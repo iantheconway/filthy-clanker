@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 
+import anthropic
 import requests
 from dotenv import load_dotenv
 
@@ -118,9 +119,18 @@ async def chat_loop(llm_client, mcp_client: HexstrikeMCPClient):
 
         # Single turn: get one LLM response, handle at most one round of tool calls,
         # then pause for user input.
-        response = await llm_client.generate_response(
-            messages, tools, DEFAULT_SYSTEM_PROMPT
-        )
+        try:
+            response = await llm_client.generate_response(
+                messages, tools, DEFAULT_SYSTEM_PROMPT
+            )
+        except anthropic.BadRequestError as e:
+            print(f"\n[!] API error: {e.message}")
+            messages.pop()  # Remove the failed user message
+            continue
+        except Exception as e:
+            print(f"\n[!] LLM request failed: {e}")
+            messages.pop()
+            continue
 
         # Print any text the model produced
         if response["text"]:
@@ -166,9 +176,13 @@ async def chat_loop(llm_client, mcp_client: HexstrikeMCPClient):
             messages.append({"role": "user", "content": tool_result_parts})
 
         # Get the model's follow-up after seeing the tool results
-        followup = await llm_client.generate_response(
-            messages, tools, DEFAULT_SYSTEM_PROMPT
-        )
+        try:
+            followup = await llm_client.generate_response(
+                messages, tools, DEFAULT_SYSTEM_PROMPT
+            )
+        except Exception as e:
+            print(f"\n[!] LLM follow-up request failed: {e}")
+            continue
 
         if followup["text"]:
             print(f"\nAssistant: {followup['text']}\n")
