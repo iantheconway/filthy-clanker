@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from config import DEFAULT_SYSTEM_PROMPT
 from llms import AnthropicClient, GeminiClient
-from mcp import HexstrikeMCPClient
+from mcp_client import HexstrikeMCPClient
 
 
 def select_provider() -> str:
