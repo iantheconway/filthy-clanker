@@ -11,6 +11,15 @@ from dotenv import load_dotenv
 from config import DEFAULT_SYSTEM_PROMPT
 from llms import AnthropicClient, GeminiClient
 from mcp_client import HexstrikeMCPClient
+from session import (
+    SESSIONS_DIR,
+    default_session_name,
+    list_sessions,
+    load_session_json,
+    load_summary,
+    save_session_json,
+    save_summary,
+)
 
 HEXSTRIKE_DIR = os.getenv("HEXSTRIKE_DIR", "/home/kali/hexstrike-ai")
 HEXSTRIKE_PORT = os.getenv("HEXSTRIKE_PORT", "8888")
@@ -91,28 +100,143 @@ def build_llm_client(provider: str):
         return GeminiClient(api_key=api_key)
 
 
-async def chat_loop(llm_client, mcp_client: HexstrikeMCPClient):
+def _auto_save(messages: list[dict], provider: str):
+    """Auto-save session JSON on exit (no LLM summary)."""
+    if not messages:
+        return
+    name = default_session_name()
+    filepath = os.path.join(SESSIONS_DIR, f"{name}.json")
+    save_session_json(messages, provider, filepath)
+    print(f"[*] Session auto-saved to {filepath}")
+
+
+async def _handle_command(
+    cmd: str,
+    messages: list[dict],
+    provider: str,
+    llm_client,
+    tools: list[dict],
+):
+    """Handle /save, /resume, /sessions commands. Returns new messages if /resume."""
+    parts = cmd.split(maxsplit=1)
+    command = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if command == "/save":
+        name = arg or default_session_name()
+        json_path = os.path.join(SESSIONS_DIR, f"{name}.json")
+        md_path = os.path.join(SESSIONS_DIR, f"{name}.md")
+        save_session_json(messages, provider, json_path)
+        print(f"[*] Session saved to {json_path}")
+        print("[*] Generating summary...")
+        await save_summary(messages, llm_client, tools, DEFAULT_SYSTEM_PROMPT, md_path)
+        print(f"[*] Summary saved to {md_path}")
+
+    elif command == "/resume":
+        if not arg:
+            # List available sessions
+            sessions = list_sessions()
+            if not sessions:
+                print("[*] No saved sessions found.")
+                return
+            print("[*] Available sessions:")
+            for s in sessions:
+                flags = []
+                if s["has_json"]:
+                    flags.append("json")
+                if s["has_md"]:
+                    flags.append("summary")
+                print(f"    - {s['name']} [{', '.join(flags)}]")
+            print("\nUsage: /resume <name>")
+            return
+
+        json_path = os.path.join(SESSIONS_DIR, f"{arg}.json")
+        md_path = os.path.join(SESSIONS_DIR, f"{arg}.md")
+
+        if os.path.exists(json_path):
+            loaded_messages, loaded_provider = load_session_json(json_path)
+            if loaded_provider != provider:
+                print(
+                    f"[!] Warning: session was saved with provider '{loaded_provider}', "
+                    f"current provider is '{provider}'. Messages may not be compatible."
+                )
+            messages.clear()
+            messages.extend(loaded_messages)
+            print(f"[*] Resumed session '{arg}' with {len(messages)} messages (JSON).")
+        elif os.path.exists(md_path):
+            summary_text = load_summary(md_path)
+            context_msg = (
+                f"[Previous session summary for context]\n\n{summary_text}\n\n"
+                "[End of previous session summary. Continue from where we left off.]"
+            )
+            messages.clear()
+            messages.append({"role": "user", "content": context_msg})
+            messages.append({
+                "role": "assistant",
+                "content": "I've reviewed the previous session summary and I'm ready to continue. What would you like to focus on next?",
+            })
+            print(f"[*] Resumed session '{arg}' from summary (no JSON found).")
+            print(f"\n--- Session Summary ---\n{summary_text}\n--- End Summary ---\n")
+        else:
+            print(f"[!] No session found with name '{arg}'.")
+
+    elif command == "/sessions":
+        sessions = list_sessions()
+        if not sessions:
+            print("[*] No saved sessions found.")
+            return
+        print("[*] Saved sessions:")
+        for s in sessions:
+            flags = []
+            if s["has_json"]:
+                flags.append("json")
+            if s["has_md"]:
+                flags.append("summary")
+            print(f"    - {s['name']} [{', '.join(flags)}]")
+
+    else:
+        print(f"[!] Unknown command: {command}")
+
+
+async def chat_loop(
+    llm_client,
+    mcp_client: HexstrikeMCPClient,
+    initial_messages: list[dict] | None = None,
+):
     tools = await mcp_client.list_tools()
     print(f"\n[*] {len(tools)} MCP tools available:")
     for t in tools:
         print(f"    - {t['name']}: {t['description'][:80]}")
 
-    messages: list[dict] = []
+    messages: list[dict] = initial_messages if initial_messages else []
     provider = "anthropic" if isinstance(llm_client, AnthropicClient) else "gemini"
 
-    print("\nChat started. Type 'exit' or 'quit' to stop.\n")
+    if initial_messages:
+        print(f"\n[*] Resumed session with {len(messages)} messages.")
+
+    print("\nChat started. Type 'exit' or 'quit' to stop.")
+    print("Commands: /save [name], /resume [name], /sessions\n")
 
     while True:
         try:
             user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting.")
+            _auto_save(messages, provider)
             break
 
         if user_input.lower() in ("exit", "quit"):
             print("Goodbye.")
+            _auto_save(messages, provider)
             break
         if not user_input:
+            continue
+
+        # Handle slash commands
+        if user_input.startswith("/"):
+            await _handle_command(
+                user_input, messages, provider, llm_client, tools
+            )
             continue
 
         messages.append({"role": "user", "content": user_input})
