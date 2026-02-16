@@ -150,6 +150,12 @@ async def _handle_command(
             print("\nUsage: /resume <name>")
             return
 
+        # Strip file extensions if user included them
+        for ext in (".json", ".md"):
+            if arg.endswith(ext):
+                arg = arg[: -len(ext)]
+                break
+
         json_path = os.path.join(SESSIONS_DIR, f"{arg}.json")
         md_path = os.path.join(SESSIONS_DIR, f"{arg}.md")
 
@@ -157,9 +163,27 @@ async def _handle_command(
             loaded_messages, loaded_provider = load_session_json(json_path)
             if loaded_provider != provider:
                 print(
-                    f"[!] Warning: session was saved with provider '{loaded_provider}', "
-                    f"current provider is '{provider}'. Messages may not be compatible."
+                    f"[!] Session was saved with provider '{loaded_provider}', "
+                    f"but current provider is '{provider}'."
                 )
+                print("[!] Message formats are incompatible for JSON resume.")
+                if os.path.exists(md_path):
+                    summary_text = load_summary(md_path)
+                    context_msg = (
+                        f"[Previous session summary for context]\n\n{summary_text}\n\n"
+                        "[End of previous session summary. Continue from where we left off.]"
+                    )
+                    messages.clear()
+                    messages.append({"role": "user", "content": context_msg})
+                    messages.append({
+                        "role": "assistant",
+                        "content": "I've reviewed the previous session summary and I'm ready to continue. What would you like to focus on next?",
+                    })
+                    print(f"[*] Falling back to summary resume for '{arg}'.")
+                    print(f"\n--- Session Summary ---\n{summary_text}\n--- End Summary ---\n")
+                else:
+                    print("[!] No summary file available either. Cannot resume this session.")
+                return
             messages.clear()
             messages.extend(loaded_messages)
             print(f"[*] Resumed session '{arg}' with {len(messages)} messages (JSON).")
@@ -270,54 +294,58 @@ async def chat_loop(
                 messages.append(GeminiClient.make_assistant_message(response))
             continue
 
-        # Append the assistant message that includes the tool_use blocks
+        # Process tool calls in a loop — the model's follow-up may request
+        # more tool calls, and Anthropic requires every tool_use to have a
+        # corresponding tool_result immediately after.
+        while tool_calls:
+            # Append the assistant message that includes the tool_use blocks
+            if provider == "anthropic":
+                messages.append(AnthropicClient.make_assistant_message(response))
+            else:
+                messages.append(GeminiClient.make_assistant_message(response))
+
+            # Execute each tool call and collect results
+            tool_result_parts = []
+            for tc in tool_calls:
+                print(f"[tool] Calling {tc['name']}({tc['arguments']})")
+                try:
+                    result = await mcp_client.call_tool(tc["name"], tc["arguments"])
+                except Exception as e:
+                    result = f"Error executing tool: {e}"
+                print(f"[tool] {tc['name']} returned ({len(result)} chars)")
+
+                if provider == "anthropic":
+                    tool_result_parts.append(
+                        AnthropicClient.make_tool_result_message(tc["id"], result)
+                    )
+                else:
+                    messages.append(
+                        GeminiClient.make_tool_result_message(tc["name"], result)
+                    )
+
+            # For Anthropic, tool results go in a single user message
+            if provider == "anthropic" and tool_result_parts:
+                messages.append({"role": "user", "content": tool_result_parts})
+
+            # Get the model's follow-up after seeing the tool results
+            try:
+                response = await llm_client.generate_response(
+                    messages, tools, DEFAULT_SYSTEM_PROMPT
+                )
+            except Exception as e:
+                print(f"\n[!] LLM follow-up request failed: {e}")
+                break
+
+            if response["text"]:
+                print(f"\nAssistant: {response['text']}\n")
+
+            tool_calls = llm_client.parse_tool_calls(response)
+
+        # Append the final text-only response
         if provider == "anthropic":
             messages.append(AnthropicClient.make_assistant_message(response))
         else:
             messages.append(GeminiClient.make_assistant_message(response))
-
-        # Execute each tool call and collect results
-        tool_result_parts = []
-        for tc in tool_calls:
-            print(f"[tool] Calling {tc['name']}({tc['arguments']})")
-            try:
-                result = await mcp_client.call_tool(tc["name"], tc["arguments"])
-            except Exception as e:
-                result = f"Error executing tool: {e}"
-            print(f"[tool] {tc['name']} returned ({len(result)} chars)")
-
-            if provider == "anthropic":
-                tool_result_parts.append(
-                    AnthropicClient.make_tool_result_message(tc["id"], result)
-                )
-            else:
-                messages.append(
-                    GeminiClient.make_tool_result_message(tc["name"], result)
-                )
-
-        # For Anthropic, tool results go in a single user message
-        if provider == "anthropic" and tool_result_parts:
-            messages.append({"role": "user", "content": tool_result_parts})
-
-        # Get the model's follow-up after seeing the tool results
-        try:
-            followup = await llm_client.generate_response(
-                messages, tools, DEFAULT_SYSTEM_PROMPT
-            )
-        except Exception as e:
-            print(f"\n[!] LLM follow-up request failed: {e}")
-            continue
-
-        if followup["text"]:
-            print(f"\nAssistant: {followup['text']}\n")
-
-        if provider == "anthropic":
-            messages.append(AnthropicClient.make_assistant_message(followup))
-        else:
-            messages.append(GeminiClient.make_assistant_message(followup))
-
-        # Pause here — do NOT auto-loop further tool calls.
-        # The user must provide the next input.
 
 
 async def main():

@@ -7,7 +7,7 @@ from .base import BaseLLMClient
 
 
 class AnthropicClient(BaseLLMClient):
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
+    def __init__(self, api_key: str, model: str = "claude-opus-4-6"):
         self.client = anthropic.AsyncAnthropic(api_key=api_key)
         self.model = model
 
@@ -36,10 +36,14 @@ class AnthropicClient(BaseLLMClient):
 
         response = await self.client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=16000,
             system=system_prompt,
             messages=messages,
             tools=formatted_tools,
+            thinking={
+                "type": "adaptive",
+                "budget_tokens": 10000,
+            },
         )
 
         text_parts = []
@@ -79,7 +83,13 @@ class AnthropicClient(BaseLLMClient):
         content = []
         raw = response["raw"]
         for block in raw.content:
-            if block.type == "text":
+            if block.type == "thinking":
+                content.append({
+                    "type": "thinking",
+                    "thinking": block.thinking,
+                    "signature": block.signature,
+                })
+            elif block.type == "text":
                 content.append({"type": "text", "text": block.text})
             elif block.type == "tool_use":
                 content.append({
