@@ -26,11 +26,70 @@ def save_session_json(messages: list[dict], provider: str, filepath: str):
         json.dump(data, f, indent=2, default=str)
 
 
+def _sanitize_anthropic_messages(messages: list[dict]) -> list[dict]:
+    """Ensure every assistant tool_use block has a matching tool_result.
+
+    If the session was saved mid-tool-loop, the final assistant message may
+    contain tool_use blocks with no corresponding tool_result in the next
+    message.  This adds stub results so the API won't reject the history.
+    """
+    sanitized = list(messages)
+    i = 0
+    while i < len(sanitized):
+        msg = sanitized[i]
+        if msg.get("role") != "assistant":
+            i += 1
+            continue
+
+        # Collect tool_use ids in this assistant message
+        tool_use_ids = [
+            block["id"]
+            for block in msg.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        if not tool_use_ids:
+            i += 1
+            continue
+
+        # Check the next message for matching tool_results
+        next_msg = sanitized[i + 1] if i + 1 < len(sanitized) else None
+        answered_ids = set()
+        if next_msg and next_msg.get("role") == "user" and isinstance(next_msg.get("content"), list):
+            for block in next_msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    answered_ids.add(block.get("tool_use_id"))
+
+        missing_ids = [tid for tid in tool_use_ids if tid not in answered_ids]
+        if missing_ids:
+            stub_results = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tid,
+                    "content": "[Tool call not completed — session was saved before execution]",
+                }
+                for tid in missing_ids
+            ]
+            if answered_ids and next_msg:
+                # Some results exist; append stubs to the existing message
+                next_msg["content"].extend(stub_results)
+            else:
+                # No result message at all; insert one
+                sanitized.insert(i + 1, {"role": "user", "content": stub_results})
+
+        i += 1
+
+    return sanitized
+
+
 def load_session_json(filepath: str) -> tuple[list[dict], str]:
     """Read a session JSON file. Returns (messages, provider)."""
     with open(filepath) as f:
         data = json.load(f)
-    return data["messages"], data["provider"]
+    messages = data["messages"]
+    provider = data["provider"]
+    if provider == "anthropic":
+        messages = _sanitize_anthropic_messages(messages)
+    return messages, provider
 
 
 async def save_summary(messages, llm_client, tools, system_prompt, filepath: str):

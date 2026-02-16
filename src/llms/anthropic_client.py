@@ -42,7 +42,6 @@ class AnthropicClient(BaseLLMClient):
             tools=formatted_tools,
             thinking={
                 "type": "adaptive",
-                "budget_tokens": 10000,
             },
         )
 

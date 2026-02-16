@@ -1,5 +1,7 @@
 import asyncio
 import os
+import select
+import signal
 import subprocess
 import sys
 import time
@@ -26,6 +28,48 @@ HEXSTRIKE_PORT = os.getenv("HEXSTRIKE_PORT", "8888")
 HEXSTRIKE_VENV_PYTHON = os.path.join(HEXSTRIKE_DIR, "hexstrike-env", "bin", "python3")
 HEXSTRIKE_SERVER_SCRIPT = os.path.join(HEXSTRIKE_DIR, "hexstrike_server.py")
 HEXSTRIKE_MCP_SCRIPT = os.path.join(HEXSTRIKE_DIR, "hexstrike_mcp.py")
+
+
+_sigint_received = False
+_active_task: asyncio.Task | None = None
+
+
+def _sigint_handler(signum, frame):
+    global _sigint_received
+    _sigint_received = True
+    # Cancel the currently awaited async task so control returns immediately
+    if _active_task and not _active_task.done():
+        _active_task.cancel()
+    print("\n[*] Ctrl+C received — interrupting...")
+
+
+def _check_interrupt() -> bool:
+    """Return True and reset the flag if SIGINT was received."""
+    global _sigint_received
+    if _sigint_received:
+        _sigint_received = False
+        return True
+    return False
+
+
+async def _cancellable(coro):
+    """Run a coroutine in a task that can be cancelled by the SIGINT handler."""
+    global _active_task
+    task = asyncio.ensure_future(coro)
+    _active_task = task
+    try:
+        return await task
+    finally:
+        _active_task = None
+
+
+def _flush_stdin():
+    """Drain any buffered input from stdin (e.g. leftover newlines from paste)."""
+    try:
+        while select.select([sys.stdin], [], [], 0)[0]:
+            sys.stdin.readline()
+    except Exception:
+        pass
 
 
 def start_hexstrike_server() -> subprocess.Popen | None:
@@ -186,6 +230,10 @@ async def _handle_command(
                 return
             messages.clear()
             messages.extend(loaded_messages)
+            # Drop trailing user messages (e.g. interrupt markers) so the
+            # next user input doesn't create consecutive user messages.
+            while messages and messages[-1].get("role") == "user":
+                messages.pop()
             print(f"[*] Resumed session '{arg}' with {len(messages)} messages (JSON).")
         elif os.path.exists(md_path):
             summary_text = load_summary(md_path)
@@ -238,114 +286,212 @@ async def chat_loop(
     if initial_messages:
         print(f"\n[*] Resumed session with {len(messages)} messages.")
 
+    # Install SIGINT handler so Ctrl+C works reliably in async context
+    prev_handler = signal.signal(signal.SIGINT, _sigint_handler)
+
     print("\nChat started. Type 'exit' or 'quit' to stop.")
     print("Commands: /save [name], /resume [name], /sessions\n")
 
-    while True:
-        try:
-            user_input = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
-            _auto_save(messages, provider)
-            break
-
-        if user_input.lower() in ("exit", "quit"):
-            print("Goodbye.")
-            _auto_save(messages, provider)
-            break
-        if not user_input:
-            continue
-
-        # Handle slash commands
-        if user_input.startswith("/"):
-            await _handle_command(
-                user_input, messages, provider, llm_client, tools
-            )
-            continue
-
-        messages.append({"role": "user", "content": user_input})
-
-        # Single turn: get one LLM response, handle at most one round of tool calls,
-        # then pause for user input.
-        try:
-            response = await llm_client.generate_response(
-                messages, tools, DEFAULT_SYSTEM_PROMPT
-            )
-        except anthropic.BadRequestError as e:
-            print(f"\n[!] API error: {e.message}")
-            messages.pop()  # Remove the failed user message
-            continue
-        except Exception as e:
-            print(f"\n[!] LLM request failed: {e}")
-            messages.pop()
-            continue
-
-        # Print any text the model produced
-        if response["text"]:
-            print(f"\nAssistant: {response['text']}\n")
-
-        tool_calls = llm_client.parse_tool_calls(response)
-
-        if not tool_calls:
-            # Pure text reply — append and loop back to user
-            if provider == "anthropic":
-                messages.append(AnthropicClient.make_assistant_message(response))
-            else:
-                messages.append(GeminiClient.make_assistant_message(response))
-            continue
-
-        # Process tool calls in a loop — the model's follow-up may request
-        # more tool calls, and Anthropic requires every tool_use to have a
-        # corresponding tool_result immediately after.
-        while tool_calls:
-            # Append the assistant message that includes the tool_use blocks
-            if provider == "anthropic":
-                messages.append(AnthropicClient.make_assistant_message(response))
-            else:
-                messages.append(GeminiClient.make_assistant_message(response))
-
-            # Execute each tool call and collect results
-            tool_result_parts = []
-            for tc in tool_calls:
-                print(f"[tool] Calling {tc['name']}({tc['arguments']})")
-                try:
-                    result = await mcp_client.call_tool(tc["name"], tc["arguments"])
-                except Exception as e:
-                    result = f"Error executing tool: {e}"
-                print(f"[tool] {tc['name']} returned ({len(result)} chars)")
-
-                if provider == "anthropic":
-                    tool_result_parts.append(
-                        AnthropicClient.make_tool_result_message(tc["id"], result)
-                    )
-                else:
-                    messages.append(
-                        GeminiClient.make_tool_result_message(tc["name"], result)
-                    )
-
-            # For Anthropic, tool results go in a single user message
-            if provider == "anthropic" and tool_result_parts:
-                messages.append({"role": "user", "content": tool_result_parts})
-
-            # Get the model's follow-up after seeing the tool results
+    try:
+        while True:
+            _check_interrupt()  # clear any stale flag
             try:
-                response = await llm_client.generate_response(
-                    messages, tools, DEFAULT_SYSTEM_PROMPT
-                )
-            except Exception as e:
-                print(f"\n[!] LLM follow-up request failed: {e}")
+                user_input = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting.")
+                _auto_save(messages, provider)
                 break
 
+            if user_input.lower() in ("exit", "quit"):
+                print("Goodbye.")
+                _auto_save(messages, provider)
+                break
+            if not user_input:
+                continue
+
+            # Handle slash commands
+            if user_input.startswith("/"):
+                await _handle_command(
+                    user_input, messages, provider, llm_client, tools
+                )
+                _flush_stdin()
+                continue
+
+            messages.append({"role": "user", "content": user_input})
+
+            # Single turn: get one LLM response, handle tool calls, then
+            # pause for user input.
+            try:
+                response = await _cancellable(
+                    llm_client.generate_response(
+                        messages, tools, DEFAULT_SYSTEM_PROMPT
+                    )
+                )
+            except asyncio.CancelledError:
+                messages.pop()
+                print("[*] Interrupted. You can now type a message.")
+                _flush_stdin()
+                continue
+            except anthropic.BadRequestError as e:
+                print(f"\n[!] API error: {e.message}")
+                messages.pop()
+                continue
+            except Exception as e:
+                print(f"\n[!] LLM request failed: {e}")
+                messages.pop()
+                continue
+
+            if _check_interrupt():
+                messages.pop()
+                print("[*] Interrupted. You can now type a message.")
+                _flush_stdin()
+                continue
+
+            # Print any text the model produced
             if response["text"]:
                 print(f"\nAssistant: {response['text']}\n")
 
             tool_calls = llm_client.parse_tool_calls(response)
 
-        # Append the final text-only response
-        if provider == "anthropic":
-            messages.append(AnthropicClient.make_assistant_message(response))
-        else:
-            messages.append(GeminiClient.make_assistant_message(response))
+            if not tool_calls:
+                if provider == "anthropic":
+                    messages.append(AnthropicClient.make_assistant_message(response))
+                else:
+                    messages.append(GeminiClient.make_assistant_message(response))
+                continue
+
+            # Process tool calls in a loop.  Track which calls have been
+            # completed so we can stub the rest if the user interrupts.
+            follow_up_ok = True
+            pending_tool_calls: list[dict] = []
+
+            while tool_calls:
+                if _check_interrupt():
+                    break
+
+                if provider == "anthropic":
+                    messages.append(AnthropicClient.make_assistant_message(response))
+                else:
+                    messages.append(GeminiClient.make_assistant_message(response))
+
+                pending_tool_calls = list(tool_calls)
+                tool_result_parts = []
+                interrupted_during_tools = False
+                for tc in tool_calls:
+                    if _check_interrupt():
+                        interrupted_during_tools = True
+                        break
+                    print(f"[tool] Calling {tc['name']}({tc['arguments']})")
+                    try:
+                        result = await _cancellable(
+                            mcp_client.call_tool(tc["name"], tc["arguments"])
+                        )
+                    except asyncio.CancelledError:
+                        result = "[Tool call cancelled by user]"
+                        interrupted_during_tools = True
+                    except Exception as e:
+                        result = f"Error executing tool: {e}"
+                    print(f"[tool] {tc['name']} returned ({len(result)} chars)")
+                    pending_tool_calls.remove(tc)
+
+                    if provider == "anthropic":
+                        tool_result_parts.append(
+                            AnthropicClient.make_tool_result_message(tc["id"], result)
+                        )
+                    else:
+                        messages.append(
+                            GeminiClient.make_tool_result_message(tc["name"], result)
+                        )
+
+                    if interrupted_during_tools:
+                        break
+
+                if interrupted_during_tools:
+                    if provider == "anthropic" and tool_result_parts:
+                        messages.append({"role": "user", "content": tool_result_parts})
+                    break
+
+                if provider == "anthropic" and tool_result_parts:
+                    messages.append({"role": "user", "content": tool_result_parts})
+
+                pending_tool_calls = []
+
+                # Retry up to 3 times on transient failures
+                follow_up_ok = False
+                for attempt in range(3):
+                    if _check_interrupt():
+                        break
+                    try:
+                        response = await _cancellable(
+                            llm_client.generate_response(
+                                messages, tools, DEFAULT_SYSTEM_PROMPT
+                            )
+                        )
+                        follow_up_ok = True
+                        break
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            wait = 2 ** attempt
+                            print(f"\n[!] LLM request failed ({e}), retrying in {wait}s...")
+                            await asyncio.sleep(wait)
+                        else:
+                            print(f"\n[!] LLM follow-up failed after 3 attempts: {e}")
+
+                if not follow_up_ok:
+                    break
+
+                if _check_interrupt():
+                    break
+
+                if response["text"]:
+                    print(f"\nAssistant: {response['text']}\n")
+
+                tool_calls = llm_client.parse_tool_calls(response)
+
+            # After the tool loop — completed normally or interrupted
+            if pending_tool_calls:
+                print("[*] Interrupted by user. You can now type a message.")
+                stub_msg = "[Tool call interrupted by user before execution]"
+                if provider == "anthropic":
+                    stub_results = [
+                        AnthropicClient.make_tool_result_message(tc["id"], stub_msg)
+                        for tc in pending_tool_calls
+                    ]
+                    messages.append({"role": "user", "content": stub_results})
+                else:
+                    for tc in pending_tool_calls:
+                        messages.append(
+                            GeminiClient.make_tool_result_message(tc["name"], stub_msg)
+                        )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[The user interrupted the tool call sequence. "
+                        "All tool calls and results above are preserved. "
+                        "Stop calling tools and wait for the user's next instruction.]"
+                    ),
+                })
+                _flush_stdin()
+            elif _check_interrupt():
+                print("[*] Interrupted by user. You can now type a message.")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[The user interrupted the assistant. "
+                        "Stop calling tools and wait for the user's next instruction.]"
+                    ),
+                })
+                _flush_stdin()
+            elif follow_up_ok:
+                if provider == "anthropic":
+                    messages.append(AnthropicClient.make_assistant_message(response))
+                else:
+                    messages.append(GeminiClient.make_assistant_message(response))
+
+    finally:
+        signal.signal(signal.SIGINT, prev_handler)
 
 
 async def main():
