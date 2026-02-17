@@ -10,7 +10,8 @@ import anthropic
 import requests
 from dotenv import load_dotenv
 
-from config import DEFAULT_SYSTEM_PROMPT
+from config import build_system_prompt
+from htb_client import HTB
 from llms import AnthropicClient, GeminiClient
 from mcp_client import HexstrikeMCPClient
 from session import (
@@ -160,20 +161,135 @@ async def _handle_command(
     provider: str,
     llm_client,
     tools: list[dict],
-):
-    """Handle /save, /resume, /sessions commands. Returns new messages if /resume."""
+    system_prompt: str,
+    htb_client: HTB | None = None,
+) -> str | None:
+    """Handle slash commands. Returns updated system_prompt if it changed, else None."""
     parts = cmd.split(maxsplit=1)
     command = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if command == "/save":
+    # --- HTB commands ---
+    if command == "/machine":
+        if not htb_client:
+            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
+            return None
+        if arg:
+            info = htb_client.get_machine_info(arg)
+            if isinstance(info, str):
+                print(f"[!] {info}")
+            else:
+                print(f"[*] Machine: {info['name']}")
+                print(f"    OS: {info['os']}")
+                print(f"    Difficulty: {info['difficulty']}")
+                print(f"    Points: {info['points']}")
+                print(f"    Stars: {info['stars']}")
+                print(f"    Active: {info['active']}  Retired: {info['retired']}")
+                print(f"    User owned: {info['user_owned']}  Root owned: {info['root_owned']}")
+        else:
+            info = htb_client.get_active_machine()
+            if info:
+                print(f"[*] Active machine: {info['name']}")
+                print(f"    OS: {info['os']}")
+                print(f"    Difficulty: {info['difficulty']}")
+                print(f"    IP: {info['ip']}")
+            else:
+                print("[*] No active machine.")
+        return None
+
+    elif command == "/spawn":
+        if not htb_client:
+            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
+            return None
+        if not arg:
+            print("[!] Usage: /spawn <machine-name>")
+            return None
+        print(f"[*] Spawning '{arg}'...")
+        result = htb_client.spawn_machine(arg)
+        if result.startswith("Error"):
+            print(f"[!] {result}")
+            return None
+        print(f"[*] Machine spawned at {result}")
+        # Refresh machine info and rebuild prompt
+        info = htb_client.get_active_machine()
+        if info:
+            new_prompt = build_system_prompt(
+                machine_name=info["name"],
+                machine_os=info["os"],
+                machine_difficulty=info["difficulty"],
+                machine_ip=info["ip"],
+            )
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[System: Target machine changed. Now working on '{info['name']}' "
+                    f"({info['os']}, {info['difficulty']}) at {info['ip']}. "
+                    f"Hostname: {info['name'].lower()}.htb]"
+                ),
+            })
+            messages.append({
+                "role": "assistant",
+                "content": (
+                    f"Understood — now targeting {info['name']} at {info['ip']}. "
+                    "Ready to begin when you are."
+                ),
+            })
+            return new_prompt
+        return None
+
+    elif command == "/stop":
+        if not htb_client:
+            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
+            return None
+        result = htb_client.stop_machine()
+        print(f"[*] {result}")
+        if not result.startswith("Error") and not result.startswith("No active"):
+            messages.append({
+                "role": "user",
+                "content": "[System: The active machine has been stopped.]",
+            })
+            messages.append({
+                "role": "assistant",
+                "content": "Machine stopped. Use /spawn <name> to start a new one.",
+            })
+            return build_system_prompt()
+        return None
+
+    elif command == "/reset":
+        if not htb_client:
+            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
+            return None
+        result = htb_client.reset_machine()
+        print(f"[*] {result}")
+        return None
+
+    elif command == "/flag":
+        if not htb_client:
+            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
+            return None
+        if not arg:
+            print("[!] Usage: /flag <flag-string>")
+            return None
+        result = htb_client.submit_flag(arg)
+        print(f"[*] {result}")
+        return None
+
+    elif command == "/vpn":
+        if not htb_client:
+            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
+            return None
+        result = htb_client.get_vpn_status()
+        print(f"[*] {result}")
+        return None
+
+    elif command == "/save":
         name = arg or default_session_name()
         json_path = os.path.join(SESSIONS_DIR, f"{name}.json")
         md_path = os.path.join(SESSIONS_DIR, f"{name}.md")
         save_session_json(messages, provider, json_path)
         print(f"[*] Session saved to {json_path}")
         print("[*] Generating summary...")
-        await save_summary(messages, llm_client, tools, DEFAULT_SYSTEM_PROMPT, md_path)
+        await save_summary(messages, llm_client, tools, system_prompt, md_path)
         print(f"[*] Summary saved to {md_path}")
 
     elif command == "/resume":
@@ -268,13 +384,19 @@ async def _handle_command(
 
     else:
         print(f"[!] Unknown command: {command}")
+        return None
 
 
 async def chat_loop(
     llm_client,
     mcp_client: HexstrikeMCPClient,
     initial_messages: list[dict] | None = None,
+    system_prompt: str | None = None,
+    htb_client: HTB | None = None,
 ):
+    if system_prompt is None:
+        system_prompt = build_system_prompt()
+
     tools = await mcp_client.list_tools()
     print(f"\n[*] {len(tools)} MCP tools available:")
     for t in tools:
@@ -290,7 +412,10 @@ async def chat_loop(
     prev_handler = signal.signal(signal.SIGINT, _sigint_handler)
 
     print("\nChat started. Type 'exit' or 'quit' to stop.")
-    print("Commands: /save [name], /resume [name], /sessions\n")
+    print("Commands: /save [name], /resume [name], /sessions")
+    if htb_client:
+        print("HTB:      /machine [name], /spawn <name>, /stop, /reset, /flag <flag>, /vpn")
+    print()
 
     try:
         while True:
@@ -311,9 +436,12 @@ async def chat_loop(
 
             # Handle slash commands
             if user_input.startswith("/"):
-                await _handle_command(
-                    user_input, messages, provider, llm_client, tools
+                new_prompt = await _handle_command(
+                    user_input, messages, provider, llm_client, tools,
+                    system_prompt, htb_client,
                 )
+                if new_prompt is not None:
+                    system_prompt = new_prompt
                 _flush_stdin()
                 continue
 
@@ -324,7 +452,7 @@ async def chat_loop(
             try:
                 response = await _cancellable(
                     llm_client.generate_response(
-                        messages, tools, DEFAULT_SYSTEM_PROMPT
+                        messages, tools, system_prompt
                     )
                 )
             except asyncio.CancelledError:
@@ -424,7 +552,7 @@ async def chat_loop(
                     try:
                         response = await _cancellable(
                             llm_client.generate_response(
-                                messages, tools, DEFAULT_SYSTEM_PROMPT
+                                messages, tools, system_prompt
                             )
                         )
                         follow_up_ok = True
@@ -497,6 +625,31 @@ async def chat_loop(
 async def main():
     load_dotenv()
 
+    # --- HTB integration (optional) ---
+    htb_client = None
+    system_prompt = build_system_prompt()
+    htb_token = os.getenv("HTB_APP_TOKEN")
+    if htb_token:
+        try:
+            htb_client = HTB(htb_token)
+            print("[*] HTB client connected.")
+            active = htb_client.get_active_machine()
+            if active:
+                print(f"[*] Active machine: {active['name']} ({active['os']}, "
+                      f"{active['difficulty']}) @ {active['ip']}")
+                system_prompt = build_system_prompt(
+                    machine_name=active["name"],
+                    machine_os=active["os"],
+                    machine_difficulty=active["difficulty"],
+                    machine_ip=active["ip"],
+                )
+            else:
+                print("[*] No active HTB machine. Use /spawn <name> to start one.")
+        except Exception as e:
+            print(f"[!] Failed to initialize HTB client: {e}")
+    else:
+        print("[*] HTB_APP_TOKEN not set — HTB commands disabled.")
+
     # Start (or detect) the hexstrike Flask server
     server_proc = start_hexstrike_server()
 
@@ -524,7 +677,7 @@ async def main():
     print("[*] MCP session initialized.")
 
     try:
-        await chat_loop(llm_client, mcp_client)
+        await chat_loop(llm_client, mcp_client, system_prompt=system_prompt, htb_client=htb_client)
     finally:
         await mcp_client.disconnect()
         print("[*] MCP session closed.")
