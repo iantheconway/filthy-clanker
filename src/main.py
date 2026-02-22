@@ -16,7 +16,9 @@ from llms import AnthropicClient, GeminiClient
 from mcp_client import HexstrikeMCPClient
 from session import (
     SESSIONS_DIR,
+    SessionLogger,
     default_session_name,
+    get_latest_session,
     list_sessions,
     load_session_json,
     load_summary,
@@ -145,19 +147,9 @@ def build_llm_client(provider: str):
         return GeminiClient(api_key=api_key)
 
 
-def _auto_save(messages: list[dict], provider: str):
-    """Auto-save session JSON on exit (no LLM summary)."""
-    if not messages:
-        return
-    name = default_session_name()
-    filepath = os.path.join(SESSIONS_DIR, f"{name}.json")
-    save_session_json(messages, provider, filepath)
-    print(f"[*] Session auto-saved to {filepath}")
-
-
 async def _handle_command(
     cmd: str,
-    messages: list[dict],
+    messages: SessionLogger,
     provider: str,
     llm_client,
     tools: list[dict],
@@ -393,6 +385,7 @@ async def chat_loop(
     initial_messages: list[dict] | None = None,
     system_prompt: str | None = None,
     htb_client: HTB | None = None,
+    session_logger: SessionLogger | None = None,
 ):
     if system_prompt is None:
         system_prompt = build_system_prompt()
@@ -402,8 +395,15 @@ async def chat_loop(
     for t in tools:
         print(f"    - {t['name']}: {t['description'][:80]}")
 
-    messages: list[dict] = initial_messages if initial_messages else []
     provider = "anthropic" if isinstance(llm_client, AnthropicClient) else "gemini"
+
+    if session_logger is not None:
+        messages = session_logger
+    else:
+        log_name = default_session_name()
+        log_path = os.path.join(SESSIONS_DIR, f"{log_name}.json")
+        messages = SessionLogger(provider, log_path, initial_messages)
+        print(f"[*] Session log: {log_path}")
 
     if initial_messages:
         print(f"\n[*] Resumed session with {len(messages)} messages.")
@@ -424,12 +424,10 @@ async def chat_loop(
                 user_input = input("You: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting.")
-                _auto_save(messages, provider)
                 break
 
             if user_input.lower() in ("exit", "quit"):
                 print("Goodbye.")
-                _auto_save(messages, provider)
                 break
             if not user_input:
                 continue
@@ -656,6 +654,23 @@ async def main():
     provider = select_provider()
     llm_client = build_llm_client(provider)
 
+    # Check for a recent session to resume
+    initial_messages = None
+    session_logger = None
+    latest = get_latest_session(provider)
+    if latest:
+        name, filepath, msg_count = latest
+        print(f"\n[*] Found recent session: {name} ({msg_count} messages)")
+        choice = input("    Resume this session? [y/N]: ").strip().lower()
+        if choice in ("y", "yes"):
+            loaded_messages, _ = load_session_json(filepath)
+            # Drop trailing user messages to avoid consecutive user turns
+            while loaded_messages and loaded_messages[-1].get("role") == "user":
+                loaded_messages.pop()
+            session_logger = SessionLogger(provider, filepath, loaded_messages)
+            initial_messages = loaded_messages
+            print(f"[*] Resuming session from {filepath}")
+
     # Configure MCP server command — defaults use hexstrike venv python
     mcp_command = os.getenv("MCP_COMMAND", HEXSTRIKE_VENV_PYTHON)
     mcp_args_str = os.getenv(
@@ -677,7 +692,13 @@ async def main():
     print("[*] MCP session initialized.")
 
     try:
-        await chat_loop(llm_client, mcp_client, system_prompt=system_prompt, htb_client=htb_client)
+        await chat_loop(
+            llm_client, mcp_client,
+            initial_messages=initial_messages,
+            system_prompt=system_prompt,
+            htb_client=htb_client,
+            session_logger=session_logger,
+        )
     finally:
         await mcp_client.disconnect()
         print("[*] MCP session closed.")

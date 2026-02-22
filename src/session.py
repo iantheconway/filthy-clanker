@@ -14,13 +14,13 @@ def default_session_name() -> str:
     return datetime.now().strftime("session-%Y-%m-%d-%H%M%S")
 
 
-def save_session_json(messages: list[dict], provider: str, filepath: str):
+def save_session_json(messages, provider: str, filepath: str):
     """Write raw messages list + metadata to a JSON file."""
     _ensure_sessions_dir()
     data = {
         "timestamp": datetime.now().isoformat(),
         "provider": provider,
-        "messages": messages,
+        "messages": list(messages),
     }
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2, default=str)
@@ -120,6 +120,93 @@ def load_summary(filepath: str) -> str:
     """Read a .md summary file and return its contents."""
     with open(filepath) as f:
         return f.read()
+
+
+class SessionLogger:
+    """A list-like wrapper around messages that auto-persists to disk on every mutation."""
+
+    def __init__(self, provider: str, filepath: str, initial_messages: list[dict] | None = None):
+        self._provider = provider
+        self._filepath = filepath
+        self._messages: list[dict] = list(initial_messages) if initial_messages else []
+        self._flush()
+
+    @property
+    def filepath(self) -> str:
+        return self._filepath
+
+    # --- List-like interface ---
+
+    def append(self, msg: dict):
+        self._messages.append(msg)
+        self._flush()
+
+    def extend(self, msgs):
+        self._messages.extend(msgs)
+        self._flush()
+
+    def clear(self):
+        self._messages.clear()
+        self._flush()
+
+    def pop(self, index: int = -1):
+        val = self._messages.pop(index)
+        self._flush()
+        return val
+
+    def __len__(self):
+        return len(self._messages)
+
+    def __iter__(self):
+        return iter(self._messages)
+
+    def __getitem__(self, index):
+        return self._messages[index]
+
+    def __setitem__(self, index, value):
+        self._messages[index] = value
+        self._flush()
+
+    def __bool__(self):
+        return bool(self._messages)
+
+    def __add__(self, other):
+        """Support messages + [extra] for read-only operations (e.g. building summary prompt)."""
+        return self._messages + other
+
+    def _flush(self):
+        save_session_json(self._messages, self._provider, self._filepath)
+
+
+def get_latest_session(provider: str) -> tuple[str, str, int] | None:
+    """Find the most recent session JSON matching the given provider.
+
+    Returns (name, filepath, message_count) or None.
+    """
+    if not os.path.isdir(SESSIONS_DIR):
+        return None
+
+    candidates = []
+    for fname in os.listdir(SESSIONS_DIR):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(SESSIONS_DIR, fname)
+        try:
+            with open(fpath) as f:
+                data = json.load(f)
+            if data.get("provider") == provider and data.get("messages"):
+                candidates.append((fname, fpath, data))
+        except (json.JSONDecodeError, KeyError, OSError):
+            continue
+
+    if not candidates:
+        return None
+
+    # Sort by timestamp descending
+    candidates.sort(key=lambda c: c[2].get("timestamp", ""), reverse=True)
+    fname, fpath, data = candidates[0]
+    name = os.path.splitext(fname)[0]
+    return name, fpath, len(data["messages"])
 
 
 def list_sessions() -> list[dict]:
