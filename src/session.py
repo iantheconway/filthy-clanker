@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from datetime import datetime
@@ -33,7 +34,7 @@ def _sanitize_anthropic_messages(messages: list[dict]) -> list[dict]:
     contain tool_use blocks with no corresponding tool_result in the next
     message.  This adds stub results so the API won't reject the history.
     """
-    sanitized = list(messages)
+    sanitized = copy.deepcopy(list(messages))
     i = 0
     while i < len(sanitized):
         msg = sanitized[i]

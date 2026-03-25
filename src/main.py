@@ -93,7 +93,8 @@ def start_hexstrike_server() -> subprocess.Popen | None:
         pass
 
     print(f"[*] Starting hexstrike server on port {HEXSTRIKE_PORT}...")
-    server_log = open(os.path.join(HEXSTRIKE_DIR, "server.log"), "w")
+    log_path = os.path.join(HEXSTRIKE_DIR, "server.log")
+    server_log = open(log_path, "w")
     proc = subprocess.Popen(
         [HEXSTRIKE_VENV_PYTHON, HEXSTRIKE_SERVER_SCRIPT, "--port", HEXSTRIKE_PORT],
         cwd=HEXSTRIKE_DIR,
@@ -106,12 +107,12 @@ def start_hexstrike_server() -> subprocess.Popen | None:
         # Check if process died
         if proc.poll() is not None:
             server_log.close()
-            log_path = os.path.join(HEXSTRIKE_DIR, "server.log")
             print(f"[!] Hexstrike server exited with code {proc.returncode}.")
             print(f"[!] Check {log_path} for details.")
             sys.exit(1)
         try:
             if requests.get(url, timeout=3).ok:
+                server_log.close()
                 print("[*] Hexstrike server is ready.")
                 return proc
         except Exception:
@@ -338,10 +339,25 @@ async def _handle_command(
                 return
             messages.clear()
             messages.extend(loaded_messages)
-            # Drop trailing user messages (e.g. interrupt markers) so the
+            # Drop trailing plain user messages (e.g. interrupt markers) so the
             # next user input doesn't create consecutive user messages.
+            # Do NOT pop user messages that contain tool_result blocks — they are
+            # required by the API to pair with a preceding tool_use.
             while messages and messages[-1].get("role") == "user":
+                _content = messages[-1].get("content", [])
+                if isinstance(_content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in _content
+                ):
+                    break
                 messages.pop()
+            # If we stopped on a tool_result user message, add a stub assistant
+            # turn so the next user input doesn't create consecutive user messages.
+            if messages and messages[-1].get("role") == "user":
+                messages.append({
+                    "role": "assistant",
+                    "content": "[Session resumed — previous tool results preserved. Ready to continue.]",
+                })
             print(f"[*] Resumed session '{arg}' with {len(messages)} messages (JSON).")
         elif os.path.exists(md_path):
             summary_text = load_summary(md_path)
@@ -664,9 +680,24 @@ async def main():
         choice = input("    Resume this session? [y/N]: ").strip().lower()
         if choice in ("y", "yes"):
             loaded_messages, _ = load_session_json(filepath)
-            # Drop trailing user messages to avoid consecutive user turns
+            # Drop trailing plain user messages to avoid consecutive user turns.
+            # Do NOT pop user messages that contain tool_result blocks — they are
+            # required by the API to pair with a preceding tool_use.
             while loaded_messages and loaded_messages[-1].get("role") == "user":
+                _content = loaded_messages[-1].get("content", [])
+                if isinstance(_content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in _content
+                ):
+                    break
                 loaded_messages.pop()
+            # If we stopped on a tool_result user message, add a stub assistant
+            # turn so the next user input doesn't create consecutive user messages.
+            if loaded_messages and loaded_messages[-1].get("role") == "user":
+                loaded_messages.append({
+                    "role": "assistant",
+                    "content": "[Session resumed — previous tool results preserved. Ready to continue.]",
+                })
             session_logger = SessionLogger(provider, filepath, loaded_messages)
             initial_messages = loaded_messages
             print(f"[*] Resuming session from {filepath}")

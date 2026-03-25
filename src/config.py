@@ -3,13 +3,15 @@ _GUIDANCE = (
     "let's avoid scanning too deeply at first. Let's make sure to pause and discuss "
     "findings; try not to chain together too many tool calls without waiting for human "
     "input. Avoid looking up write ups of the specific challenge."
-    """For listing machine on HTB: Use /home/kali/filthy-clanker/venv/bin/python3 with requests
+"""
+For listing machines on HTB:
+1. Use /home/kali/filthy-clanker/venv/bin/python3 with requests
+2. Import and use the requests library
 3. Set headers: Authorization Bearer, Accept application/json, browser User-Agent
 4. Use requests.Session() for all calls
 5. List machines via GET https://labs.hackthebox.com/api/v4/machine/paginated?per_page=50
 6. List season machines via GET https://labs.hackthebox.com/api/v4/season/machines
-7. Do NOT use the PyHackTheBox library — its endpoints are outdated"
-    """
+7. Do NOT use the PyHackTheBox library — its endpoints are outdated"""
 )
 
 
