@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from config import build_system_prompt
 from htb_client import HTB
-from llms import AnthropicClient, GeminiClient
+from llms import AnthropicClient, GeminiClient, OllamaClient
 from mcp_client import HexstrikeMCPClient
 from session import (
     SESSIONS_DIR,
@@ -124,14 +124,46 @@ def start_hexstrike_server() -> subprocess.Popen | None:
     sys.exit("Error: Hexstrike server failed to start within 30 seconds.")
 
 
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+
+
 def select_provider() -> str:
     print("\nSelect LLM provider:")
     print("  1) Anthropic (Claude)")
     print("  2) Gemini")
+    print("  3) Ollama (local)")
     while True:
-        choice = input("Enter 1 or 2: ").strip()
-        if choice in ("1", "2"):
-            return "anthropic" if choice == "1" else "gemini"
+        choice = input("Enter 1, 2, or 3: ").strip()
+        if choice == "1":
+            return "anthropic"
+        if choice == "2":
+            return "gemini"
+        if choice == "3":
+            return "ollama"
+        print("Invalid choice.")
+
+
+def _fetch_ollama_models() -> list[str]:
+    """Return a list of model names available on the Ollama server."""
+    try:
+        resp = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        resp.raise_for_status()
+        return [m["name"] for m in resp.json().get("models", [])]
+    except Exception as e:
+        sys.exit(f"Error: Could not reach Ollama at {OLLAMA_HOST}: {e}")
+
+
+def _select_ollama_model() -> str:
+    models = _fetch_ollama_models()
+    if not models:
+        sys.exit(f"Error: No models found on Ollama at {OLLAMA_HOST}.")
+    print("\nAvailable Ollama models:")
+    for i, name in enumerate(models, 1):
+        print(f"  {i}) {name}")
+    while True:
+        choice = input(f"Enter model number (1-{len(models)}): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            return models[int(choice) - 1]
         print("Invalid choice.")
 
 
@@ -141,6 +173,9 @@ def build_llm_client(provider: str):
         if not api_key:
             sys.exit("Error: ANTHROPIC_API_KEY not set in environment.")
         return AnthropicClient(api_key=api_key)
+    elif provider == "ollama":
+        model = _select_ollama_model()
+        return OllamaClient(model=model, host=OLLAMA_HOST)
     else:
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
@@ -411,7 +446,12 @@ async def chat_loop(
     for t in tools:
         print(f"    - {t['name']}: {t['description'][:80]}")
 
-    provider = "anthropic" if isinstance(llm_client, AnthropicClient) else "gemini"
+    if isinstance(llm_client, AnthropicClient):
+        provider = "anthropic"
+    elif isinstance(llm_client, OllamaClient):
+        provider = "ollama"
+    else:
+        provider = "gemini"
 
     if session_logger is not None:
         messages = session_logger
@@ -499,7 +539,7 @@ async def chat_loop(
                 if provider == "anthropic":
                     messages.append(AnthropicClient.make_assistant_message(response))
                 else:
-                    messages.append(GeminiClient.make_assistant_message(response))
+                    messages.append(llm_client.__class__.make_assistant_message(response))
                 continue
 
             # Process tool calls in a loop.  Track which calls have been
@@ -514,7 +554,7 @@ async def chat_loop(
                 if provider == "anthropic":
                     messages.append(AnthropicClient.make_assistant_message(response))
                 else:
-                    messages.append(GeminiClient.make_assistant_message(response))
+                    messages.append(llm_client.__class__.make_assistant_message(response))
 
                 pending_tool_calls = list(tool_calls)
                 tool_result_parts = []
@@ -542,7 +582,7 @@ async def chat_loop(
                         )
                     else:
                         messages.append(
-                            GeminiClient.make_tool_result_message(tc["name"], result)
+                            llm_client.__class__.make_tool_result_message(tc["name"], result)
                         )
 
                     if interrupted_during_tools:
@@ -605,7 +645,7 @@ async def chat_loop(
                 else:
                     for tc in pending_tool_calls:
                         messages.append(
-                            GeminiClient.make_tool_result_message(tc["name"], stub_msg)
+                            llm_client.__class__.make_tool_result_message(tc["name"], stub_msg)
                         )
                 messages.append({
                     "role": "user",
@@ -630,7 +670,7 @@ async def chat_loop(
                 if provider == "anthropic":
                     messages.append(AnthropicClient.make_assistant_message(response))
                 else:
-                    messages.append(GeminiClient.make_assistant_message(response))
+                    messages.append(llm_client.__class__.make_assistant_message(response))
 
     finally:
         signal.signal(signal.SIGINT, prev_handler)
