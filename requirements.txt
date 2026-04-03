@@ -1,0 +1,22 @@
+# Core LLM providers
+anthropic
+google-genai
+
+# LangGraph multi-agent orchestration
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# Async SQLite checkpointer for LangGraph
+langgraph-checkpoint-sqlite
+
+# MCP protocol
+mcp
+
+# Configuration and utilities
+python-dotenv
+pyyaml
+requests
+aiosqlite
+
+# HTB integration (optional)
+pyhackthebox

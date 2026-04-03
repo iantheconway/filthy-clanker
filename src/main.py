@@ -1,3 +1,13 @@
+"""
+Filthy-Clanker — LangGraph Multi-Agent CTF Solver
+
+Entry point. Orchestrates:
+  1. Hexstrike Flask server startup
+  2. MCP client connection
+  3. LangGraph StateGraph with SqliteSaver checkpointing
+  4. Interactive HITL loop with autonomous agent execution
+  5. Trajectory logging to data/training/
+"""
 import asyncio
 import os
 import select
@@ -5,33 +15,30 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
+from datetime import datetime
 
-import anthropic
 import requests
+import yaml
 from dotenv import load_dotenv
+from langgraph.types import Command
 
 from config import build_system_prompt
 from htb_client import HTB
-from llms import AnthropicClient, GeminiClient, OllamaClient
 from mcp_client import HexstrikeMCPClient
-from session import (
-    SESSIONS_DIR,
-    SessionLogger,
-    default_session_name,
-    get_latest_session,
-    list_sessions,
-    load_session_json,
-    load_summary,
-    save_session_json,
-    save_summary,
-)
+from graph import build_graph, create_checkpointer, TeamState
+from graph.graph import initial_state
+from data_capture import TrajectoryLogger
 
+# ---------------------------------------------------------------------------
+# Constants / environment
+# ---------------------------------------------------------------------------
 HEXSTRIKE_DIR = os.getenv("HEXSTRIKE_DIR", "/home/kali/hexstrike-ai")
 HEXSTRIKE_PORT = os.getenv("HEXSTRIKE_PORT", "8888")
 HEXSTRIKE_VENV_PYTHON = os.path.join(HEXSTRIKE_DIR, "hexstrike-env", "bin", "python3")
 HEXSTRIKE_SERVER_SCRIPT = os.path.join(HEXSTRIKE_DIR, "hexstrike_server.py")
 HEXSTRIKE_MCP_SCRIPT = os.path.join(HEXSTRIKE_DIR, "hexstrike_mcp.py")
-
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
 
 _sigint_received = False
 _active_task: asyncio.Task | None = None
@@ -40,14 +47,12 @@ _active_task: asyncio.Task | None = None
 def _sigint_handler(signum, frame):
     global _sigint_received
     _sigint_received = True
-    # Cancel the currently awaited async task so control returns immediately
     if _active_task and not _active_task.done():
         _active_task.cancel()
     print("\n[*] Ctrl+C received — interrupting...")
 
 
 def _check_interrupt() -> bool:
-    """Return True and reset the flag if SIGINT was received."""
     global _sigint_received
     if _sigint_received:
         _sigint_received = False
@@ -56,7 +61,6 @@ def _check_interrupt() -> bool:
 
 
 async def _cancellable(coro):
-    """Run a coroutine in a task that can be cancelled by the SIGINT handler."""
     global _active_task
     task = asyncio.ensure_future(coro)
     _active_task = task
@@ -67,7 +71,6 @@ async def _cancellable(coro):
 
 
 def _flush_stdin():
-    """Drain any buffered input from stdin (e.g. leftover newlines from paste)."""
     try:
         while select.select([sys.stdin], [], [], 0)[0]:
             sys.stdin.readline()
@@ -75,16 +78,12 @@ def _flush_stdin():
         pass
 
 
+# ---------------------------------------------------------------------------
+# Hexstrike server management (unchanged from original)
+# ---------------------------------------------------------------------------
+
 def start_hexstrike_server() -> subprocess.Popen | None:
-    """Start hexstrike_server.py as a background process and wait for health.
-
-    Returns the subprocess handle, or None if the server was already running.
-    """
-    # Use a lightweight endpoint for readiness checks — /health runs
-    # 'which' on 130+ tools and can take 30+ seconds to respond.
     url = f"http://127.0.0.1:{HEXSTRIKE_PORT}/api/cache/stats"
-
-    # Check if already running
     try:
         if requests.get(url, timeout=3).ok:
             print("[*] Hexstrike server already running.")
@@ -101,14 +100,10 @@ def start_hexstrike_server() -> subprocess.Popen | None:
         stdout=server_log,
         stderr=subprocess.STDOUT,
     )
-
-    # Poll /health up to ~30 seconds
-    for i in range(30):
-        # Check if process died
+    for _ in range(30):
         if proc.poll() is not None:
             server_log.close()
-            print(f"[!] Hexstrike server exited with code {proc.returncode}.")
-            print(f"[!] Check {log_path} for details.")
+            print(f"[!] Hexstrike server exited (code {proc.returncode}). Check {log_path}")
             sys.exit(1)
         try:
             if requests.get(url, timeout=3).ok:
@@ -124,11 +119,21 @@ def start_hexstrike_server() -> subprocess.Popen | None:
     sys.exit("Error: Hexstrike server failed to start within 30 seconds.")
 
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+# ---------------------------------------------------------------------------
+# Configuration loading
+# ---------------------------------------------------------------------------
+
+def load_config(path: str = "agents.yaml") -> dict:
+    """Load and return the agents.yaml config dict."""
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), path)
+    if not os.path.exists(config_path):
+        sys.exit(f"Error: {config_path} not found. Copy agents.yaml.example or check the path.")
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
 
-def select_provider() -> str:
-    print("\nSelect LLM provider:")
+def select_provider(config: dict) -> str:
+    print("\nSelect primary LLM provider:")
     print("  1) Anthropic (Claude)")
     print("  2) Gemini")
     print("  3) Ollama (local)")
@@ -143,632 +148,473 @@ def select_provider() -> str:
         print("Invalid choice.")
 
 
-def _fetch_ollama_models() -> list[str]:
-    """Return a list of model names available on the Ollama server."""
+# ---------------------------------------------------------------------------
+# Session management (using SqliteSaver thread IDs)
+# ---------------------------------------------------------------------------
+
+def list_graph_sessions(db_path: str) -> list[dict]:
+    """List all saved graph sessions from the SQLite checkpoint DB."""
+    import sqlite3
+    sessions = []
+    if not os.path.exists(db_path):
+        return sessions
     try:
-        resp = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
-        resp.raise_for_status()
-        return [m["name"] for m in resp.json().get("models", [])]
-    except Exception as e:
-        sys.exit(f"Error: Could not reach Ollama at {OLLAMA_HOST}: {e}")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # LangGraph checkpoint table structure
+        cursor.execute(
+            "SELECT DISTINCT thread_id, MAX(checkpoint_id) as latest "
+            "FROM checkpoints GROUP BY thread_id ORDER BY latest DESC"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        for thread_id, checkpoint_id in rows:
+            sessions.append({"thread_id": thread_id, "checkpoint_id": checkpoint_id})
+    except Exception:
+        pass
+    return sessions
 
 
-def _select_ollama_model() -> str:
-    models = _fetch_ollama_models()
-    if not models:
-        sys.exit(f"Error: No models found on Ollama at {OLLAMA_HOST}.")
-    print("\nAvailable Ollama models:")
-    for i, name in enumerate(models, 1):
-        print(f"  {i}) {name}")
-    while True:
-        choice = input(f"Enter model number (1-{len(models)}): ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(models):
-            return models[int(choice) - 1]
-        print("Invalid choice.")
+# ---------------------------------------------------------------------------
+# HTB command helpers (preserved from original)
+# ---------------------------------------------------------------------------
 
+def _handle_htb_command(cmd: str, htb_client: HTB | None) -> str | None:
+    """Handle /machine, /spawn, /stop, /reset, /flag, /vpn commands.
+    Returns new IP if machine changed, else None."""
+    if not htb_client:
+        print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
+        return None
 
-def build_llm_client(provider: str):
-    if provider == "anthropic":
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            sys.exit("Error: ANTHROPIC_API_KEY not set in environment.")
-        return AnthropicClient(api_key=api_key)
-    elif provider == "ollama":
-        model = _select_ollama_model()
-        return OllamaClient(model=model, host=OLLAMA_HOST)
-    else:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            sys.exit("Error: GEMINI_API_KEY not set in environment.")
-        return GeminiClient(api_key=api_key)
-
-
-async def _handle_command(
-    cmd: str,
-    messages: SessionLogger,
-    provider: str,
-    llm_client,
-    tools: list[dict],
-    system_prompt: str,
-    htb_client: HTB | None = None,
-) -> str | None:
-    """Handle slash commands. Returns updated system_prompt if it changed, else None."""
     parts = cmd.split(maxsplit=1)
     command = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    # --- HTB commands ---
     if command == "/machine":
-        if not htb_client:
-            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
-            return None
-        if arg:
-            info = htb_client.get_machine_info(arg)
-            if isinstance(info, str):
-                print(f"[!] {info}")
-            else:
-                print(f"[*] Machine: {info['name']}")
-                print(f"    OS: {info['os']}")
-                print(f"    Difficulty: {info['difficulty']}")
-                print(f"    Points: {info['points']}")
-                print(f"    Stars: {info['stars']}")
-                print(f"    Active: {info['active']}  Retired: {info['retired']}")
-                print(f"    User owned: {info['user_owned']}  Root owned: {info['root_owned']}")
+        info = htb_client.get_machine_info(arg) if arg else htb_client.get_active_machine()
+        if not info:
+            print("[*] No active machine.")
+        elif isinstance(info, str):
+            print(f"[!] {info}")
         else:
-            info = htb_client.get_active_machine()
-            if info:
-                print(f"[*] Active machine: {info['name']}")
-                print(f"    OS: {info['os']}")
-                print(f"    Difficulty: {info['difficulty']}")
-                print(f"    IP: {info['ip']}")
-            else:
-                print("[*] No active machine.")
+            print(f"[*] Machine: {info.get('name')} | OS: {info.get('os')} | "
+                  f"IP: {info.get('ip', 'N/A')} | {info.get('difficulty')}")
         return None
 
     elif command == "/spawn":
-        if not htb_client:
-            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
-            return None
         if not arg:
             print("[!] Usage: /spawn <machine-name>")
             return None
         print(f"[*] Spawning '{arg}'...")
         result = htb_client.spawn_machine(arg)
-        if result.startswith("Error"):
+        if isinstance(result, str) and result.startswith("Error"):
             print(f"[!] {result}")
             return None
         print(f"[*] Machine spawned at {result}")
-        # Refresh machine info and rebuild prompt
-        info = htb_client.get_active_machine()
-        if info:
-            new_prompt = build_system_prompt(
-                machine_name=info["name"],
-                machine_os=info["os"],
-                machine_difficulty=info["difficulty"],
-                machine_ip=info["ip"],
-            )
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"[System: Target machine changed. Now working on '{info['name']}' "
-                    f"({info['os']}, {info['difficulty']}) at {info['ip']}. "
-                    f"Hostname: {info['name'].lower()}.htb]"
-                ),
-            })
-            messages.append({
-                "role": "assistant",
-                "content": (
-                    f"Understood — now targeting {info['name']} at {info['ip']}. "
-                    "Ready to begin when you are."
-                ),
-            })
-            return new_prompt
-        return None
+        return result
 
     elif command == "/stop":
-        if not htb_client:
-            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
-            return None
-        result = htb_client.stop_machine()
-        print(f"[*] {result}")
-        if not result.startswith("Error") and not result.startswith("No active"):
-            messages.append({
-                "role": "user",
-                "content": "[System: The active machine has been stopped.]",
-            })
-            messages.append({
-                "role": "assistant",
-                "content": "Machine stopped. Use /spawn <name> to start a new one.",
-            })
-            return build_system_prompt()
-        return None
-
+        print(f"[*] {htb_client.stop_machine()}")
     elif command == "/reset":
-        if not htb_client:
-            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
-            return None
-        result = htb_client.reset_machine()
-        print(f"[*] {result}")
-        return None
-
+        print(f"[*] {htb_client.reset_machine()}")
     elif command == "/flag":
-        if not htb_client:
-            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
-            return None
         if not arg:
             print("[!] Usage: /flag <flag-string>")
-            return None
-        result = htb_client.submit_flag(arg)
-        print(f"[*] {result}")
-        return None
-
-    elif command == "/vpn":
-        if not htb_client:
-            print("[!] HTB integration not configured (set HTB_APP_TOKEN).")
-            return None
-        result = htb_client.get_vpn_status()
-        print(f"[*] {result}")
-        return None
-
-    elif command == "/save":
-        name = arg or default_session_name()
-        json_path = os.path.join(SESSIONS_DIR, f"{name}.json")
-        md_path = os.path.join(SESSIONS_DIR, f"{name}.md")
-        save_session_json(messages, provider, json_path)
-        print(f"[*] Session saved to {json_path}")
-        print("[*] Generating summary...")
-        await save_summary(messages, llm_client, tools, system_prompt, md_path)
-        print(f"[*] Summary saved to {md_path}")
-
-    elif command == "/resume":
-        if not arg:
-            # List available sessions
-            sessions = list_sessions()
-            if not sessions:
-                print("[*] No saved sessions found.")
-                return
-            print("[*] Available sessions:")
-            for s in sessions:
-                flags = []
-                if s["has_json"]:
-                    flags.append("json")
-                if s["has_md"]:
-                    flags.append("summary")
-                print(f"    - {s['name']} [{', '.join(flags)}]")
-            print("\nUsage: /resume <name>")
-            return
-
-        # Strip file extensions if user included them
-        for ext in (".json", ".md"):
-            if arg.endswith(ext):
-                arg = arg[: -len(ext)]
-                break
-
-        json_path = os.path.join(SESSIONS_DIR, f"{arg}.json")
-        md_path = os.path.join(SESSIONS_DIR, f"{arg}.md")
-
-        if os.path.exists(json_path):
-            loaded_messages, loaded_provider = load_session_json(json_path)
-            if loaded_provider != provider:
-                print(
-                    f"[!] Session was saved with provider '{loaded_provider}', "
-                    f"but current provider is '{provider}'."
-                )
-                print("[!] Message formats are incompatible for JSON resume.")
-                if os.path.exists(md_path):
-                    summary_text = load_summary(md_path)
-                    context_msg = (
-                        f"[Previous session summary for context]\n\n{summary_text}\n\n"
-                        "[End of previous session summary. Continue from where we left off.]"
-                    )
-                    messages.clear()
-                    messages.append({"role": "user", "content": context_msg})
-                    messages.append({
-                        "role": "assistant",
-                        "content": "I've reviewed the previous session summary and I'm ready to continue. What would you like to focus on next?",
-                    })
-                    print(f"[*] Falling back to summary resume for '{arg}'.")
-                    print(f"\n--- Session Summary ---\n{summary_text}\n--- End Summary ---\n")
-                else:
-                    print("[!] No summary file available either. Cannot resume this session.")
-                return
-            messages.clear()
-            messages.extend(loaded_messages)
-            # Drop trailing plain user messages (e.g. interrupt markers) so the
-            # next user input doesn't create consecutive user messages.
-            # Do NOT pop user messages that contain tool_result blocks — they are
-            # required by the API to pair with a preceding tool_use.
-            while messages and messages[-1].get("role") == "user":
-                _content = messages[-1].get("content", [])
-                if isinstance(_content, list) and any(
-                    isinstance(b, dict) and b.get("type") == "tool_result"
-                    for b in _content
-                ):
-                    break
-                messages.pop()
-            # If we stopped on a tool_result user message, add a stub assistant
-            # turn so the next user input doesn't create consecutive user messages.
-            if messages and messages[-1].get("role") == "user":
-                messages.append({
-                    "role": "assistant",
-                    "content": "[Session resumed — previous tool results preserved. Ready to continue.]",
-                })
-            print(f"[*] Resumed session '{arg}' with {len(messages)} messages (JSON).")
-        elif os.path.exists(md_path):
-            summary_text = load_summary(md_path)
-            context_msg = (
-                f"[Previous session summary for context]\n\n{summary_text}\n\n"
-                "[End of previous session summary. Continue from where we left off.]"
-            )
-            messages.clear()
-            messages.append({"role": "user", "content": context_msg})
-            messages.append({
-                "role": "assistant",
-                "content": "I've reviewed the previous session summary and I'm ready to continue. What would you like to focus on next?",
-            })
-            print(f"[*] Resumed session '{arg}' from summary (no JSON found).")
-            print(f"\n--- Session Summary ---\n{summary_text}\n--- End Summary ---\n")
         else:
-            print(f"[!] No session found with name '{arg}'.")
-
-    elif command == "/sessions":
-        sessions = list_sessions()
-        if not sessions:
-            print("[*] No saved sessions found.")
-            return
-        print("[*] Saved sessions:")
-        for s in sessions:
-            flags = []
-            if s["has_json"]:
-                flags.append("json")
-            if s["has_md"]:
-                flags.append("summary")
-            print(f"    - {s['name']} [{', '.join(flags)}]")
-
+            print(f"[*] {htb_client.submit_flag(arg)}")
+    elif command == "/vpn":
+        print(f"[*] {htb_client.get_vpn_status()}")
     else:
-        print(f"[!] Unknown command: {command}")
-        return None
+        print(f"[!] Unknown HTB command: {command}")
+    return None
 
 
-async def chat_loop(
-    llm_client,
-    mcp_client: HexstrikeMCPClient,
-    initial_messages: list[dict] | None = None,
-    system_prompt: str | None = None,
-    htb_client: HTB | None = None,
-    session_logger: SessionLogger | None = None,
-):
-    if system_prompt is None:
-        system_prompt = build_system_prompt()
+# ---------------------------------------------------------------------------
+# Output rendering
+# ---------------------------------------------------------------------------
 
-    tools = await mcp_client.list_tools()
-    print(f"\n[*] {len(tools)} MCP tools available:")
-    for t in tools:
-        print(f"    - {t['name']}: {t['description'][:80]}")
+def _print_agent_output(node_name: str, output: dict) -> None:
+    """Pretty-print state updates emitted by an agent node."""
+    if node_name == "supervisor":
+        next_target = output.get("next", "")
+        if next_target and next_target != "__end__":
+            print(f"\n{'='*60}")
+            print(f"  [Supervisor] → Routing to: {next_target.upper()}")
+            print(f"{'='*60}")
+        return
 
-    if isinstance(llm_client, AnthropicClient):
-        provider = "anthropic"
-    elif isinstance(llm_client, OllamaClient):
-        provider = "ollama"
-    else:
-        provider = "gemini"
+    messages = output.get("messages", [])
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "assistant":
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "").strip()
+                        if text:
+                            print(f"\n[{node_name.upper()}] {text}\n")
+            elif isinstance(content, str) and content.strip():
+                print(f"\n[{node_name.upper()}] {content.strip()}\n")
 
-    if session_logger is not None:
-        messages = session_logger
-    else:
-        log_name = default_session_name()
-        log_path = os.path.join(SESSIONS_DIR, f"{log_name}.json")
-        messages = SessionLogger(provider, log_path, initial_messages)
-        print(f"[*] Session log: {log_path}")
+    kb = output.get("knowledge_base")
+    if kb:
+        flags = kb.get("flags", [])
+        if flags:
+            print(f"\n{'!'*60}")
+            print(f"  FLAG CAPTURED: {flags}")
+            print(f"{'!'*60}\n")
 
-    if initial_messages:
-        print(f"\n[*] Resumed session with {len(messages)} messages.")
 
-    # Install SIGINT handler so Ctrl+C works reliably in async context
+# ---------------------------------------------------------------------------
+# Main graph session loop
+# ---------------------------------------------------------------------------
+
+async def run_session(
+    graph,
+    session_id: str,
+    task: str,
+    provider: str,
+    config: dict,
+    trajectory_logger: TrajectoryLogger,
+    target_ip: str = "",
+    machine_name: str = "",
+    resume: bool = False,
+) -> None:
+    """
+    Drive the LangGraph graph for one CTF session.
+    Handles streaming output, HITL interrupts, and trajectory logging.
+    """
+    thread_config = {"configurable": {"thread_id": session_id}}
+
+    if resume:
+        # Resume from checkpoint — inject a continuation message
+        current_graph_state = graph.get_state(thread_config)
+        if current_graph_state.values:
+            print(f"[*] Resuming session {session_id} from checkpoint.")
+            input_payload = Command(resume=f"[Resuming session. Continue from where we left off. Task: {task}]")
+        else:
+            print(f"[!] No checkpoint found for {session_id}. Starting fresh.")
+            resume = False
+
+    if not resume:
+        state = initial_state(task, provider, session_id, config, target_ip, machine_name)
+        input_payload = state
+        trajectory_logger.set_session(session_id)
+
+    print(f"\n[*] Session ID: {session_id}")
+    print("[*] Running autonomous agents. Press Ctrl+C to interrupt.\n")
+
     prev_handler = signal.signal(signal.SIGINT, _sigint_handler)
-
-    print("\nChat started. Type 'exit' or 'quit' to stop.")
-    print("Commands: /save [name], /resume [name], /sessions")
-    if htb_client:
-        print("HTB:      /machine [name], /spawn <name>, /stop, /reset, /flag <flag>, /vpn")
-    print()
 
     try:
         while True:
-            _check_interrupt()  # clear any stale flag
+            _check_interrupt()
+
+            # Stream graph execution node-by-node
+            interrupted = False
             try:
-                user_input = input("You: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nExiting.")
-                break
-
-            if user_input.lower() in ("exit", "quit"):
-                print("Goodbye.")
-                break
-            if not user_input:
-                continue
-
-            # Handle slash commands
-            if user_input.startswith("/"):
-                new_prompt = await _handle_command(
-                    user_input, messages, provider, llm_client, tools,
-                    system_prompt, htb_client,
-                )
-                if new_prompt is not None:
-                    system_prompt = new_prompt
-                _flush_stdin()
-                continue
-
-            messages.append({"role": "user", "content": user_input})
-
-            # Single turn: get one LLM response, handle tool calls, then
-            # pause for user input.
-            try:
-                response = await _cancellable(
-                    llm_client.generate_response(
-                        messages, tools, system_prompt
-                    )
-                )
-            except asyncio.CancelledError:
-                messages.pop()
-                print("[*] Interrupted. You can now type a message.")
-                _flush_stdin()
-                continue
-            except anthropic.BadRequestError as e:
-                print(f"\n[!] API error: {e.message}")
-                messages.pop()
-                continue
-            except Exception as e:
-                print(f"\n[!] LLM request failed: {e}")
-                messages.pop()
-                continue
-
-            if _check_interrupt():
-                messages.pop()
-                print("[*] Interrupted. You can now type a message.")
-                _flush_stdin()
-                continue
-
-            # Print any text the model produced
-            if response["text"]:
-                print(f"\nAssistant: {response['text']}\n")
-
-            tool_calls = llm_client.parse_tool_calls(response)
-
-            if not tool_calls:
-                if provider == "anthropic":
-                    messages.append(AnthropicClient.make_assistant_message(response))
-                else:
-                    messages.append(llm_client.__class__.make_assistant_message(response))
-                continue
-
-            # Process tool calls in a loop.  Track which calls have been
-            # completed so we can stub the rest if the user interrupts.
-            follow_up_ok = True
-            pending_tool_calls: list[dict] = []
-
-            while tool_calls:
-                if _check_interrupt():
-                    break
-
-                if provider == "anthropic":
-                    messages.append(AnthropicClient.make_assistant_message(response))
-                else:
-                    messages.append(llm_client.__class__.make_assistant_message(response))
-
-                pending_tool_calls = list(tool_calls)
-                tool_result_parts = []
-                interrupted_during_tools = False
-                for tc in tool_calls:
+                async for event in graph.astream(input_payload, thread_config, stream_mode="updates"):
                     if _check_interrupt():
-                        interrupted_during_tools = True
+                        interrupted = True
                         break
-                    print(f"[tool] Calling {tc['name']}({tc['arguments']})")
-                    try:
-                        result = await _cancellable(
-                            mcp_client.call_tool(tc["name"], tc["arguments"])
-                        )
-                    except asyncio.CancelledError:
-                        result = "[Tool call cancelled by user]"
-                        interrupted_during_tools = True
-                    except Exception as e:
-                        result = f"Error executing tool: {e}"
-                    print(f"[tool] {tc['name']} returned ({len(result)} chars)")
-                    pending_tool_calls.remove(tc)
-
-                    if provider == "anthropic":
-                        tool_result_parts.append(
-                            AnthropicClient.make_tool_result_message(tc["id"], result)
-                        )
-                    else:
-                        messages.append(
-                            llm_client.__class__.make_tool_result_message(tc["name"], result)
-                        )
-
-                    if interrupted_during_tools:
-                        break
-
-                if interrupted_during_tools:
-                    if provider == "anthropic" and tool_result_parts:
-                        messages.append({"role": "user", "content": tool_result_parts})
-                    break
-
-                if provider == "anthropic" and tool_result_parts:
-                    messages.append({"role": "user", "content": tool_result_parts})
-
-                pending_tool_calls = []
-
-                # Retry up to 3 times on transient failures
-                follow_up_ok = False
-                for attempt in range(3):
-                    if _check_interrupt():
-                        break
-                    try:
-                        response = await _cancellable(
-                            llm_client.generate_response(
-                                messages, tools, system_prompt
-                            )
-                        )
-                        follow_up_ok = True
-                        break
-                    except asyncio.CancelledError:
-                        break
-                    except Exception as e:
-                        if attempt < 2:
-                            wait = 2 ** attempt
-                            print(f"\n[!] LLM request failed ({e}), retrying in {wait}s...")
-                            await asyncio.sleep(wait)
+                    for node_name, output in event.items():
+                        if node_name == "__interrupt__":
+                            # HITL interrupt from supervisor
+                            interrupt_data = output[0].value if output else {}
+                            reason = interrupt_data.get("reason", "manual_intervention")
+                            message = interrupt_data.get("message", "Human input required.")
+                            print(f"\n{'*'*60}")
+                            print(f"  [HITL INTERRUPT — {reason}]")
+                            print(f"{'*'*60}")
+                            print(f"{message}\n")
+                            try:
+                                human_response = input("Your response (or Enter to skip): ").strip()
+                            except (EOFError, KeyboardInterrupt):
+                                human_response = "Continue with best effort."
+                            input_payload = Command(resume=human_response or "Continue with best effort.")
+                            interrupted = True
+                            break
                         else:
-                            print(f"\n[!] LLM follow-up failed after 3 attempts: {e}")
+                            _print_agent_output(node_name, output)
 
-                if not follow_up_ok:
+                        # Log trajectories for agent nodes
+                        if node_name in ("recon", "exploit", "privesc"):
+                            _log_node_trajectories(node_name, output, trajectory_logger)
+
+                    if interrupted:
+                        break
+
+            except asyncio.CancelledError:
+                interrupted = True
+                print("\n[*] Agent loop interrupted by user.")
+
+            except Exception as e:
+                print(f"\n[!] Graph execution error: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+
+            if interrupted and not isinstance(input_payload, Command):
+                # User pressed Ctrl+C (not a HITL interrupt) — ask what to do
+                print("\nOptions:")
+                print("  1) Continue running")
+                print("  2) Inject a message to agents")
+                print("  3) Save and exit")
+                print("  4) Exit without saving")
+                choice = input("Choice [1]: ").strip() or "1"
+
+                if choice == "1":
+                    # Re-invoke from last checkpoint
+                    input_payload = Command(resume="Continue autonomously.")
+                    continue
+                elif choice == "2":
+                    user_msg = input("Message to agents: ").strip()
+                    if user_msg:
+                        input_payload = Command(resume=user_msg)
+                        continue
+                    else:
+                        input_payload = Command(resume="Continue autonomously.")
+                        continue
+                else:
                     break
 
-                if _check_interrupt():
+            elif isinstance(input_payload, Command):
+                # We sent a Command(resume=...) — check if graph still has work
+                graph_state = graph.get_state(thread_config)
+                if not graph_state.next:
+                    print("[*] Graph completed.")
                     break
+                # Graph paused again at interrupt or completed — loop back
+                continue
 
-                if response["text"]:
-                    print(f"\nAssistant: {response['text']}\n")
-
-                tool_calls = llm_client.parse_tool_calls(response)
-
-            # After the tool loop — completed normally or interrupted
-            if pending_tool_calls:
-                print("[*] Interrupted by user. You can now type a message.")
-                stub_msg = "[Tool call interrupted by user before execution]"
-                if provider == "anthropic":
-                    stub_results = [
-                        AnthropicClient.make_tool_result_message(tc["id"], stub_msg)
-                        for tc in pending_tool_calls
-                    ]
-                    messages.append({"role": "user", "content": stub_results})
-                else:
-                    for tc in pending_tool_calls:
-                        messages.append(
-                            llm_client.__class__.make_tool_result_message(tc["name"], stub_msg)
-                        )
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "[The user interrupted the tool call sequence. "
-                        "All tool calls and results above are preserved. "
-                        "Stop calling tools and wait for the user's next instruction.]"
-                    ),
-                })
-                _flush_stdin()
-            elif _check_interrupt():
-                print("[*] Interrupted by user. You can now type a message.")
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "[The user interrupted the assistant. "
-                        "Stop calling tools and wait for the user's next instruction.]"
-                    ),
-                })
-                _flush_stdin()
-            elif follow_up_ok:
-                if provider == "anthropic":
-                    messages.append(AnthropicClient.make_assistant_message(response))
-                else:
-                    messages.append(llm_client.__class__.make_assistant_message(response))
+            else:
+                # Normal completion
+                break
 
     finally:
         signal.signal(signal.SIGINT, prev_handler)
+        # Record session end
+        try:
+            final_state = graph.get_state(thread_config)
+            if final_state.values:
+                trajectory_logger.record_session_end(final_state.values)
+                stats = trajectory_logger.get_stats()
+                print(f"\n[DataCapture] Trajectories: {stats.get('records', 0)} records, "
+                      f"avg score: {stats.get('avg_score', 0)}, "
+                      f"high-value: {stats.get('high_value', 0)}")
+        except Exception:
+            pass
 
+
+def _log_node_trajectories(node_name: str, output: dict, logger: TrajectoryLogger) -> None:
+    """Extract tool call/result pairs from node output and log as trajectories."""
+    messages = output.get("messages", [])
+    kb_after = output.get("knowledge_base", {})
+
+    # Find tool result messages and pair with preceding tool calls
+    # This is a best-effort extraction from the message list
+    for i, msg in enumerate(messages):
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_use_id = block.get("tool_use_id", "")
+                    result_text = ""
+                    result_content = block.get("content", [])
+                    if isinstance(result_content, list):
+                        result_text = " ".join(
+                            b.get("text", "") for b in result_content
+                            if isinstance(b, dict)
+                        )
+                    elif isinstance(result_content, str):
+                        result_text = result_content
+
+                    # Find the corresponding tool_use block
+                    tool_name = ""
+                    tool_args = {}
+                    for prev_msg in reversed(messages[:i]):
+                        prev_content = prev_msg.get("content", [])
+                        if isinstance(prev_content, list):
+                            for b in prev_content:
+                                if (isinstance(b, dict) and
+                                        b.get("type") == "tool_use" and
+                                        b.get("id") == tool_use_id):
+                                    tool_name = b.get("name", "")
+                                    tool_args = b.get("input", {})
+
+                    if tool_name and result_text:
+                        # Use minimal state snapshots for logging
+                        state_before = {"knowledge_base": {}, "task": "", "session_id": ""}
+                        state_after = {"knowledge_base": kb_after, "exploit_attempts": output.get("exploit_attempts", 0)}
+                        logger.record(
+                            state_before=state_before,
+                            action={"tool_name": tool_name, "arguments": tool_args},
+                            result=result_text,
+                            state_after=state_after,
+                            agent_name=node_name,
+                        )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 async def main():
     load_dotenv()
 
-    # --- HTB integration (optional) ---
+    # --- Load config ---
+    config = load_config("agents.yaml")
+    settings = config.get("settings", {})
+    checkpoint_db = settings.get("checkpoint_db", "sessions/checkpoint.db")
+    training_dir = settings.get("training_data_dir", "data/training")
+
+    # Resolve paths relative to project root
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    checkpoint_db = os.path.join(project_root, checkpoint_db)
+    training_dir = os.path.join(project_root, training_dir)
+
+    # --- HTB integration ---
     htb_client = None
-    system_prompt = build_system_prompt()
+    active_machine = None
     htb_token = os.getenv("HTB_APP_TOKEN")
     if htb_token:
         try:
             htb_client = HTB(htb_token)
             print("[*] HTB client connected.")
-            active = htb_client.get_active_machine()
-            if active:
-                print(f"[*] Active machine: {active['name']} ({active['os']}, "
-                      f"{active['difficulty']}) @ {active['ip']}")
-                system_prompt = build_system_prompt(
-                    machine_name=active["name"],
-                    machine_os=active["os"],
-                    machine_difficulty=active["difficulty"],
-                    machine_ip=active["ip"],
-                )
+            active_machine = htb_client.get_active_machine()
+            if active_machine:
+                print(f"[*] Active machine: {active_machine['name']} "
+                      f"({active_machine['os']}, {active_machine['difficulty']}) "
+                      f"@ {active_machine['ip']}")
             else:
-                print("[*] No active HTB machine. Use /spawn <name> to start one.")
+                print("[*] No active HTB machine.")
         except Exception as e:
             print(f"[!] Failed to initialize HTB client: {e}")
     else:
         print("[*] HTB_APP_TOKEN not set — HTB commands disabled.")
 
-    # Start (or detect) the hexstrike Flask server
+    # --- Hexstrike server ---
     server_proc = start_hexstrike_server()
 
-    provider = select_provider()
-    llm_client = build_llm_client(provider)
+    # --- Provider selection ---
+    provider = select_provider(config)
 
-    # Check for a recent session to resume
-    initial_messages = None
-    session_logger = None
-    latest = get_latest_session(provider)
-    if latest:
-        name, filepath, msg_count = latest
-        print(f"\n[*] Found recent session: {name} ({msg_count} messages)")
-        choice = input("    Resume this session? [y/N]: ").strip().lower()
-        if choice in ("y", "yes"):
-            loaded_messages, _ = load_session_json(filepath)
-            # Drop trailing plain user messages to avoid consecutive user turns.
-            # Do NOT pop user messages that contain tool_result blocks — they are
-            # required by the API to pair with a preceding tool_use.
-            while loaded_messages and loaded_messages[-1].get("role") == "user":
-                _content = loaded_messages[-1].get("content", [])
-                if isinstance(_content, list) and any(
-                    isinstance(b, dict) and b.get("type") == "tool_result"
-                    for b in _content
-                ):
-                    break
-                loaded_messages.pop()
-            # If we stopped on a tool_result user message, add a stub assistant
-            # turn so the next user input doesn't create consecutive user messages.
-            if loaded_messages and loaded_messages[-1].get("role") == "user":
-                loaded_messages.append({
-                    "role": "assistant",
-                    "content": "[Session resumed — previous tool results preserved. Ready to continue.]",
-                })
-            session_logger = SessionLogger(provider, filepath, loaded_messages)
-            initial_messages = loaded_messages
-            print(f"[*] Resuming session from {filepath}")
-
-    # Configure MCP server command — defaults use hexstrike venv python
+    # --- MCP client ---
     mcp_command = os.getenv("MCP_COMMAND", HEXSTRIKE_VENV_PYTHON)
     mcp_args_str = os.getenv(
         "MCP_ARGS",
         f"{HEXSTRIKE_MCP_SCRIPT} --server http://127.0.0.1:{HEXSTRIKE_PORT}",
     )
-    args = mcp_args_str.split() if mcp_args_str else []
+    mcp_args = mcp_args_str.split() if mcp_args_str else []
 
-    mcp_client = HexstrikeMCPClient(command=mcp_command, args=args)
-
-    print(f"[*] Connecting to MCP server: {mcp_command} {' '.join(args)}")
+    mcp_client = HexstrikeMCPClient(command=mcp_command, args=mcp_args)
+    print(f"[*] Connecting to MCP server...")
     try:
         await mcp_client.connect()
     except Exception as e:
         if server_proc:
             server_proc.terminate()
         sys.exit(f"Failed to connect to MCP server: {e}")
-
     print("[*] MCP session initialized.")
 
+    # List available tools
+    tools = await mcp_client.list_tools()
+    print(f"[*] {len(tools)} MCP tools available.")
+
+    # --- Build LangGraph ---
+    checkpointer = create_checkpointer(checkpoint_db)
+    graph = build_graph(mcp_client, config, checkpointer)
+    trajectory_logger = TrajectoryLogger(training_dir)
+
+    # --- Session selection ---
+    print("\nSession options:")
+    print("  1) New session")
+    sessions = list_graph_sessions(checkpoint_db)
+    for i, s in enumerate(sessions[:5], 2):
+        print(f"  {i}) Resume: {s['thread_id']}")
+    print()
+
+    session_id = None
+    resume = False
+    task = ""
+    target_ip = ""
+    machine_name = ""
+
+    while True:
+        choice = input("Choice [1]: ").strip() or "1"
+        if choice == "1":
+            # New session
+            session_id = f"session-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}-{str(uuid.uuid4())[:8]}"
+
+            # Determine task from HTB machine or user input
+            if active_machine:
+                machine_name = active_machine["name"]
+                target_ip = active_machine["ip"]
+                task = (
+                    f"Hack the HackTheBox machine '{machine_name}' "
+                    f"({active_machine['os']}, {active_machine['difficulty']}) "
+                    f"at IP {target_ip}. Hostname: {machine_name.lower()}.htb. "
+                    f"Capture user.txt and root.txt flags."
+                )
+                print(f"[*] Task auto-set from active HTB machine: {machine_name}")
+            else:
+                task = input("Enter target/task description: ").strip()
+                if not task:
+                    task = "Enumerate and exploit the target machine. Capture all flags."
+                ip_input = input("Target IP (optional): ").strip()
+                if ip_input:
+                    target_ip = ip_input
+
+            print(f"[*] New session: {session_id}")
+            break
+
+        elif choice.isdigit() and 2 <= int(choice) < 2 + len(sessions):
+            idx = int(choice) - 2
+            session_id = sessions[idx]["thread_id"]
+            resume = True
+            task = input("Override task (Enter to keep original): ").strip()
+            print(f"[*] Resuming session: {session_id}")
+            break
+        else:
+            print("Invalid choice.")
+
+    # --- HTB commands before starting ---
+    print("\nCommands during session:")
+    print("  Ctrl+C  — interrupt and show options")
+    if htb_client:
+        print("  Use /spawn, /stop, /reset, /flag, /vpn before starting the graph")
+        while True:
+            cmd = input("\nHTB command (or Enter to start): ").strip()
+            if not cmd:
+                break
+            if cmd.startswith("/"):
+                new_ip = _handle_htb_command(cmd, htb_client)
+                if new_ip and cmd.startswith("/spawn"):
+                    active_machine = htb_client.get_active_machine()
+                    if active_machine:
+                        target_ip = active_machine["ip"]
+                        machine_name = active_machine["name"]
+                        task = (
+                            f"Hack the HackTheBox machine '{machine_name}' "
+                            f"({active_machine['os']}, {active_machine['difficulty']}) "
+                            f"at IP {target_ip}. Hostname: {machine_name.lower()}.htb. "
+                            f"Capture user.txt and root.txt flags."
+                        )
+                        print(f"[*] Task updated for {machine_name} @ {target_ip}")
+
+    # --- Run the graph ---
     try:
-        await chat_loop(
-            llm_client, mcp_client,
-            initial_messages=initial_messages,
-            system_prompt=system_prompt,
-            htb_client=htb_client,
-            session_logger=session_logger,
+        await run_session(
+            graph=graph,
+            session_id=session_id,
+            task=task,
+            provider=provider,
+            config=config,
+            trajectory_logger=trajectory_logger,
+            target_ip=target_ip,
+            machine_name=machine_name,
+            resume=resume,
         )
     finally:
         await mcp_client.disconnect()
@@ -777,6 +623,8 @@ async def main():
             server_proc.terminate()
             server_proc.wait()
             print("[*] Hexstrike server stopped.")
+        print(f"\n[*] Session {session_id} checkpointed to {checkpoint_db}")
+        print(f"[*] Training data saved to {training_dir}/")
 
 
 if __name__ == "__main__":
