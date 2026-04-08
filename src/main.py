@@ -9,6 +9,7 @@ Entry point. Orchestrates:
   5. Trajectory logging to data/training/
 """
 import asyncio
+import logging
 import os
 import select
 import signal
@@ -42,6 +43,35 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
 
 _sigint_received = False
 _active_task: asyncio.Task | None = None
+
+
+def setup_logging(session_id: str, project_root: str) -> str:
+    """
+    Configure the 'filthy_clanker' logger to write to both console and a
+    per-session log file at <project_root>/logs/<session_id>.log.
+    Returns the log file path.
+    """
+    log_dir = os.path.join(project_root, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"{session_id}.log")
+
+    log = logging.getLogger("filthy_clanker")
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+    fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+
+    # File handler — full record of all agent activity
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+
+    # Console handler — mirrors to stdout so the user sees it live
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    log.addHandler(ch)
+
+    return log_path
 
 
 def _sigint_handler(signum, frame):
@@ -150,22 +180,34 @@ def select_provider(config: dict) -> str:
 
 
 def _select_and_set_ollama_model(config: dict) -> None:
-    """Prompt user to pick an Ollama model and store it in OLLAMA_MODEL env var."""
-    host = (
+    """Prompt user to pick an Ollama model and store it in OLLAMA_MODEL env var.
+    If the configured host is unreachable, prompts the user to enter the correct one."""
+    default_host = (
         config.get("agents", {}).get("summarizer", {}).get("host")
-        or os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+        or os.getenv("OLLAMA_HOST", "http://localhost:11434")
     )
-    try:
-        resp = requests.get(f"{host}/api/tags", timeout=5)
-        resp.raise_for_status()
-        models = [m["name"] for m in resp.json().get("models", [])]
-    except Exception as e:
-        print(f"[!] Could not reach Ollama at {host}: {e}")
-        print("[!] Using default model 'llama3.2'. Set OLLAMA_MODEL to override.")
+
+    # Try up to 3 hosts (let user correct if needed)
+    host = default_host
+    for attempt in range(3):
+        try:
+            resp = requests.get(f"{host}/api/tags", timeout=5)
+            resp.raise_for_status()
+            models = [m["name"] for m in resp.json().get("models", [])]
+            break
+        except Exception as e:
+            print(f"[!] Could not reach Ollama at {host}: {e}")
+            new_host = input(f"    Enter Ollama host URL (or Enter to skip Ollama): ").strip()
+            if not new_host:
+                print("[!] Skipping Ollama model selection. Set OLLAMA_HOST and OLLAMA_MODEL in .env to use Ollama.")
+                return
+            host = new_host.rstrip("/")
+    else:
+        print("[!] Could not connect to Ollama after 3 attempts.")
         return
 
     if not models:
-        print(f"[!] No models found on Ollama at {host}. Using 'llama3.2'.")
+        print(f"[!] No models found on Ollama at {host}.")
         return
 
     print(f"\nAvailable Ollama models (from {host}):")
@@ -178,6 +220,8 @@ def _select_and_set_ollama_model(config: dict) -> None:
             os.environ["OLLAMA_MODEL"] = selected
             os.environ["OLLAMA_HOST"] = host
             print(f"[*] Ollama model: {selected}")
+            # Also update the summarizer host in the loaded config so compaction works
+            config.setdefault("agents", {}).setdefault("summarizer", {})["host"] = host
             return
         print("Invalid choice.")
 
@@ -628,6 +672,10 @@ async def main():
                             f"Capture user.txt and root.txt flags."
                         )
                         print(f"[*] Task updated for {machine_name} @ {target_ip}")
+
+    # --- Set up per-session logging ---
+    log_path = setup_logging(session_id, project_root)
+    print(f"[*] Agent log: {log_path}")
 
     # --- Build LangGraph and run (checkpointer must stay open for the session) ---
     try:

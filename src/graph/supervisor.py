@@ -14,6 +14,7 @@ control back to the human operator when manual intervention is needed.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import os
 from typing import Any, Literal
@@ -24,6 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from llms import AnthropicClient, GeminiClient, OllamaClient
 
 from .state import TeamState
+
+logger = logging.getLogger("filthy_clanker")
 
 
 # Possible routing destinations
@@ -75,15 +78,14 @@ async def supervisor_node(state: TeamState) -> dict:
     # -----------------------------------------------------------------------
     flags = kb.get("flags", [])
     if flags:
-        print(f"\n[Supervisor] Flag captured: {flags}. Mission complete!")
+        logger.info("[Supervisor] Flag captured: %s. Mission complete!", flags)
         return {"next": "__end__"}
 
     # -----------------------------------------------------------------------
     # 2. Context compaction check — route to summarizer before hitting limits
     # -----------------------------------------------------------------------
     if current_estimate > context_limit:
-        print(f"\n[Supervisor] Context limit approaching "
-              f"(~{current_estimate:,} tokens). Triggering compaction.")
+        logger.info("[Supervisor] Context limit approaching (~%s tokens). Triggering compaction.", f"{current_estimate:,}")
         return {"next": "compaction"}
 
     # -----------------------------------------------------------------------
@@ -98,8 +100,7 @@ async def supervisor_node(state: TeamState) -> dict:
                 f"Knowledge Base:\n{json.dumps(kb, indent=2)}"
             ),
         }
-        print(f"\n[Supervisor] Exploit loop detected ({exploit_attempts} failures). "
-              f"Requesting human input...")
+        logger.info("[Supervisor] Exploit loop detected (%s failures). Requesting human input...", exploit_attempts)
         human_response = interrupt(hitl_payload)
         # Resume after human provides input — inject as a user message and reset counter
         new_message = {
@@ -171,7 +172,7 @@ async def supervisor_node(state: TeamState) -> dict:
     response = await llm.generate_response(
         messages=routing_messages,
         tools=[],
-        system=system_prompt,
+        system_prompt=system_prompt,
     )
 
     # Parse the routing decision
@@ -219,8 +220,7 @@ async def supervisor_node(state: TeamState) -> dict:
         else:
             next_agent = "recon"
 
-    print(f"\n[Supervisor] → {next_agent.upper()}"
-          + (f" | {reasoning[:120]}" if reasoning else ""))
+    logger.info("[Supervisor] → %s%s", next_agent.upper(), f" | {reasoning[:120]}" if reasoning else "")
 
     return {
         "next": next_agent,

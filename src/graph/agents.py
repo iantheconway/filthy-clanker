@@ -11,6 +11,7 @@ configured LLM and available MCP tools, then returns a state update including:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 import os
@@ -22,6 +23,8 @@ from .summarizer import maybe_summarize
 # Import existing LLM clients
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from llms import AnthropicClient, GeminiClient, OllamaClient
+
+logger = logging.getLogger("filthy_clanker")
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +173,7 @@ async def _run_agent_loop(
         response = await llm.generate_response(
             messages=messages + new_messages,
             tools=formatted_tools,
-            system=full_system,
+            system_prompt=full_system,
         )
 
         tool_calls = llm.parse_tool_calls(response)
@@ -192,7 +195,7 @@ async def _run_agent_loop(
                 except json.JSONDecodeError:
                     raw_args = {}
 
-            print(f"  [{agent_name}] → {tool_name}({json.dumps(raw_args)[:120]})")
+            logger.info("[%s] → %s(%s)", agent_name, tool_name, json.dumps(raw_args)[:120])
 
             raw_result = await mcp_client.call_tool(tool_name, raw_args)
 
@@ -200,7 +203,7 @@ async def _run_agent_loop(
             result = maybe_summarize(raw_result, config)
 
             if result != raw_result:
-                print(f"  [Summarizer] Condensed {len(raw_result):,} → {len(result):,} chars")
+                logger.info("[Summarizer] Condensed %s → %s chars", f"{len(raw_result):,}", f"{len(result):,}")
 
             # Track exploit failures
             if agent_name == "exploit" and (
@@ -250,7 +253,7 @@ async def _run_agent_loop(
 def make_recon_node(mcp_client: Any, tools: list):
     """Return an async node function for the Recon agent."""
     async def recon_node(state: TeamState) -> dict:
-        print(f"\n[Recon Agent] Starting reconnaissance...")
+        logger.info("[Recon Agent] Starting reconnaissance...")
         return await _run_agent_loop("recon", state, tools, mcp_client)
     return recon_node
 
@@ -258,7 +261,7 @@ def make_recon_node(mcp_client: Any, tools: list):
 def make_exploit_node(mcp_client: Any, tools: list):
     """Return an async node function for the Exploit agent."""
     async def exploit_node(state: TeamState) -> dict:
-        print(f"\n[Exploit Agent] Attempting exploitation...")
+        logger.info("[Exploit Agent] Attempting exploitation...")
         return await _run_agent_loop("exploit", state, tools, mcp_client)
     return exploit_node
 
@@ -266,6 +269,6 @@ def make_exploit_node(mcp_client: Any, tools: list):
 def make_privesc_node(mcp_client: Any, tools: list):
     """Return an async node function for the PrivEsc agent."""
     async def privesc_node(state: TeamState) -> dict:
-        print(f"\n[PrivEsc Agent] Escalating privileges...")
+        logger.info("[PrivEsc Agent] Escalating privileges...")
         return await _run_agent_loop("privesc", state, tools, mcp_client)
     return privesc_node
