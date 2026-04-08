@@ -144,7 +144,41 @@ def select_provider(config: dict) -> str:
         if choice == "2":
             return "gemini"
         if choice == "3":
+            _select_and_set_ollama_model(config)
             return "ollama"
+        print("Invalid choice.")
+
+
+def _select_and_set_ollama_model(config: dict) -> None:
+    """Prompt user to pick an Ollama model and store it in OLLAMA_MODEL env var."""
+    host = (
+        config.get("agents", {}).get("summarizer", {}).get("host")
+        or os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+    )
+    try:
+        resp = requests.get(f"{host}/api/tags", timeout=5)
+        resp.raise_for_status()
+        models = [m["name"] for m in resp.json().get("models", [])]
+    except Exception as e:
+        print(f"[!] Could not reach Ollama at {host}: {e}")
+        print("[!] Using default model 'llama3.2'. Set OLLAMA_MODEL to override.")
+        return
+
+    if not models:
+        print(f"[!] No models found on Ollama at {host}. Using 'llama3.2'.")
+        return
+
+    print(f"\nAvailable Ollama models (from {host}):")
+    for i, name in enumerate(models, 1):
+        print(f"  {i}) {name}")
+    while True:
+        choice = input(f"Select model [1]: ").strip() or "1"
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            selected = models[int(choice) - 1]
+            os.environ["OLLAMA_MODEL"] = selected
+            os.environ["OLLAMA_HOST"] = host
+            print(f"[*] Ollama model: {selected}")
+            return
         print("Invalid choice.")
 
 
@@ -522,12 +556,9 @@ async def main():
     tools = await mcp_client.list_tools()
     print(f"[*] {len(tools)} MCP tools available.")
 
-    # --- Build LangGraph ---
-    checkpointer = create_checkpointer(checkpoint_db)
-    graph = build_graph(mcp_client, config, checkpointer)
     trajectory_logger = TrajectoryLogger(training_dir)
 
-    # --- Session selection ---
+    # --- Session selection (before opening checkpointer) ---
     print("\nSession options:")
     print("  1) New session")
     sessions = list_graph_sessions(checkpoint_db)
@@ -544,10 +575,7 @@ async def main():
     while True:
         choice = input("Choice [1]: ").strip() or "1"
         if choice == "1":
-            # New session
             session_id = f"session-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}-{str(uuid.uuid4())[:8]}"
-
-            # Determine task from HTB machine or user input
             if active_machine:
                 machine_name = active_machine["name"]
                 target_ip = active_machine["ip"]
@@ -565,10 +593,8 @@ async def main():
                 ip_input = input("Target IP (optional): ").strip()
                 if ip_input:
                     target_ip = ip_input
-
             print(f"[*] New session: {session_id}")
             break
-
         elif choice.isdigit() and 2 <= int(choice) < 2 + len(sessions):
             idx = int(choice) - 2
             session_id = sessions[idx]["thread_id"]
@@ -603,19 +629,23 @@ async def main():
                         )
                         print(f"[*] Task updated for {machine_name} @ {target_ip}")
 
-    # --- Run the graph ---
+    # --- Build LangGraph and run (checkpointer must stay open for the session) ---
     try:
-        await run_session(
-            graph=graph,
-            session_id=session_id,
-            task=task,
-            provider=provider,
-            config=config,
-            trajectory_logger=trajectory_logger,
-            target_ip=target_ip,
-            machine_name=machine_name,
-            resume=resume,
-        )
+        async with create_checkpointer(checkpoint_db) as checkpointer:
+            graph = build_graph(mcp_client, config, checkpointer)
+            await run_session(
+                graph=graph,
+                session_id=session_id,
+                task=task,
+                provider=provider,
+                config=config,
+                trajectory_logger=trajectory_logger,
+                target_ip=target_ip,
+                machine_name=machine_name,
+                resume=resume,
+            )
+            print(f"\n[*] Session {session_id} checkpointed to {checkpoint_db}")
+            print(f"[*] Training data saved to {training_dir}/")
     finally:
         await mcp_client.disconnect()
         print("[*] MCP session closed.")
@@ -623,8 +653,6 @@ async def main():
             server_proc.terminate()
             server_proc.wait()
             print("[*] Hexstrike server stopped.")
-        print(f"\n[*] Session {session_id} checkpointed to {checkpoint_db}")
-        print(f"[*] Training data saved to {training_dir}/")
 
 
 if __name__ == "__main__":

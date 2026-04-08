@@ -29,15 +29,22 @@ from llms import AnthropicClient, GeminiClient, OllamaClient
 # ---------------------------------------------------------------------------
 
 def _build_llm_client(provider: str, agent_cfg: dict):
-    """Instantiate the correct LLM client for a given agent config."""
+    """
+    Instantiate the correct LLM client.
+    `provider` is the user-selected provider (from TeamState) and takes precedence
+    over whatever is set in agents.yaml.
+    """
     model = agent_cfg.get("model")
     if provider == "anthropic":
-        return AnthropicClient(model=model)
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        return AnthropicClient(api_key=api_key, model=model)
     elif provider == "gemini":
-        return GeminiClient(model=model)
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        return GeminiClient(api_key=api_key, model=model)
     elif provider == "ollama":
-        host = agent_cfg.get("host", "http://10.0.2.2:11434")
-        return OllamaClient(host=host, model=model)
+        host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+        ollama_model = os.getenv("OLLAMA_MODEL") or model or "llama3.2"
+        return OllamaClient(host=host, model=ollama_model)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -131,7 +138,8 @@ async def _run_agent_loop(
     """
     config = state.get("config", {})
     agent_cfg = config.get("agents", {}).get(agent_name, {})
-    provider = agent_cfg.get("provider", state.get("provider", "anthropic"))
+    # User-selected provider (from TeamState) always wins over agents.yaml default
+    provider = state.get("provider") or agent_cfg.get("provider", "anthropic")
     system_prompt = agent_cfg.get("system_prompt", "")
 
     # Build LLM client

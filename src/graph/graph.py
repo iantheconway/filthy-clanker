@@ -20,7 +20,7 @@ import os
 from typing import Any, Dict
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from .state import TeamState
 from .supervisor import supervisor_node, route_from_supervisor
@@ -28,16 +28,20 @@ from .summarizer import compaction_node
 from .agents import make_recon_node, make_exploit_node, make_privesc_node
 
 
-def create_checkpointer(db_path: str) -> SqliteSaver:
+def create_checkpointer(db_path: str):
     """
-    Create and return a SqliteSaver checkpointer.
-    The database file is created automatically if it does not exist.
+    Return an AsyncSqliteSaver async context manager.
+
+    Usage in main:
+        async with create_checkpointer(db_path) as checkpointer:
+            graph = build_graph(mcp_client, config, checkpointer)
+            ...
     """
     os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
-    return SqliteSaver.from_conn_string(db_path)
+    return AsyncSqliteSaver.from_conn_string(db_path)
 
 
-def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer: SqliteSaver):
+def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     """
     Assemble and compile the LangGraph StateGraph.
 

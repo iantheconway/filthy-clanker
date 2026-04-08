@@ -31,14 +31,24 @@ NEXT_OPTIONS = Literal["recon", "exploit", "privesc", "compaction", "__end__"]
 
 
 def _build_llm_client(provider: str, agent_cfg: dict):
+    """
+    Instantiate the correct LLM client.
+    `provider` is the user-selected provider (from TeamState) and takes precedence
+    over whatever is set in agents.yaml so that selecting Ollama at startup routes
+    all agents through Ollama.
+    """
     model = agent_cfg.get("model")
     if provider == "anthropic":
-        return AnthropicClient(model=model)
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        return AnthropicClient(api_key=api_key, model=model)
     elif provider == "gemini":
-        return GeminiClient(model=model)
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        return GeminiClient(api_key=api_key, model=model)
     elif provider == "ollama":
-        host = agent_cfg.get("host", "http://10.0.2.2:11434")
-        return OllamaClient(host=host, model=model)
+        host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+        # model may be overridden via env or agent config; fall back to llama3.2
+        ollama_model = os.getenv("OLLAMA_MODEL") or model or "llama3.2"
+        return OllamaClient(host=host, model=ollama_model)
     raise ValueError(f"Unknown provider: {provider}")
 
 
@@ -126,7 +136,8 @@ async def supervisor_node(state: TeamState) -> dict:
     # 5. Ask the supervisor LLM to route
     # -----------------------------------------------------------------------
     sup_cfg = config.get("agents", {}).get("supervisor", {})
-    provider = sup_cfg.get("provider", state.get("provider", "anthropic"))
+    # User-selected provider always wins over agents.yaml default
+    provider = state.get("provider") or sup_cfg.get("provider", "anthropic")
     system_prompt = sup_cfg.get("system_prompt", "Route the CTF team.")
 
     llm = _build_llm_client(provider, sup_cfg)
