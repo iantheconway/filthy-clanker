@@ -1,32 +1,31 @@
 # Filthy-Clanker
 
-An AI-powered CTF (Capture The Flag) challenge solver that uses LLMs and 130+ security tools to assist with HackTheBox challenges. It connects large language models (Claude or Gemini) to the [Hexstrike-AI](https://github.com/your-org/hexstrike-ai) tool server via the Model Context Protocol (MCP), enabling the AI to autonomously run reconnaissance, enumeration, and exploitation tools based on conversational input.
+An AI-powered CTF solver that connects LLMs (Claude, Gemini, or Ollama) to 130+ security tools via the Model Context Protocol (MCP). It uses a **LangGraph multi-agent architecture** with a Supervisor orchestrating three specialized agents (Recon, Exploit, PrivEsc), plus an Ollama-powered compaction node for managing context windows.
 
 ## Architecture
 
 ```
-User Input
-    |
-Filthy-Clanker (this repo)
-    |
-LLM (Claude / Gemini) -- decides which tools to call
-    |
-MCP Client -- communicates over stdio
-    |
-Hexstrike MCP Server -- translates to HTTP
-    |
-Hexstrike Flask Server -- executes tools
-    |
-Security Tools (nmap, gobuster, etc.)
+User → main.py → LangGraph StateGraph (SqliteSaver checkpoint)
+                       │
+                   supervisor ──► recon    ─────────────────┐
+                       ▲          exploit  ────────────────►│
+                       │          privesc  ────────────────►│
+                       │          compaction (Ollama) ──────►│
+                       └──────────────────────────────────────┘
+                              (loop until flag found or FINISH)
+
+Each agent: LLM client → MCP tool loop → knowledge_base update → supervisor
 ```
+
+The Supervisor calls the LLM to decide which agent runs next. Each specialized agent runs a ReAct-style tool loop internally, executing MCP tools until the LLM produces a final text response, then returns state updates back to the Supervisor.
+
+**Key state**: `TeamState` has two tiers — `messages` (full task history) and `knowledge_base` (structured facts: IPs, ports, credentials, flags, attack surface). Both are shared across all agents.
 
 ## Prerequisites
 
 - Python 3.13+
 - [Hexstrike-AI](https://github.com/your-org/hexstrike-ai) cloned to `/home/kali/hexstrike-ai` (or set `HEXSTRIKE_DIR`)
-- An API key for at least one LLM provider:
-  - [Anthropic](https://console.anthropic.com/) (Claude)
-  - [Google3 AI Studio](https://aistudio.google.com/) (Gemini)
+- At least one LLM API key (Anthropic or Google Gemini), or a local Ollama instance
 
 ## Installation
 
@@ -37,15 +36,14 @@ cd filthy-clanker
 python3 -m venv venv
 source venv/bin/activate
 
-pip install anthropic google-genai mcp python-dotenv requests pyhackthebox
+pip install -r requirements.txt
 ```
 
 ## Configuration
 
-Copy the example env file and fill in your keys:
-
 ```bash
 cp .env.example .env
+# Edit .env with your keys
 ```
 
 `.env` contents:
@@ -62,12 +60,16 @@ HTB_APP_TOKEN=your-htb-app-token
 HEXSTRIKE_DIR=/home/kali/hexstrike-ai
 HEXSTRIKE_PORT=8888
 
+# Ollama (optional — required if you select Ollama as provider)
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=llama3.2
+
 # Optional MCP overrides (derived from the above by default)
 # MCP_COMMAND=/home/kali/hexstrike-ai/hexstrike-env/bin/python3
 # MCP_ARGS=/home/kali/hexstrike-ai/hexstrike_mcp.py --server http://127.0.0.1:8888
 ```
 
-To get an HTB app token, go to your [HackTheBox profile settings](https://app.hackthebox.com/profile/settings) and create one under "App Tokens".
+Agent behaviour (models, system prompts, thresholds) is configured in **`agents.yaml`** — edit this without touching source code.
 
 ## Usage
 
@@ -76,99 +78,101 @@ source venv/bin/activate
 python src/main.py
 ```
 
-On startup the program will:
+On startup:
 
-1. Connect to HackTheBox (if `HTB_APP_TOKEN` is set) and detect any active machine
-2. Start the Hexstrike Flask server (or detect it if already running)
-3. Prompt you to select an LLM provider (Anthropic or Gemini)
-4. Connect to the Hexstrike MCP server and list available tools
-5. Build a system prompt tailored to the active machine (or a generic one if none is running)
-6. Enter an interactive chat loop
+1. Connects to HackTheBox (if `HTB_APP_TOKEN` is set) and detects any active machine
+2. Starts the Hexstrike Flask server (or detects it if already running)
+3. Prompts for LLM provider (Anthropic / Gemini / Ollama)
+4. Connects to the MCP server and loads all available tools
+5. Prompts to start a new session or resume a previous one
+6. Enters the autonomous agent loop
 
-Example session:
+Example startup:
 
 ```
 [*] HTB client connected.
 [*] Active machine: Headless (Linux, Easy) @ 10.10.11.8
 [*] Hexstrike server is ready.
 
-Select LLM provider:
+Select primary LLM provider:
   1) Anthropic (Claude)
   2) Gemini
-Enter 1 or 2: 1
+  3) Ollama (local)
+Enter 1, 2, or 3: 1
 
 [*] MCP session initialized.
-[*] 134 MCP tools available:
-    - nmap_scan: Run an nmap scan against a target
-    ...
+[*] 134 MCP tools available.
+[*] Session ID: session-2026-04-08-120000-abc12345
+[*] Agent log: logs/session-2026-04-08-120000-abc12345.log
+[*] Running autonomous agents. Press Ctrl+C to interrupt.
 
-Chat started. Type 'exit' or 'quit' to stop.
-Commands: /save [name], /resume [name], /sessions
-HTB:      /machine [name], /spawn <name>, /stop, /reset, /flag <flag>, /vpn
-
-You: let's start with a quick scan
-[tool] Calling nmap_scan({"target": "10.10.11.8", "arguments": "-sC -sV"})
-[tool] nmap_scan returned (2340 chars)
-Assistant: Based on the scan results, I can see ports 22 (SSH) and 5000 (HTTP) are open...
+[Recon Agent] Starting reconnaissance...
+[recon] → nmap_scan({"target": "10.10.11.8", "arguments": "-sC -sV -p-"})
+[Supervisor] → EXPLOIT | Open port 5000 HTTP found, attempting web exploitation
+[Exploit Agent] Attempting exploitation...
 ```
 
-Type `exit` or `quit` to stop. On exit, the Hexstrike server is automatically shut down.
+## Session Management
+
+Sessions are checkpointed to `sessions/checkpoint.db` (SQLite via LangGraph's `SqliteSaver`). Select **Resume** at startup and enter a session number to continue from the last checkpoint — the full message history and knowledge base are restored.
+
+## Agent Logs
+
+Every session writes a timestamped log to `logs/<session-id>.log`. This captures all agent activity (tool calls, supervisor routing decisions, summarization events, flag discoveries) even if terminal output is lost. Tail it in another terminal:
+
+```bash
+tail -f logs/session-2026-04-08-120000-abc12345.log
+```
+
+## In-Session Controls
+
+| Control | Action |
+|---------|--------|
+| `Ctrl+C` | Interrupt — choose to continue, inject a message, or exit |
+| HITL breakpoints | Auto-pause when exploit loop detected or credentials needed |
 
 ## HackTheBox Integration
 
-When `HTB_APP_TOKEN` is set, you get direct access to HTB machine management from within the chat. The system prompt automatically adapts to the active machine, so the AI knows the target name, OS, difficulty, and IP without you having to type it.
-
-### HTB Commands
+When `HTB_APP_TOKEN` is set, machine management commands are available before the agent loop starts:
 
 | Command | Description |
 |---------|-------------|
 | `/machine` | Show the currently active machine |
-| `/machine <name>` | Look up details for any machine |
-| `/spawn <name>` | Spawn a machine and update the AI's context |
+| `/machine <name>` | Look up any machine |
+| `/spawn <name>` | Spawn a machine and auto-set the task |
 | `/stop` | Stop the active machine |
-| `/reset` | Reset the active machine (~1 min) |
-| `/flag <flag>` | Submit a flag for the active machine |
-| `/vpn` | Show current VPN server info |
+| `/reset` | Reset the active machine |
+| `/flag <flag>` | Submit a flag |
+| `/vpn` | Show VPN status |
 
-### Example: Full workflow
+## Training Data
 
-```
-You: /spawn Headless
-[*] Spawning 'Headless'...
-[*] Machine spawned at 10.10.11.8
-
-You: let's go
-Assistant: Understood — now targeting Headless at 10.10.11.8. I'll start with a quick
-nmap scan to see what's open...
-
-    ... hacking happens ...
-
-You: /flag 8a3f5b2c1d4e6f7a8b9c0d1e2f3a4b5c
-[*] Congratulations! Machine owned!
-
-You: /stop
-[*] Stopped machine 'Headless'.
-```
-
-### How it works
-
-- On startup, the client checks for an already-running machine and auto-populates the system prompt.
-- `/spawn` updates the system prompt and injects a context message into the conversation so the AI immediately knows the new target.
-- `/stop` resets the prompt back to a generic one.
-- Without `HTB_APP_TOKEN`, everything works as before — you just won't have the HTB commands, and the system prompt will be generic.
+Each session logs tool call trajectories to `data/training/` as JSONL files. Each record captures the tool called, arguments, result snippet, knowledge base before/after, and a `success_score` heuristic (0.0–1.0). Records accumulate in `data/training/all_trajectories.jsonl` across all sessions.
 
 ## Project Structure
 
 ```
 src/
-├── main.py              # Entry point, server management, chat loop
-├── config.py            # Dynamic system prompt builder
+├── main.py              # Entry point, server management, session loop
+├── config.py            # System prompt builder
 ├── htb_client.py        # HackTheBox API wrapper
-├── session.py           # Session save/resume logic
+├── data_capture.py      # Trajectory logging
 ├── llms/
 │   ├── base.py          # Abstract LLM client interface
-│   ├── anthropic_client.py  # Claude integration
-│   └── gemini_client.py     # Gemini integration
-└── mcp_client/
-    └── client.py        # MCP protocol client
+│   ├── anthropic_client.py
+│   ├── gemini_client.py
+│   └── ollama_client.py
+├── mcp_client/
+│   └── client.py        # MCP stdio client
+└── graph/
+    ├── graph.py         # LangGraph StateGraph builder
+    ├── state.py         # TeamState / KnowledgeBase types
+    ├── supervisor.py    # Supervisor node + routing
+    ├── agents.py        # Recon / Exploit / PrivEsc nodes
+    ├── summarizer.py    # Ollama-based compaction
+    └── tools.py         # LangChain MCP tool wrappers
+agents.yaml              # Agent config (models, prompts, thresholds)
+logs/                    # Per-session agent activity logs
+sessions/                # SQLite checkpoint DB
+data/training/           # Trajectory JSONL files
 ```
