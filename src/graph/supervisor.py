@@ -228,13 +228,15 @@ async def supervisor_node(state: TeamState) -> dict:
 
             if raw_next == "finish":
                 next_agent = "__end__"
-            elif raw_next in ("recon", "webexplorer", "exploit", "privesc"):
+            elif raw_next in ("recon", "webexplorer", "exploit", "privesc", "refusal_specialist"):
                 next_agent = raw_next
             else:
                 next_agent = "recon"
     except (json.JSONDecodeError, AttributeError):
         # Fallback: keyword search in response
-        if "webexplorer" in decision_text.lower() or "web explorer" in decision_text.lower():
+        if "refusal_specialist" in decision_text.lower() or "refusal specialist" in decision_text.lower():
+            next_agent = "refusal_specialist"
+        elif "webexplorer" in decision_text.lower() or "web explorer" in decision_text.lower():
             next_agent = "webexplorer"
         elif "exploit" in decision_text.lower():
             next_agent = "exploit"

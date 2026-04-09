@@ -2,13 +2,18 @@
 StateGraph assembly for the Filthy-Clanker multi-agent workflow.
 
 Graph topology:
-                      ┌─────────────────────────────────────┐
-                      │                                     │
-    START ──► supervisor ──► recon ────────────────────────►│
-                   ▲         exploit ─────────────────────►│
-                   │         privesc ────────────────────►  │
-                   │         compaction ─────────────────►  │
-                   └─────────────────────────────────────────┘
+                                                    ┌──────────────────────────┐
+                                                    │                          │
+    START ──► supervisor ──► recon ──► evaluator ──►│ supervisor               │
+                   ▲         exploit ── evaluator ──►│                          │
+                   │         privesc ── evaluator ──►│                          │
+                   │         webexplorer  evaluator ►│                          │
+                   │                        │        │                          │
+                   │              refusal   │        └──────────────────────────┘
+                   │           ┌───────────►│
+                   └───────────┤ refusal_specialist
+                               │ (llama3-abliterated)
+                   compaction ─┘
                               (loop until __end__)
 
 Checkpointing: SqliteSaver persists graph state after every node execution,
@@ -25,7 +30,10 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from .state import TeamState
 from .supervisor import supervisor_node, route_from_supervisor
 from .summarizer import compaction_node
-from .agents import make_recon_node, make_exploit_node, make_privesc_node, make_webexplorer_node
+from .agents import (
+    make_recon_node, make_exploit_node, make_privesc_node, make_webexplorer_node,
+    make_refusal_specialist_node, lightweight_evaluator,
+)
 
 
 def create_checkpointer(db_path: str):
@@ -59,6 +67,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     exploit_node = make_exploit_node(mcp_client, tools)
     privesc_node = make_privesc_node(mcp_client, tools)
     webexplorer_node = make_webexplorer_node(mcp_client, tools)
+    refusal_specialist_node = make_refusal_specialist_node(mcp_client)
 
     # -----------------------------------------------------------------------
     # Construct the StateGraph
@@ -71,6 +80,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     graph.add_node("exploit", exploit_node)
     graph.add_node("privesc", privesc_node)
     graph.add_node("webexplorer", webexplorer_node)
+    graph.add_node("refusal_specialist", refusal_specialist_node)
     graph.add_node("compaction", compaction_node)
 
     # Entry: always start at supervisor
@@ -85,16 +95,20 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
             "exploit": "exploit",
             "privesc": "privesc",
             "webexplorer": "webexplorer",
+            "refusal_specialist": "refusal_specialist",
             "compaction": "compaction",
             "__end__": END,
         },
     )
 
-    # All agent nodes report back to supervisor after completing their sub-task
-    graph.add_edge("recon", "supervisor")
-    graph.add_edge("exploit", "supervisor")
-    graph.add_edge("privesc", "supervisor")
-    graph.add_edge("webexplorer", "supervisor")
+    # Each agent node passes through the lightweight evaluator before returning
+    # to the supervisor — the evaluator redirects to refusal_specialist if needed.
+    _evaluator_map = {"supervisor": "supervisor", "refusal_specialist": "refusal_specialist"}
+    for _agent in ("recon", "exploit", "privesc", "webexplorer"):
+        graph.add_conditional_edges(_agent, lightweight_evaluator, _evaluator_map)
+
+    # refusal_specialist always hands back to supervisor after fixing a response
+    graph.add_edge("refusal_specialist", "supervisor")
     graph.add_edge("compaction", "supervisor")
 
     # Compile with checkpointer for persistence

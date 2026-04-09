@@ -431,7 +431,7 @@ async def run_session(
                             _print_agent_output(node_name, output)
 
                         # Log trajectories for agent nodes
-                        if node_name in ("recon", "exploit", "privesc", "webexplorer"):
+                        if node_name in ("recon", "exploit", "privesc", "webexplorer", "refusal_specialist"):
                             _log_node_trajectories(node_name, output, trajectory_logger)
 
                     if interrupted:
