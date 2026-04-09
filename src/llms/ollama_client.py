@@ -1,11 +1,14 @@
 import asyncio
 import json
+import logging
 import uuid
 from typing import Any
 
 import requests
 
 from .base import BaseLLMClient
+
+logger = logging.getLogger("filthy_clanker")
 
 _DEFAULT_HOST = "http://10.0.2.2:11434"
 
@@ -42,6 +45,16 @@ class OllamaClient(BaseLLMClient):
         ollama_tools = self.format_tools(tools)
         ollama_messages = [{"role": "system", "content": system_prompt}] + list(messages)
 
+        last_content = ""
+        if messages:
+            raw = messages[-1].get("content", "")
+            last_content = (raw if isinstance(raw, str) else json.dumps(raw))[:300]
+
+        logger.info("[Ollama] REQUEST  model=%s  msgs=%d  tools=%d  system=%.120s",
+                    self.model, len(messages), len(ollama_tools),
+                    system_prompt.replace("\n", " "))
+        logger.info("[Ollama] LAST_MSG %.300s", last_content.replace("\n", " "))
+
         payload = {
             "model": self.model,
             "messages": ollama_messages,
@@ -50,13 +63,24 @@ class OllamaClient(BaseLLMClient):
         }
 
         def _call():
-            resp = requests.post(
-                f"{self.host}/api/chat",
-                json=payload,
-                timeout=300,
-            )
-            resp.raise_for_status()
-            return resp.json()
+            try:
+                resp = requests.post(
+                    f"{self.host}/api/chat",
+                    json=payload,
+                    timeout=(10, None),  # 10s connect, no read timeout
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except requests.Timeout:
+                logger.error("[Ollama] CONNECT TIMEOUT (>10s)  model=%s  host=%s",
+                             self.model, self.host)
+                raise
+            except requests.HTTPError as exc:
+                logger.error("[Ollama] HTTP ERROR %s  model=%s", exc, self.model)
+                raise
+            except requests.RequestException as exc:
+                logger.error("[Ollama] REQUEST ERROR %s: %s", type(exc).__name__, exc)
+                raise
 
         data = await asyncio.get_event_loop().run_in_executor(None, _call)
 
@@ -77,6 +101,10 @@ class OllamaClient(BaseLLMClient):
                 "name": fn.get("name", ""),
                 "arguments": args,
             })
+
+        tc_names = [tc["name"] for tc in tool_calls]
+        logger.info("[Ollama] RESPONSE  tool_calls=%s  text=%.200s",
+                    tc_names, (text or "").replace("\n", " "))
 
         return {
             "text": text,

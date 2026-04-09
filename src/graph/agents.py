@@ -148,9 +148,8 @@ async def _run_agent_loop(
     # Build LLM client
     llm = _build_llm_client(provider, agent_cfg)
 
-    # Format tools for the LLM provider
+    # Fetch raw MCP tools — each client's generate_response formats them internally
     raw_tools = await mcp_client.list_tools()
-    formatted_tools = llm.format_tools(raw_tools)
 
     # Inject knowledge base into system prompt
     kb = state.get("knowledge_base", {})
@@ -172,7 +171,7 @@ async def _run_agent_loop(
     for iteration in range(max_iterations):
         response = await llm.generate_response(
             messages=messages + new_messages,
-            tools=formatted_tools,
+            tools=raw_tools,
             system_prompt=full_system,
         )
 
@@ -185,18 +184,18 @@ async def _run_agent_loop(
             break
 
         # Execute each tool call
+        # All clients return: {"id": str, "name": str, "arguments": dict}
         tool_results: list = []
         for tc in tool_calls:
-            tool_name = tc.get("name") or tc.get("function", {}).get("name", "")
-            raw_args = tc.get("input") or tc.get("function", {}).get("arguments", {})
+            tool_name = tc.get("name", "")
+            raw_args = tc.get("arguments") or tc.get("input", {})
             if isinstance(raw_args, str):
                 try:
                     raw_args = json.loads(raw_args)
                 except json.JSONDecodeError:
                     raw_args = {}
 
-            logger.info("[%s] → %s(%s)", agent_name, tool_name, json.dumps(raw_args)[:120])
-
+            logger.info("[%s] → %s(%s)", agent_name, tool_name, json.dumps(raw_args)[:200])
             raw_result = await mcp_client.call_tool(tool_name, raw_args)
 
             # Auto-summarize large outputs
@@ -220,7 +219,7 @@ async def _run_agent_loop(
         # Build tool result messages (provider-specific)
         if provider == "anthropic":
             result_blocks = [
-                llm.make_tool_result_message(tc, result)
+                llm.make_tool_result_message(tc.get("id", ""), result)
                 for tc, result in tool_results
             ]
             # Anthropic bundles all results in one user message
@@ -231,7 +230,7 @@ async def _run_agent_loop(
         else:
             # Gemini and Ollama: one message per result
             for tc, result in tool_results:
-                new_messages.append(llm.make_tool_result_message(tc, result))
+                new_messages.append(llm.make_tool_result_message(tc.get("name", ""), result))
 
     # Compute new token estimate
     all_messages = (messages + new_messages)
