@@ -17,7 +17,7 @@ enabling crash recovery and session resume via thread_id.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -25,7 +25,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from .state import TeamState
 from .supervisor import supervisor_node, route_from_supervisor
 from .summarizer import compaction_node
-from .agents import make_recon_node, make_exploit_node, make_privesc_node
+from .agents import make_recon_node, make_exploit_node, make_privesc_node, make_webexplorer_node
 
 
 def create_checkpointer(db_path: str):
@@ -58,6 +58,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     recon_node = make_recon_node(mcp_client, tools)
     exploit_node = make_exploit_node(mcp_client, tools)
     privesc_node = make_privesc_node(mcp_client, tools)
+    webexplorer_node = make_webexplorer_node(mcp_client, tools)
 
     # -----------------------------------------------------------------------
     # Construct the StateGraph
@@ -69,6 +70,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     graph.add_node("recon", recon_node)
     graph.add_node("exploit", exploit_node)
     graph.add_node("privesc", privesc_node)
+    graph.add_node("webexplorer", webexplorer_node)
     graph.add_node("compaction", compaction_node)
 
     # Entry: always start at supervisor
@@ -82,6 +84,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
             "recon": "recon",
             "exploit": "exploit",
             "privesc": "privesc",
+            "webexplorer": "webexplorer",
             "compaction": "compaction",
             "__end__": END,
         },
@@ -91,6 +94,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     graph.add_edge("recon", "supervisor")
     graph.add_edge("exploit", "supervisor")
     graph.add_edge("privesc", "supervisor")
+    graph.add_edge("webexplorer", "supervisor")
     graph.add_edge("compaction", "supervisor")
 
     # Compile with checkpointer for persistence
@@ -100,7 +104,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
 
 def initial_state(
     task: str,
-    provider: str,
+    provider: Optional[str],
     session_id: str,
     config: Dict[str, Any],
     target_ip: str = "",

@@ -10,6 +10,7 @@ configured LLM and available MCP tools, then returns a state update including:
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import re
@@ -31,25 +32,58 @@ logger = logging.getLogger("filthy_clanker")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_llm_client(provider: str, agent_cfg: dict):
+# Fallback models used when a global provider override is active but the
+# per-agent model name is incompatible (e.g. "gemma4:e2b" can't run on Anthropic).
+_PROVIDER_DEFAULT_MODELS = {
+    "anthropic": "claude-opus-4-6",
+    "gemini": "gemini-2.5-flash",
+    "ollama": "llama3.2",
+}
+
+
+def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
     """
-    Instantiate the correct LLM client.
-    `provider` is the user-selected provider (from TeamState) and takes precedence
-    over whatever is set in agents.yaml.
+    Determine (provider, model, llm_client) for an agent invocation.
+
+    If state["provider"] is set it acts as a global override — useful for
+    switching all agents to Ollama for offline testing.  Otherwise each agent
+    uses its own provider / model / host from agents.yaml.
     """
-    model = agent_cfg.get("model")
-    if provider == "anthropic":
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        return AnthropicClient(api_key=api_key, model=model)
-    elif provider == "gemini":
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        return GeminiClient(api_key=api_key, model=model)
-    elif provider == "ollama":
-        host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
-        ollama_model = os.getenv("OLLAMA_MODEL") or model or "llama3.2"
-        return OllamaClient(host=host, model=ollama_model)
+    override = state.get("provider")  # None → use per-agent config
+
+    if override:
+        provider = override
+        if provider == "ollama":
+            host = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+            # OLLAMA_MODEL set at startup by the interactive model picker
+            model = os.getenv("OLLAMA_MODEL") or agent_cfg.get("model", "llama3.2")
+            llm = OllamaClient(host=host, model=model)
+        elif provider == "anthropic":
+            agent_model = agent_cfg.get("model", "")
+            # Ollama-style model names (contain ":") can't be used with Anthropic
+            model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["anthropic"]
+            llm = AnthropicClient(api_key=os.getenv("ANTHROPIC_API_KEY", ""), model=model)
+        elif provider == "gemini":
+            agent_model = agent_cfg.get("model", "")
+            model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["gemini"]
+            llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        else:
+            raise ValueError(f"Unknown provider override: {provider}")
     else:
-        raise ValueError(f"Unknown provider: {provider}")
+        # Per-agent config — provider, model, and host all come from agents.yaml
+        provider = agent_cfg.get("provider", "anthropic")
+        model = agent_cfg.get("model", _PROVIDER_DEFAULT_MODELS.get(provider, ""))
+        if provider == "anthropic":
+            llm = AnthropicClient(api_key=os.getenv("ANTHROPIC_API_KEY", ""), model=model)
+        elif provider == "gemini":
+            llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        elif provider == "ollama":
+            host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+            llm = OllamaClient(host=host, model=model)
+        else:
+            raise ValueError(f"Unknown provider in agents.yaml for this agent: {provider}")
+
+    return provider, model, llm
 
 
 def _estimate_tokens(messages: list) -> int:
@@ -141,15 +175,27 @@ async def _run_agent_loop(
     """
     config = state.get("config", {})
     agent_cfg = config.get("agents", {}).get(agent_name, {})
-    # User-selected provider (from TeamState) always wins over agents.yaml default
-    provider = state.get("provider") or agent_cfg.get("provider", "anthropic")
     system_prompt = agent_cfg.get("system_prompt", "")
 
-    # Build LLM client
-    llm = _build_llm_client(provider, agent_cfg)
+    # Resolve provider/model — global override in state takes precedence, else per-agent config
+    provider, model, llm = _resolve_llm(state, agent_cfg)
+    logger.info("[%s] provider=%s model=%s", agent_name, provider, model)
 
     # Fetch raw MCP tools — each client's generate_response formats them internally
-    raw_tools = await mcp_client.list_tools()
+    all_tools = await mcp_client.list_tools()
+
+    # Filter to the agent's allowed tool set (fnmatch patterns in agents.yaml).
+    # If no 'tools' key is present, all tools are passed through.
+    allowed_patterns: list[str] = agent_cfg.get("tools", [])
+    if allowed_patterns:
+        raw_tools = [
+            t for t in all_tools
+            if any(fnmatch.fnmatch(t["name"], pat) for pat in allowed_patterns)
+        ]
+        logger.info("[%s] Tool filter: %d/%d tools allowed",
+                    agent_name, len(raw_tools), len(all_tools))
+    else:
+        raw_tools = all_tools
 
     # Inject knowledge base into system prompt
     kb = state.get("knowledge_base", {})
@@ -271,3 +317,11 @@ def make_privesc_node(mcp_client: Any, tools: list):
         logger.info("[PrivEsc Agent] Escalating privileges...")
         return await _run_agent_loop("privesc", state, tools, mcp_client)
     return privesc_node
+
+
+def make_webexplorer_node(mcp_client: Any, tools: list):
+    """Return an async node function for the Web Explorer agent."""
+    async def webexplorer_node(state: TeamState) -> dict:
+        logger.info("[WebExplorer Agent] Browsing and mapping web content...")
+        return await _run_agent_loop("webexplorer", state, tools, mcp_client)
+    return webexplorer_node

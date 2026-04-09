@@ -30,7 +30,8 @@ class TeamState(TypedDict):
     task                  — Current high-level objective.
     next                  — Routing decision set by the supervisor.
     exploit_attempts      — Counter for consecutive failed exploit attempts.
-    provider              — Active LLM provider ("anthropic", "gemini", "ollama").
+    provider              — Global provider override ("anthropic", "gemini", "ollama"),
+                            or None to use each agent's own config from agents.yaml.
     context_token_estimate— Rough token count for context-limit tracking.
     hitl_reason           — If set, supervisor will interrupt for human input.
     session_id            — Unique ID for this hacking session (maps to checkpoint thread).
@@ -42,7 +43,7 @@ class TeamState(TypedDict):
     task: str
     next: str
     exploit_attempts: int
-    provider: str
+    provider: Optional[str]
     context_token_estimate: int
     hitl_reason: Optional[str]
     session_id: str

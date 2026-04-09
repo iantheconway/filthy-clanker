@@ -33,26 +33,50 @@ logger = logging.getLogger("filthy_clanker")
 NEXT_OPTIONS = Literal["recon", "exploit", "privesc", "compaction", "__end__"]
 
 
-def _build_llm_client(provider: str, agent_cfg: dict):
+_PROVIDER_DEFAULT_MODELS = {
+    "anthropic": "claude-opus-4-6",
+    "gemini": "gemini-2.5-flash",
+    "ollama": "llama3.2",
+}
+
+
+def _resolve_llm(state: TeamState, agent_cfg: dict):
     """
-    Instantiate the correct LLM client.
-    `provider` is the user-selected provider (from TeamState) and takes precedence
-    over whatever is set in agents.yaml so that selecting Ollama at startup routes
-    all agents through Ollama.
+    Determine (provider, model, llm_client) for the supervisor.
+    Mirrors the same logic in agents.py — global override wins, else per-agent config.
     """
-    model = agent_cfg.get("model")
-    if provider == "anthropic":
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        return AnthropicClient(api_key=api_key, model=model)
-    elif provider == "gemini":
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        return GeminiClient(api_key=api_key, model=model)
-    elif provider == "ollama":
-        host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
-        # model may be overridden via env or agent config; fall back to llama3.2
-        ollama_model = os.getenv("OLLAMA_MODEL") or model or "llama3.2"
-        return OllamaClient(host=host, model=ollama_model)
-    raise ValueError(f"Unknown provider: {provider}")
+    override = state.get("provider")
+
+    if override:
+        provider = override
+        if provider == "ollama":
+            host = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+            model = os.getenv("OLLAMA_MODEL") or agent_cfg.get("model", "llama3.2")
+            llm = OllamaClient(host=host, model=model)
+        elif provider == "anthropic":
+            agent_model = agent_cfg.get("model", "")
+            model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["anthropic"]
+            llm = AnthropicClient(api_key=os.getenv("ANTHROPIC_API_KEY", ""), model=model)
+        elif provider == "gemini":
+            agent_model = agent_cfg.get("model", "")
+            model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["gemini"]
+            llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        else:
+            raise ValueError(f"Unknown provider override: {provider}")
+    else:
+        provider = agent_cfg.get("provider", "anthropic")
+        model = agent_cfg.get("model", _PROVIDER_DEFAULT_MODELS.get(provider, ""))
+        if provider == "anthropic":
+            llm = AnthropicClient(api_key=os.getenv("ANTHROPIC_API_KEY", ""), model=model)
+        elif provider == "gemini":
+            llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        elif provider == "ollama":
+            host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+            llm = OllamaClient(host=host, model=model)
+        else:
+            raise ValueError(f"Unknown provider in agents.yaml for supervisor: {provider}")
+
+    return provider, model, llm
 
 
 async def supervisor_node(state: TeamState) -> dict:
@@ -137,11 +161,10 @@ async def supervisor_node(state: TeamState) -> dict:
     # 5. Ask the supervisor LLM to route
     # -----------------------------------------------------------------------
     sup_cfg = config.get("agents", {}).get("supervisor", {})
-    # User-selected provider always wins over agents.yaml default
-    provider = state.get("provider") or sup_cfg.get("provider", "anthropic")
     system_prompt = sup_cfg.get("system_prompt", "Route the CTF team.")
 
-    llm = _build_llm_client(provider, sup_cfg)
+    provider, model, llm = _resolve_llm(state, sup_cfg)
+    logger.info("[supervisor] provider=%s model=%s", provider, model)
 
     # Build a concise status digest for the supervisor LLM
     messages = state.get("messages", [])
@@ -165,7 +188,7 @@ async def supervisor_node(state: TeamState) -> dict:
         f"Exploit attempts so far: {exploit_attempts}\n"
         f"Current agent: {state.get('current_agent', 'none')}\n\n"
         f"Decide the next action. Respond with ONLY a JSON object:\n"
-        f'{{"next": "<recon|exploit|privesc|FINISH>", "reasoning": "<brief reason>", "hitl_reason": null}}'
+        f'{{"next": "<recon|webexplorer|exploit|privesc|FINISH>", "reasoning": "<brief reason>", "hitl_reason": null}}'
     )
 
     routing_messages = [{"role": "user", "content": routing_prompt}]
@@ -205,13 +228,15 @@ async def supervisor_node(state: TeamState) -> dict:
 
             if raw_next == "finish":
                 next_agent = "__end__"
-            elif raw_next in ("recon", "exploit", "privesc"):
+            elif raw_next in ("recon", "webexplorer", "exploit", "privesc"):
                 next_agent = raw_next
             else:
                 next_agent = "recon"
     except (json.JSONDecodeError, AttributeError):
         # Fallback: keyword search in response
-        if "exploit" in decision_text.lower():
+        if "webexplorer" in decision_text.lower() or "web explorer" in decision_text.lower():
+            next_agent = "webexplorer"
+        elif "exploit" in decision_text.lower():
             next_agent = "exploit"
         elif "privesc" in decision_text.lower() or "privilege" in decision_text.lower():
             next_agent = "privesc"

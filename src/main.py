@@ -162,18 +162,32 @@ def load_config(path: str = "agents.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def select_provider(config: dict) -> str:
-    print("\nSelect primary LLM provider:")
-    print("  1) Anthropic (Claude)")
-    print("  2) Gemini")
-    print("  3) Ollama (local)")
+def select_provider(config: dict) -> str | None:
+    """
+    Ask whether to use per-agent config or a single global provider override.
+    Returns the override provider string, or None to use each agent's own config.
+    """
+    agents_cfg = config.get("agents", {})
+    print("\nLLM provider configuration:")
+    print("  1) Use per-agent config from agents.yaml")
+    for name, cfg in agents_cfg.items():
+        if name == "summarizer":
+            continue
+        p = cfg.get("provider", "?")
+        m = cfg.get("model", "?")
+        print(f"       {name}: {p} / {m}")
+    print("  2) Override all agents — Anthropic (Claude)")
+    print("  3) Override all agents — Gemini")
+    print("  4) Override all agents — Ollama (local)")
     while True:
-        choice = input("Enter 1, 2, or 3: ").strip()
+        choice = input("Enter 1–4 [1]: ").strip() or "1"
         if choice == "1":
-            return "anthropic"
+            return None
         if choice == "2":
-            return "gemini"
+            return "anthropic"
         if choice == "3":
+            return "gemini"
+        if choice == "4":
             _select_and_set_ollama_model(config)
             return "ollama"
         print("Invalid choice.")
@@ -417,7 +431,7 @@ async def run_session(
                             _print_agent_output(node_name, output)
 
                         # Log trajectories for agent nodes
-                        if node_name in ("recon", "exploit", "privesc"):
+                        if node_name in ("recon", "exploit", "privesc", "webexplorer"):
                             _log_node_trajectories(node_name, output, trajectory_logger)
 
                     if interrupted:

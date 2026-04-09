@@ -3,18 +3,25 @@
 
 agents:
   supervisor:
-    provider: anthropic
-    model: claude-opus-4-6
+    provider: ollama
+    model: gemma4:e2b
+    host: "http://10.0.2.2:11434"
     system_prompt: |
       You are the Supervisor of a CTF hacking team. Your job is to coordinate three
       specialized agents — Recon, Exploit, and PrivEsc — and guide them toward
       capturing the flag on a HackTheBox or similar machine.
 
       After each agent reports back, analyze the knowledge base and decide:
-        - "recon"   : more enumeration needed (open ports, services, directories)
-        - "exploit" : a foothold attack vector is known
-        - "privesc" : initial access is gained; escalate privileges
-        - "FINISH"  : flag has been captured
+        - "recon"       : more enumeration needed (open ports, services, directories)
+        - "webexplorer" : a web application is found and needs deeper content mapping
+                          (crawl pages, read source, follow links, find hidden paths)
+        - "exploit"     : a clear attack vector is known; attempt exploitation
+        - "privesc"     : initial access is gained; escalate privileges
+        - "FINISH"      : flag has been captured
+
+      Use webexplorer when recon has found HTTP/HTTPS services and you need to
+      understand the application's content, structure, or hidden functionality
+      before attempting exploitation.
 
       If the exploit agent has failed more than the allowed threshold, or if
       manual credentials/hints are needed, set hitl_reason to explain what you
@@ -23,8 +30,57 @@ agents:
       Always output a JSON object with keys: next, reasoning, hitl_reason (null if none).
 
   recon:
-    provider: anthropic
-    model: claude-opus-4-6
+    provider: ollama
+    model: gemma4:e2b
+    host: "http://10.0.2.2:11434"
+    # Glob patterns matched against MCP tool names. Omit to allow all tools.
+    tools:
+      # Port & service scanning
+      - "nmap*"
+      - "masscan*"
+      - "rustscan*"
+      # Web enumeration
+      - "gobuster*"
+      - "feroxbuster*"
+      - "ffuf*"
+      - "nikto*"
+      - "wfuzz*"
+      - "dirb*"
+      - "dirsearch*"
+      - "whatweb*"
+      - "wafw00f*"
+      - "curl*"
+      - "wget*"
+      # DNS & subdomain
+      - "dig*"
+      - "dnsrecon*"
+      - "dnsenum*"
+      - "subfinder*"
+      - "sublist3r*"
+      - "amass*"
+      - "host_lookup*"
+      - "nslookup*"
+      # SMB / NFS / LDAP
+      - "enum4linux*"
+      - "smbclient*"
+      - "smbmap*"
+      - "showmount*"
+      - "rpcclient*"
+      - "ldapsearch*"
+      - "ldap*"
+      # SNMP
+      - "snmpwalk*"
+      - "snmpenum*"
+      # Web crawling / passive recon
+      - "gau*"
+      - "waybackurls*"
+      - "hakrawler*"
+      - "arjun*"
+      - "paramspider*"
+      # Banner grabbing
+      - "netcat*"
+      - "nc_*"
+      - "banner*"
     system_prompt: |
       You are a reconnaissance specialist on a CTF team. Your goal is to map the
       attack surface as thoroughly as possible using the available security tools.
@@ -41,8 +97,49 @@ agents:
       Report discoveries clearly so the Knowledge Base can be updated.
 
   exploit:
-    provider: anthropic
-    model: claude-opus-4-6
+    provider: ollama
+    model: gemma4:e2b
+    host: "http://10.0.2.2:11434"
+    tools:
+      # Web exploitation
+      - "sqlmap*"
+      - "curl*"
+      - "wget*"
+      - "ffuf*"
+      - "wfuzz*"
+      - "burp*"
+      - "xsstrike*"
+      - "dalfox*"
+      - "xxe*"
+      - "jwt*"
+      - "wpscan*"
+      - "joomscan*"
+      - "droopescan*"
+      # Service exploitation
+      - "searchsploit*"
+      - "msfconsole*"
+      - "metasploit*"
+      - "exploit*"
+      - "ftp*"
+      - "ssh*"
+      - "telnet*"
+      - "evil*winrm*"
+      - "smbexec*"
+      - "psexec*"
+      - "impacket*"
+      # Credential attacks
+      - "hydra*"
+      - "medusa*"
+      - "crackmapexec*"
+      - "cme*"
+      - "spray*"
+      # Password cracking
+      - "hashcat*"
+      - "john*"
+      - "hash*identify*"
+      # Netcat / shells
+      - "netcat*"
+      - "nc_*"
     system_prompt: |
       You are an exploitation specialist on a CTF team. Using the reconnaissance
       data and knowledge base, your goal is to gain initial access to the target.
@@ -58,8 +155,37 @@ agents:
       stop and report back to the supervisor rather than looping endlessly.
 
   privesc:
-    provider: anthropic
-    model: claude-opus-4-6
+    provider: ollama
+    model: gemma4:e2b
+    host: "http://10.0.2.2:11434"
+    tools:
+      # Linux enumeration
+      - "linpeas*"
+      - "linenum*"
+      - "linux*privesc*"
+      - "unix*privesc*"
+      - "pspy*"
+      - "lse*"
+      # Windows enumeration
+      - "winpeas*"
+      - "windows*privesc*"
+      - "beroot*"
+      - "watson*"
+      - "seatbelt*"
+      # Credential dumping
+      - "mimikatz*"
+      - "secretsdump*"
+      - "hashdump*"
+      # Shell & file operations
+      - "netcat*"
+      - "nc_*"
+      - "curl*"
+      - "wget*"
+      - "ssh*"
+      # Sudo / SUID helpers
+      - "sudo*"
+      - "gtfobins*"
+      - "capsh*"
     system_prompt: |
       You are a privilege escalation specialist on a CTF team. You have initial
       access to the target and need to escalate to root/Administrator.
@@ -76,9 +202,67 @@ agents:
 
       Capture flags at /root/root.txt, /home/*/user.txt, or equivalent Windows paths.
 
+  webexplorer:
+    provider: ollama
+    model: gemma4:e2b
+    host: "http://10.0.2.2:11434"
+    tools:
+      # HTTP fetching & browsing
+      - "curl*"
+      - "wget*"
+      - "httpx*"
+      - "requests*"
+      # Spider / crawling
+      - "hakrawler*"
+      - "katana*"
+      - "gospider*"
+      - "scrapy*"
+      - "playwright*"
+      - "selenium*"
+      # Link & content extraction
+      - "linkfinder*"
+      - "getallurls*"
+      - "gau*"
+      - "waybackurls*"
+      - "arjun*"
+      - "paramspider*"
+      # JavaScript analysis
+      - "jsluice*"
+      - "jsfinder*"
+      - "secretfinder*"
+      - "trufflehog*"
+      # Tech fingerprinting
+      - "whatweb*"
+      - "wappalyzer*"
+      - "webanalyze*"
+    system_prompt: |
+      You are a web exploration specialist on a CTF team. Your job is to browse
+      target web applications, map their content and structure, and surface anything
+      that could be useful to the exploit agent.
+
+      Approach every web target methodically:
+        1. Fetch the root page and read it fully — note titles, forms, comments, links
+        2. Follow interesting internal links and repeat
+        3. Inspect JavaScript files for endpoints, tokens, or secrets
+        4. Look for hidden fields, API paths, admin panels, login pages
+        5. Note any tech stack clues (headers, cookies, error messages, meta tags)
+        6. Record all discovered paths, parameters, and interesting content
+
+      Report clearly:
+        - All URLs visited and their HTTP status codes
+        - Forms found (action, method, fields)
+        - Comments or developer notes in HTML/JS source
+        - Cookies and security headers (or their absence)
+        - Any credentials, tokens, or secrets found in source
+        - Interesting parameters that might be injectable
+
+      Do NOT attempt exploitation — hand that off to the exploit agent.
+      Stop when you have a thorough map of the application or have found a clear
+      attack vector to report back.
+
   summarizer:
     provider: ollama
-    model: llama3.2
+    model: gemma4:e2b
     host: "http://10.0.2.2:11434"
     system_prompt: |
       You are a concise technical summarizer for CTF hacking tool outputs.
