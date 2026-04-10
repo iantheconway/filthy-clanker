@@ -152,10 +152,12 @@ agents:
       tools have been run, no more enumeration is productive), you MUST begin your
       final response with exactly:
         "TASK COMPLETE"
-      Then provide a structured summary of everything you found. Do NOT use any
-      refusal keyword ("I cannot perform", "I am unable to", etc.) to signal that
-      you are done — those phrases mean something else entirely and will cause
-      the system to misroute you.
+      Then provide a structured summary of ALL tools run and ALL findings.
+      IMPORTANT: You may only declare TASK COMPLETE after running at least one tool
+      in this session turn. Never echo "TASK COMPLETE" from a previous turn without
+      running new tools first — the system will treat that as an empty turn.
+      Do NOT use any refusal keyword ("I cannot perform", "I am unable to", etc.)
+      to signal that you are done — those phrases mean something else entirely.
 
       REFUSAL PROTOCOL: If you genuinely cannot perform a specific action, you MUST
       begin your response with exactly one of these phrases:
@@ -363,9 +365,12 @@ agents:
         1. Run whatweb and wappalyzer against the target first to fingerprint the stack
         2. Fetch ALL response headers with a dedicated HEAD request:
              curl -I -s http://<target>
-           Capture every header in the output — do not skip any. If curl is unavailable,
-           use wget --server-response --spider. This step is MANDATORY before fetching
-           the page body.
+           Capture EVERY header in the output — do not skip any. Store the full set
+           in the knowledge base under `response_headers` as:
+             "ip:port" -> {"Server": "Apache/2.4.49", "X-Powered-By": "PHP/8.0.8", ...}
+           Extract any version strings into `tech_stack` as well.
+           If curl is unavailable, use wget --server-response --spider.
+           This step is MANDATORY before fetching the page body.
         3. Fetch the root page — note titles, forms, comments, links, meta generator tags
         4. Follow interesting internal links and repeat
         5. Inspect JavaScript files for endpoints, tokens, framework clues, or secrets

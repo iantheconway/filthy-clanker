@@ -282,12 +282,25 @@ async def _run_agent_loop(
     all_messages = (messages + new_messages)
     new_estimate = _estimate_tokens(all_messages)
 
+    # Detect substantive TASK COMPLETE in the final assistant message so the
+    # supervisor knows not to re-route to this agent unnecessarily.
+    _final_text, _final_had_tool = _last_assistant_text_and_tools(new_messages)
+    _body = _final_text[len("task complete"):].strip() if _final_text.lower().lstrip().startswith("task complete") else ""
+    _is_substantive_completion = (
+        _final_text.lower().lstrip().startswith("task complete")
+        and (_final_had_tool or len(_body) >= 80)
+    )
+    existing_completed = list(state.get("completed_agents") or [])
+    if _is_substantive_completion and agent_name not in existing_completed:
+        existing_completed = existing_completed + [agent_name]
+
     return {
         "messages": new_messages,
         "knowledge_base": updated_kb,
         "current_agent": agent_name,
         "context_token_estimate": new_estimate,
         "exploit_attempts": state.get("exploit_attempts", 0) + exploit_delta,
+        "completed_agents": existing_completed,
     }
 
 
@@ -395,6 +408,16 @@ def lightweight_evaluator(state: TeamState) -> str:
     # (A) keyword match in opening — but skip entirely if the agent signalled
     #     explicit completion with "TASK COMPLETE" at the start.
     if opening.lstrip().startswith("task complete"):
+        # Require a meaningful body — a bare "TASK COMPLETE" with no findings
+        # means the agent is echoing the previous turn without doing any work.
+        body = text[len("task complete"):].strip()
+        if not had_tool and len(body) < 80:
+            logger.info(
+                "[Evaluator] Bare TASK COMPLETE (no tools, no body) from %s "
+                "— treating as empty turn → refusal_specialist",
+                state.get("current_agent", "?"),
+            )
+            return "refusal_specialist"
         logger.info("[Evaluator] TASK COMPLETE signal from %s → supervisor",
                     state.get("current_agent", "?"))
         return "supervisor"

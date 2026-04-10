@@ -191,6 +191,32 @@ async def supervisor_node(state: TeamState) -> dict:
         return {"next": "exploit"}
 
     # -----------------------------------------------------------------------
+    # 4c. Completed-agent loop guard — if every work agent has completed and
+    #     no flag exists, we're stuck; trigger HITL so the human can provide
+    #     a new direction.  Also: if the current_agent is already completed
+    #     and there's nothing new in the KB to justify re-running them, skip
+    #     to the LLM decision so it can pick a different agent.
+    # -----------------------------------------------------------------------
+    completed_agents_now: list[str] = list(state.get("completed_agents") or [])
+    all_work_agents = {"recon", "webexplorer", "exploit", "privesc"}
+    if all_work_agents.issubset(set(completed_agents_now)) and not flags:
+        logger.warning("[Supervisor] All agents completed but no flag — requesting human input")
+        human_response = interrupt({
+            "reason": "all_agents_complete_no_flag",
+            "message": (
+                "All agents have signalled TASK COMPLETE but no flag was captured.\n"
+                f"Knowledge Base:\n{json.dumps(kb, indent=2)}\n\n"
+                "Please provide a new attack direction, credentials, or hints."
+            ),
+        })
+        return {
+            "messages": [{"role": "user", "content": f"[Human Operator]: {human_response}"}],
+            "completed_agents": [],   # reset so agents can run again
+            "hitl_reason": None,
+            "next": "recon",
+        }
+
+    # -----------------------------------------------------------------------
     # 5. Propagate an existing hitl_reason
     # -----------------------------------------------------------------------
     hitl_reason = state.get("hitl_reason")
@@ -234,12 +260,25 @@ async def supervisor_node(state: TeamState) -> dict:
         recent_text_parts.append(f"[{role.upper()}]: {str(content)[:500]}")
     recent_digest = "\n".join(recent_text_parts)
 
+    # Agents that have already signalled a substantive TASK COMPLETE — read
+    # directly from state (maintained by _run_agent_loop in agents.py).
+    completed_agents: list[str] = list(state.get("completed_agents") or [])
+    completed_hint = ""
+    if completed_agents:
+        done_list = ", ".join(completed_agents)
+        completed_hint = (
+            f"\nAgents that have already reported TASK COMPLETE this session: {done_list}. "
+            f"Do NOT re-route to them unless the knowledge base has materially changed "
+            f"in a way that specifically requires their skills again.\n"
+        )
+
     routing_prompt = (
         f"Current Knowledge Base:\n{json.dumps(kb, indent=2)}\n\n"
         f"Recent Activity:\n{recent_digest}\n\n"
         f"Exploit attempts so far: {exploit_attempts}\n"
-        f"Current agent: {state.get('current_agent', 'none')}\n\n"
-        f"Decide the next action. Respond with ONLY a JSON object:\n"
+        f"Current agent: {state.get('current_agent', 'none')}\n"
+        f"{completed_hint}"
+        f"\nDecide the next action. Respond with ONLY a JSON object:\n"
         f'{{"next": "<recon|webexplorer|exploit|privesc|FINISH>", "reasoning": "<brief reason>", "hitl_reason": null}}'
     )
 

@@ -156,6 +156,7 @@ def initial_state(
         task=task,
         next="recon",
         exploit_attempts=0,
+        completed_agents=[],
         provider=provider,
         context_token_estimate=len(task) // 4,
         hitl_reason=None,

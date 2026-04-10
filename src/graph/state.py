@@ -15,6 +15,7 @@ class KnowledgeBase(TypedDict, total=False):
     open_ports: Dict[str, List[int]]       # ip -> [port, ...]
     services: Dict[str, str]               # "ip:port" -> service banner
     tech_stack: Dict[str, List[str]]       # "ip:port" -> ["Software/version", ...]
+    response_headers: Dict[str, Dict[str, str]]  # "ip:port" -> {header: value}
     credentials: List[Dict[str, str]]      # [{"user": ..., "pass": ..., "service": ...}]
     flags: List[str]
     attack_surface: List[str]              # Discovered paths, endpoints, vulns
@@ -31,6 +32,8 @@ class TeamState(TypedDict):
     task                  — Current high-level objective.
     next                  — Routing decision set by the supervisor.
     exploit_attempts      — Counter for consecutive failed exploit attempts.
+    completed_agents      — Set of agent names that have signalled TASK COMPLETE
+                            with substantive findings. Reset when KB changes significantly.
     provider              — Global provider override ("anthropic", "gemini", "ollama"),
                             or None to use each agent's own config from agents.yaml.
     context_token_estimate— Rough token count for context-limit tracking.
@@ -44,6 +47,7 @@ class TeamState(TypedDict):
     task: str
     next: str
     exploit_attempts: int
+    completed_agents: List[str]
     provider: Optional[str]
     context_token_estimate: int
     hitl_reason: Optional[str]
