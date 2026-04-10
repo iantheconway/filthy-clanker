@@ -79,6 +79,27 @@ def _resolve_llm(state: TeamState, agent_cfg: dict):
     return provider, model, llm
 
 
+_HTTP_PORTS = {80, 443, 8080, 8443, 8000, 8008, 8888, 3000, 4000, 5000, 9000, 9090}
+
+
+def _http_services(kb: dict) -> list[str]:
+    """
+    Return a list of 'ip:port' strings for any HTTP/HTTPS service found in the
+    knowledge base — either by service name or by well-known port number.
+    """
+    found: list[str] = []
+    for addr, svc in kb.get("services", {}).items():
+        if any(s in svc.lower() for s in ("http", "https", "web", "www")):
+            found.append(addr)
+    for ip, ports in kb.get("open_ports", {}).items():
+        for port in ports:
+            if port in _HTTP_PORTS:
+                addr = f"{ip}:{port}"
+                if addr not in found:
+                    found.append(addr)
+    return found
+
+
 async def supervisor_node(state: TeamState) -> dict:
     """
     LangGraph node: decide which agent runs next (or end the session).
@@ -139,7 +160,38 @@ async def supervisor_node(state: TeamState) -> dict:
         }
 
     # -----------------------------------------------------------------------
-    # 4. Propagate an existing hitl_reason
+    # 4. HTTP auto-trigger — route to webexplorer the moment an HTTP port is
+    #    discovered by recon, before asking the LLM to decide anything.
+    #    Only fires when recon (or refusal_specialist correcting recon) just ran,
+    #    so webexplorer isn't re-triggered on every supervisor cycle.
+    # -----------------------------------------------------------------------
+    current_agent = state.get("current_agent", "none")
+    http_svcs = _http_services(kb)
+    if http_svcs and current_agent in ("recon", "refusal_specialist"):
+        logger.info("[Supervisor] HTTP service(s) detected on %s → webexplorer", http_svcs)
+        return {"next": "webexplorer"}
+
+    # -----------------------------------------------------------------------
+    # 4b. Tech-stack vuln research trigger — after webexplorer (or recon)
+    #     populates tech_stack, route to exploit for a CVE research pass before
+    #     any active exploitation.  Only fires once: skip if attack_surface
+    #     already contains CVE references from a previous research pass.
+    # -----------------------------------------------------------------------
+    tech_stack = kb.get("tech_stack", {})
+    attack_surface = kb.get("attack_surface", [])
+    cve_researched = any(
+        "cve" in entry.lower() or "searchsploit" in entry.lower()
+        for entry in attack_surface
+    )
+    if (tech_stack
+            and not cve_researched
+            and current_agent in ("webexplorer", "recon", "refusal_specialist")):
+        logger.info("[Supervisor] tech_stack populated (%d entries), no CVE research yet → exploit",
+                    len(tech_stack))
+        return {"next": "exploit"}
+
+    # -----------------------------------------------------------------------
+    # 5. Propagate an existing hitl_reason
     # -----------------------------------------------------------------------
     hitl_reason = state.get("hitl_reason")
     if hitl_reason:
@@ -158,7 +210,7 @@ async def supervisor_node(state: TeamState) -> dict:
         }
 
     # -----------------------------------------------------------------------
-    # 5. Ask the supervisor LLM to route
+    # 6. Ask the supervisor LLM to route
     # -----------------------------------------------------------------------
     sup_cfg = config.get("agents", {}).get("supervisor", {})
     system_prompt = sup_cfg.get("system_prompt", "Route the CTF team.")
@@ -246,6 +298,20 @@ async def supervisor_node(state: TeamState) -> dict:
             next_agent = "__end__"
         else:
             next_agent = "recon"
+
+    # Loop guard: if the refusal_specialist just ran, the supervisor must not
+    # route back to it again — the specialist already had its chance.  Pick the
+    # most appropriate work agent from the knowledge base instead.
+    if next_agent == "refusal_specialist" and state.get("current_agent") == "refusal_specialist":
+        kb_now = state.get("knowledge_base", {})
+        if kb_now.get("flags"):
+            next_agent = "__end__"
+        elif kb_now.get("open_ports") or kb_now.get("attack_surface"):
+            next_agent = "exploit"
+        else:
+            next_agent = "recon"
+        logger.warning("[Supervisor] Loop guard: refusal_specialist→refusal_specialist prevented, "
+                       "redirecting to %s", next_agent.upper())
 
     logger.info("[Supervisor] → %s%s", next_agent.upper(), f" | {reasoning[:120]}" if reasoning else "")
 

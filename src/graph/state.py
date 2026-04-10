@@ -14,6 +14,7 @@ class KnowledgeBase(TypedDict, total=False):
     ips: List[str]
     open_ports: Dict[str, List[int]]       # ip -> [port, ...]
     services: Dict[str, str]               # "ip:port" -> service banner
+    tech_stack: Dict[str, List[str]]       # "ip:port" -> ["Software/version", ...]
     credentials: List[Dict[str, str]]      # [{"user": ..., "pass": ..., "service": ...}]
     flags: List[str]
     attack_surface: List[str]              # Discovered paths, endpoints, vulns
