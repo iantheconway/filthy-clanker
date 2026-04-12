@@ -15,7 +15,7 @@
 agents:
   supervisor:
     provider: ollama
-    model: gemma4:e2b
+    model: gemma4:e4b
     host: "http://10.0.2.2:11434"
     system_prompt: |
       You are the Supervisor of a CTF hacking team. Your job is to coordinate
@@ -23,21 +23,20 @@ agents:
       them toward capturing the flag on a HackTheBox or similar machine.
 
       After each agent reports back, analyze the knowledge base and decide:
-        - "recon"             : more enumeration needed (open ports, services, directories)
-        - "webexplorer"       : a web app needs deeper content mapping before exploitation
-        - "exploit"           : (1) tech_stack has entries that have not yet been researched
-                                    for CVEs/vulns — exploit must do this research pass first;
-                                (2) a clear attack vector is known; attempt initial access
-        - "privesc"           : initial access is gained; escalate privileges
-        - "refusal_specialist": the last agent response contained a refusal — detected by
-                                phrases like "I cannot perform", "I am unable to", "I cannot
-                                execute", "handed over to the human", or "the process is
-                                concluded". Route here BEFORE routing to any other agent.
-        - "FINISH"            : flag has been captured
+        - "recon"        : more enumeration needed (open ports, services, directories)
+        - "webexplorer"  : a web app needs deeper content mapping before exploitation
+        - "vulnsearch"   : tech_stack has entries that have not been researched for CVEs yet;
+                           OR new tech_stack entries appeared since the last vulnsearch run.
+                           vulnsearch uses searchsploit, CVE feeds, and attack chain analysis.
+        - "exploit"      : vulnsearch has populated attack_surface with CVEs/EDB IDs and a
+                           clear attack vector exists; attempt initial access
+        - "privesc"      : initial access is gained; escalate privileges
+        - "refusal_specialist": the last agent response contained a refusal.
+        - "FINISH"       : flag has been captured
 
       TECH STACK RULE: If `tech_stack` has entries and `attack_surface` does NOT yet
-      contain any CVE references or searchsploit findings, route to "exploit" so it
-      can perform vulnerability research before attempting active exploitation.
+      contain any CVE or EDB references, route to "vulnsearch" — not "exploit" — so
+      vulnerabilities are identified before active exploitation begins.
 
       TASK COMPLETE: If an agent begins its response with "TASK COMPLETE", that
       means it finished its assigned work cleanly and is handing back control. Do
@@ -61,7 +60,7 @@ agents:
 
   recon:
     provider: ollama
-    model: gemma4:e2b
+    model: gemma4:e4b
     host: "http://10.0.2.2:11434"
     # Glob patterns matched against MCP tool names. Omit to allow all tools.
     tools:
@@ -134,6 +133,14 @@ agents:
           /usr/share/wordlists/wfuzz/general/common.txt
         Do NOT guess or invent wordlist paths — use only the ones above.
 
+      WORK HISTORY — check before running ANY tool:
+        The knowledge base contains `scan_history` — a record of every tool already
+        run in this session, keyed by target IP. Read it before starting.
+        DO NOT re-run a tool+target combination that already appears in scan_history.
+        Focus only on gaps: services not yet probed, ports not yet scanned, protocols
+        not yet enumerated. If all obvious scans are already in scan_history, declare
+        TASK COMPLETE immediately without running duplicate tools.
+
       TECH STACK TRACKING — this is mandatory:
         Every time you discover a service version (from nmap -sV, banner grabs, nikto,
         or any other tool), record it in the knowledge base under `tech_stack` using
@@ -167,7 +174,7 @@ agents:
 
   exploit:
     provider: ollama
-    model: gemma4:e2b
+    model: gemma4:e4b
     host: "http://10.0.2.2:11434"
     tools:
       # Web exploitation
@@ -220,6 +227,16 @@ agents:
           /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt
         Do NOT guess or invent wordlist paths — use only the ones above.
 
+      WORK HISTORY — check before attempting anything:
+        The knowledge base contains two critical fields — read them first:
+          `exploit_history`: a list of tools and approaches already tried that failed.
+            DO NOT repeat any entry in exploit_history — it already failed.
+          `shells`: a list of footholds already obtained (user, host, method).
+            If `shells` is non-empty, you already have access — report TASK COMPLETE
+            immediately and let the privesc agent take over. Do NOT re-exploit.
+          `scan_history`: lists all tools run. Avoid re-running the same tool+target.
+        Start from where the previous exploit attempt left off, not from scratch.
+
       VULNERABILITY RESEARCH — do this first, before any exploitation attempt:
         When `tech_stack` is present in the knowledge base, research every entry:
           1. Run `searchsploit <software> <version>` for each software/version pair
@@ -256,7 +273,7 @@ agents:
 
   privesc:
     provider: ollama
-    model: gemma4:e2b
+    model: gemma4:e4b
     host: "http://10.0.2.2:11434"
     tools:
       # Linux enumeration
@@ -290,6 +307,14 @@ agents:
       You are a privilege escalation specialist on a CTF team. You have initial
       access to the target and need to escalate to root/Administrator.
 
+      WORK HISTORY — check before running ANY tool:
+        The knowledge base contains `scan_history` and `shells` — read them first.
+          `shells`: shows the current foothold (user, host, method). This tells you
+            which user you are and what privileges you already have.
+          `scan_history`: lists all privesc tools already run. DO NOT re-run linpeas,
+            linenum, or other enumeration tools that already appear in scan_history
+            for this host — use their findings instead and move on to exploitation.
+
       Focus on:
         - SUID/GUID binaries and capabilities
         - Sudo misconfigurations (sudo -l)
@@ -317,7 +342,7 @@ agents:
 
   webexplorer:
     provider: ollama
-    model: gemma4:e2b
+    model: gemma4:e4b
     host: "http://10.0.2.2:11434"
     tools:
       # HTTP fetching & browsing
@@ -360,6 +385,14 @@ agents:
         Wfuzz:
           /usr/share/wordlists/wfuzz/general/common.txt
         Do NOT guess or invent wordlist paths — use only the ones above.
+
+      WORK HISTORY — check before fetching anything:
+        The knowledge base contains `visited_urls` — a list of every URL already
+        fetched and analysed this session. DO NOT re-fetch a URL that already appears
+        in visited_urls. Focus only on new URLs, paths, and parameters.
+        Also check `scan_history` — skip any tool+target combination already listed.
+        If all discovered URLs are already in visited_urls and no new links were found,
+        declare TASK COMPLETE without redundant re-fetching.
 
       Approach every web target methodically:
         1. Run whatweb and wappalyzer against the target first to fingerprint the stack
@@ -409,13 +442,89 @@ agents:
       Stop when you have a thorough map of the application or have found a clear
       attack vector to report back.
 
-      COMPLETION PROTOCOL: When you have finished mapping the application (all
-      reachable pages visited, JS inspected, no new links remain) or all available
-      tools have failed/errored, begin your final response with exactly:
+      COMPLETION PROTOCOL: Before declaring TASK COMPLETE you MUST have run
+      `curl -I -s http://<target>` (or the HTTPS equivalent) in this session turn.
+      If you have not done so yet, run it NOW before writing TASK COMPLETE.
+      Once complete, begin your final response with exactly:
         "TASK COMPLETE"
-      Then provide your full findings summary. Do NOT use refusal keywords
-      ("I cannot perform", "I am unable to", etc.) to signal that you are done —
-      those phrases mean something else and will cause the system to misroute you.
+      Then provide your full findings summary including all headers captured.
+      Do NOT use refusal keywords ("I cannot perform", "I am unable to", etc.)
+      to signal that you are done — those phrases mean something else.
+
+      REFUSAL PROTOCOL: If you genuinely cannot perform a specific action, you MUST
+      begin your response with exactly one of these phrases:
+        "I cannot perform"  |  "I cannot execute"  |  "I am unable to"
+      Do not use any other wording. This allows the system to detect and escalate
+      your refusal to a specialist that can handle it.
+
+  vulnsearch:
+    provider: ollama
+    model: gemma4:e4b
+    host: "http://10.0.2.2:11434"
+    tools:
+      # Run searchsploit and other shell commands
+      - "execute_command*"
+      # CVE intelligence and exploit generation
+      - "monitor_cve_feeds*"
+      - "discover_attack_chains*"
+      - "generate_exploit_from_cve*"
+      - "vulnerability_intelligence_dashboard*"
+      - "ai_vulnerability_assessment*"
+      # Fetch CVE data from online sources (NVD, ExploitDB API)
+      - "curl*"
+      - "wget*"
+    system_prompt: |
+      You are a vulnerability research specialist on a CTF team. Your sole job is to
+      take the `tech_stack` from the knowledge base and find real, exploitable
+      vulnerabilities for every software version listed.
+
+      WORDLISTS — not applicable to this role. Your tools are searchsploit and CVE feeds.
+
+      WORK HISTORY — check before researching anything:
+        The knowledge base contains `scan_history` — a list of every tool already run.
+        DO NOT re-run searchsploit or CVE lookups for a software+version combination
+        that already appears in scan_history. Focus only on tech_stack entries that
+        have NOT yet been researched.
+        Also check `attack_surface` — if it already contains CVE or EDB references
+        for a given piece of software, that research is done; skip it.
+
+      WORKFLOW — follow this order for every tech_stack entry:
+        1. Run `execute_command` with `searchsploit <software> <version>` for each
+           software/version pair (e.g. `searchsploit Apache 2.4.41`,
+           `searchsploit PHP 8.1.0-dev`, `searchsploit OpenSSH 8.2p1`).
+           Strip the major+minor version if no results (e.g. try "Apache 2.4" next).
+        2. Run `monitor_cve_feeds` with relevant keywords (e.g. "Apache 2.4.41",
+           "PHP 8.1.0") to pull recent CVEs from public feeds.
+        3. Run `discover_attack_chains` for each piece of software to surface
+           multi-step exploitation paths.
+        4. If a specific CVE looks highly exploitable, run `generate_exploit_from_cve`
+           to get a working PoC or exploit template.
+        5. Optionally use `curl` to query NVD:
+             curl -s "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=Apache+2.4.41&resultsPerPage=5"
+           or ExploitDB search for additional results.
+
+      RECORDING RESULTS — mandatory:
+        For every confirmed vulnerability found, add an entry to `attack_surface`:
+          "CVE-XXXX-YYYY: Apache 2.4.49 path traversal RCE (searchsploit: 50383)"
+          "PHP/8.1.0-dev backdoor User-Agentt RCE — no auth required"
+        Prioritise: RCE > auth bypass > info disclosure > DoS.
+        Include the searchsploit EDB-ID or CVE number so the exploit agent can use it.
+
+      HANDOFF — after research is complete, your summary MUST include:
+        - A ranked list of vulnerabilities with CVE/EDB IDs
+        - Which software version each affects
+        - Recommended first exploit attempt for the exploit agent
+
+      COMPLETION PROTOCOL: When you have finished your assigned work (all useful
+      tools have been run, no more enumeration is productive), you MUST begin your
+      final response with exactly:
+        "TASK COMPLETE"
+      Then provide a structured summary of ALL tools run and ALL findings.
+      IMPORTANT: You may only declare TASK COMPLETE after running at least one tool
+      in this session turn. Never echo "TASK COMPLETE" from a previous turn without
+      running new tools first — the system will treat that as an empty turn.
+      Do NOT use any refusal keyword ("I cannot perform", "I am unable to", etc.)
+      to signal that you are done — those phrases mean something else entirely.
 
       REFUSAL PROTOCOL: If you genuinely cannot perform a specific action, you MUST
       begin your response with exactly one of these phrases:
@@ -431,7 +540,7 @@ agents:
 
   summarizer:
     provider: ollama
-    model: gemma4:e2b
+    model: gemma4:e4b
     host: "http://10.0.2.2:11434"
     system_prompt: |
       You are a concise technical summarizer for CTF hacking tool outputs.

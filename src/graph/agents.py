@@ -159,7 +159,141 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase) -> 
         surface = set(kb.get("attack_surface", []))
         kb["attack_surface"] = list(surface | set(found_paths[:20]))  # cap at 20
 
+    # CVE and searchsploit findings → attack_surface
+    # Searchsploit output lines: "Title  | EDB-ID | ..."
+    edb_pattern = re.compile(r'(.+?)\s*\|\s*(\d{4,6})\s*\|', re.MULTILINE)
+    cve_inline = re.compile(r'(CVE-\d{4}-\d{4,})', re.IGNORECASE)
+    vuln_entries: list[str] = []
+    for m in edb_pattern.finditer(tool_result):
+        title = m.group(1).strip()
+        edb_id = m.group(2).strip()
+        if title and not title.startswith("-"):
+            vuln_entries.append(f"EDB-{edb_id}: {title}")
+    for cve in cve_inline.findall(tool_result):
+        # Only add if it's near something that looks like a title/description
+        vuln_entries.append(cve.upper())
+    if vuln_entries:
+        surface = set(kb.get("attack_surface", []))
+        kb["attack_surface"] = list(surface | set(vuln_entries[:30]))
+
+    # -----------------------------------------------------------------------
+    # Tech stack and response header extraction
+    # -----------------------------------------------------------------------
+    target_ip = (kb.get("ips") or ["target"])[0]
+
+    # Patterns that yield "Software/version" strings from various tools
+    version_patterns = [
+        # curl -I / HTTP header values:  "Server: Apache/2.4.49"
+        re.compile(r'^(?:server|x-powered-by|x-generator|x-aspnet-version|x-runtime|via)\s*:\s*(.+)$',
+                   re.IGNORECASE | re.MULTILINE),
+        # nmap -sV banner:  "80/tcp open  http  Apache httpd 2.4.49"
+        re.compile(r'\d+/tcp\s+open\s+\S+\s+(.+)', re.IGNORECASE),
+        # nmap script output:  "| http-server-header: Apache/2.4.49"
+        re.compile(r'\|\s*http-server-header:\s*(.+)', re.IGNORECASE),
+        # nikto:  "+ Server: Apache/2.4.49 (Ubuntu)"
+        re.compile(r'\+\s*Server:\s*(.+)', re.IGNORECASE),
+        # whatweb:  Apache[2.4.49], PHP[8.1.0-dev]
+        re.compile(r'(\w[\w.-]+)\[(\d[\d.a-z_-]+)\]', re.IGNORECASE),
+    ]
+
+    tech_entries: list[str] = []
+    whatweb_pat = version_patterns[-1]  # the name[version] pattern
+    for pat in version_patterns:
+        for m in pat.finditer(tool_result):
+            if pat is whatweb_pat:
+                entry = f"{m.group(1)}/{m.group(2)}"
+            else:
+                entry = m.group(1).strip()
+            if entry and len(entry) < 120:
+                tech_entries.append(entry)
+
+    if tech_entries:
+        # Associate with the port referenced in the tool call (default 80 for web)
+        port_match = re.search(r':(\d+)', tool_name) or re.search(r'\b(80|443|8080|8443)\b', tool_result)
+        port = port_match.group(1) if port_match else "80"
+        key = f"{target_ip}:{port}"
+        tech_stack = dict(kb.get("tech_stack") or {})
+        existing = set(tech_stack.get(key, []))
+        tech_stack[key] = list(existing | set(tech_entries))
+        kb["tech_stack"] = tech_stack
+
+    # Response headers from curl -I / wget --server-response output
+    # Match lines of the form "Header-Name: value" (HTTP header format)
+    header_line_pat = re.compile(
+        r'^([\w-]+):\s+(.+)$', re.MULTILINE
+    )
+    # Only extract if this looks like an HTTP response (has HTTP/ status line or
+    # at least a Server header) to avoid false positives from other tool output.
+    if re.search(r'HTTP/\d', tool_result) or re.search(r'^Server:', tool_result, re.MULTILINE | re.IGNORECASE):
+        headers_found: dict[str, str] = {}
+        for m in header_line_pat.finditer(tool_result):
+            hname = m.group(1).strip()
+            hval = m.group(2).strip()
+            # Skip obviously non-header lines (JSON keys, nmap fields, etc.)
+            if len(hname) <= 60 and len(hval) <= 256:
+                headers_found[hname] = hval
+        if headers_found:
+            port_h = re.search(r':(\d+)', tool_name)
+            port_str = port_h.group(1) if port_h else "80"
+            key = f"{target_ip}:{port_str}"
+            resp_headers = dict(kb.get("response_headers") or {})
+            existing_h = dict(resp_headers.get(key, {}))
+            existing_h.update(headers_found)
+            resp_headers[key] = existing_h
+            kb["response_headers"] = resp_headers
+
     return kb
+
+
+def _scan_key_args(tool_name: str, raw_args: dict) -> str:
+    """Return a short, human-readable summary of the key arguments for scan_history."""
+    for key in ("target", "host", "url", "command", "ip", "address", "domain"):
+        val = raw_args.get(key)
+        if val:
+            return str(val)[:80]
+    # Fallback: first value in args
+    if raw_args:
+        first_val = next(iter(raw_args.values()))
+        return str(first_val)[:80]
+    return ""
+
+
+def _extract_url_from_args(raw_args: dict) -> Optional[str]:
+    """Extract the first HTTP/HTTPS URL from tool call arguments."""
+    for key in ("url", "target", "command", "uri", "address"):
+        val = raw_args.get(key, "")
+        if val:
+            m = re.search(r'https?://[^\s\'")\]]+', str(val))
+            if m:
+                return m.group(0).rstrip("'\")")
+    return None
+
+
+def _detect_shell_from_output(result: str, known_ips: List[str]) -> Optional[Dict[str, str]]:
+    """
+    Detect a successful shell / RCE from command output.
+    Only returns a result for strong signals to avoid false positives.
+    """
+    # uid=0(root) or uid=1000(user) — very reliable indicator of code execution
+    uid_match = re.search(r'\buid=(\d+)\((\w+)\)', result)
+    if uid_match:
+        return {
+            "user": uid_match.group(2),
+            "uid": uid_match.group(1),
+            "host": known_ips[0] if known_ips else "unknown",
+            "via": "RCE (uid output)",
+        }
+    # "root@hostname:~#" style prompts that are the LAST line of output
+    last_lines = result.strip().splitlines()[-3:]
+    for line in last_lines:
+        m = re.match(r'^(\w[\w-]*)@([\w.-]+)[:#\$]\s*(?:~.*)?[#\$]\s*$', line.strip())
+        if m:
+            return {
+                "user": m.group(1),
+                "host": m.group(2),
+                "via": "shell prompt",
+            }
+    return None
 
 
 async def _run_agent_loop(
@@ -260,6 +394,54 @@ async def _run_agent_loop(
 
             # Update knowledge base from tool output
             updated_kb = _extract_kb_updates(tool_name, result, updated_kb)
+
+            # ---- scan_history: record every tool call so agents don't repeat work ----
+            _sh_target = (updated_kb.get("ips") or ["target"])[0]
+            _sh_args_summary = _scan_key_args(tool_name, raw_args)
+            _sh_entry = f"[{agent_name}] {tool_name}: {_sh_args_summary}"
+            _scan_hist = dict(updated_kb.get("scan_history") or {})
+            _target_hist = list(_scan_hist.get(_sh_target, []))
+            if _sh_entry not in _target_hist:
+                _target_hist.append(_sh_entry)
+                _scan_hist[_sh_target] = _target_hist[-60:]  # cap per-target
+                updated_kb["scan_history"] = _scan_hist
+
+            # ---- visited_urls: record HTTP fetches for webexplorer deduplication ----
+            _url = _extract_url_from_args(raw_args)
+            if _url:
+                _visited = list(updated_kb.get("visited_urls") or [])
+                if _url not in _visited:
+                    _visited.append(_url)
+                    updated_kb["visited_urls"] = _visited[-300:]  # cap
+
+            # ---- exploit_history: record failed exploit attempts ----
+            if agent_name == "exploit":
+                _fail_kws = (
+                    "failed", "connection refused", "access denied",
+                    "not vulnerable", "patched", "not found", "403", "404", "500",
+                )
+                _is_fail = any(kw in result.lower()[:600] for kw in _fail_kws)
+                if _is_fail:
+                    _exp_entry = f"{tool_name}({_sh_args_summary[:60]}): failed"
+                    _exp_hist = list(updated_kb.get("exploit_history") or [])
+                    if _exp_entry not in _exp_hist:
+                        _exp_hist.append(_exp_entry)
+                        updated_kb["exploit_history"] = _exp_hist[-40:]
+
+            # ---- shells: auto-detect successful RCE / foothold ----
+            _shell = _detect_shell_from_output(result, list(updated_kb.get("ips") or []))
+            if _shell:
+                _shells = list(updated_kb.get("shells") or [])
+                # Avoid duplicate entries for the same user@host
+                _shell_key = (_shell.get("user"), _shell.get("host"))
+                if not any(
+                    (s.get("user"), s.get("host")) == _shell_key for s in _shells
+                ):
+                    _shells.append(_shell)
+                    updated_kb["shells"] = _shells
+                    logger.info("[%s] Shell detected: %s@%s via %s",
+                                agent_name, _shell.get("user"), _shell.get("host"), _shell.get("via"))
+
             tool_results.append((tc, result))
 
         # Build tool result messages (provider-specific)
@@ -538,11 +720,35 @@ def make_refusal_specialist_node(mcp_client: Any):
         tool_calls = specialist.parse_tool_calls(response)
         new_messages: list = [specialist.make_assistant_message(response)]
 
-        # Check if specialist determined this was a legitimate completion
-        response_text = response.get("text") or ""
-        if "legitimate_completion" in response_text.lower():
+        # Extract text from the assistant message (provider-agnostic)
+        _asst_content = new_messages[0].get("content", "") if new_messages else ""
+        response_text = ""
+        if isinstance(_asst_content, str):
+            response_text = _asst_content
+        elif isinstance(_asst_content, list):
+            for _blk in _asst_content:
+                if isinstance(_blk, dict) and _blk.get("type") == "text":
+                    response_text += _blk.get("text", "")
+
+        # Check if specialist determined this was a legitimate completion —
+        # either as text OR as a fake "LEGITIMATE_COMPLETION" tool call (some
+        # abliterated models treat it as a tool name instead of a token).
+        _legit_tool_call = any(
+            tc.get("name", "").replace(" ", "_").lower() in (
+                "legitimate_completion", "legitimate_completion_signal"
+            )
+            for tc in tool_calls
+        )
+        if "legitimate_completion" in response_text.lower() or _legit_tool_call:
             logger.info("[RefusalSpecialist] Determined response was a legitimate completion — passing through")
             return {"messages": new_messages, "current_agent": "refusal_specialist"}
+
+        # Strip any remaining fake LEGITIMATE_COMPLETION tool calls so they
+        # don't reach mcp_client.call_tool() and produce "Unknown tool" errors.
+        tool_calls = [
+            tc for tc in tool_calls
+            if tc.get("name", "").replace(" ", "_").lower() != "legitimate_completion"
+        ]
 
         if not tool_calls:
             logger.warning("[RefusalSpecialist] Specialist produced no tool calls — routing to supervisor")
@@ -609,3 +815,11 @@ def make_webexplorer_node(mcp_client: Any, tools: list):
         logger.info("[WebExplorer Agent] Browsing and mapping web content...")
         return await _run_agent_loop("webexplorer", state, tools, mcp_client)
     return webexplorer_node
+
+
+def make_vulnsearch_node(mcp_client: Any, tools: list):
+    """Return an async node function for the Vulnerability Search agent."""
+    async def vulnsearch_node(state: TeamState) -> dict:
+        logger.info("[VulnSearch Agent] Researching vulnerabilities in tech stack...")
+        return await _run_agent_loop("vulnsearch", state, tools, mcp_client)
+    return vulnsearch_node

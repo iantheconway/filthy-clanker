@@ -4,10 +4,11 @@ StateGraph assembly for the Filthy-Clanker multi-agent workflow.
 Graph topology:
                                                     ┌──────────────────────────┐
                                                     │                          │
-    START ──► supervisor ──► recon ──► evaluator ──►│ supervisor               │
-                   ▲         exploit ── evaluator ──►│                          │
-                   │         privesc ── evaluator ──►│                          │
-                   │         webexplorer  evaluator ►│                          │
+    START ──► supervisor ──► recon ──────► evaluator ──►│ supervisor               │
+                   ▲         webexplorer ── evaluator ──►│                          │
+                   │         vulnsearch ─── evaluator ──►│                          │
+                   │         exploit ────── evaluator ──►│                          │
+                   │         privesc ────── evaluator ──►│                          │
                    │                        │        │                          │
                    │              refusal   │        └──────────────────────────┘
                    │           ┌───────────►│
@@ -32,7 +33,7 @@ from .supervisor import supervisor_node, route_from_supervisor
 from .summarizer import compaction_node
 from .agents import (
     make_recon_node, make_exploit_node, make_privesc_node, make_webexplorer_node,
-    make_refusal_specialist_node, lightweight_evaluator,
+    make_vulnsearch_node, make_refusal_specialist_node, lightweight_evaluator,
 )
 
 
@@ -67,6 +68,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     exploit_node = make_exploit_node(mcp_client, tools)
     privesc_node = make_privesc_node(mcp_client, tools)
     webexplorer_node = make_webexplorer_node(mcp_client, tools)
+    vulnsearch_node = make_vulnsearch_node(mcp_client, tools)
     refusal_specialist_node = make_refusal_specialist_node(mcp_client)
 
     # -----------------------------------------------------------------------
@@ -80,6 +82,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     graph.add_node("exploit", exploit_node)
     graph.add_node("privesc", privesc_node)
     graph.add_node("webexplorer", webexplorer_node)
+    graph.add_node("vulnsearch", vulnsearch_node)
     graph.add_node("refusal_specialist", refusal_specialist_node)
     graph.add_node("compaction", compaction_node)
 
@@ -95,6 +98,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
             "exploit": "exploit",
             "privesc": "privesc",
             "webexplorer": "webexplorer",
+            "vulnsearch": "vulnsearch",
             "refusal_specialist": "refusal_specialist",
             "compaction": "compaction",
             "__end__": END,
@@ -104,7 +108,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     # Each agent node passes through the lightweight evaluator before returning
     # to the supervisor — the evaluator redirects to refusal_specialist if needed.
     _evaluator_map = {"supervisor": "supervisor", "refusal_specialist": "refusal_specialist"}
-    for _agent in ("recon", "exploit", "privesc", "webexplorer"):
+    for _agent in ("recon", "exploit", "privesc", "webexplorer", "vulnsearch"):
         graph.add_conditional_edges(_agent, lightweight_evaluator, _evaluator_map)
 
     # refusal_specialist always hands back to supervisor after fixing a response

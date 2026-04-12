@@ -18,8 +18,13 @@ class KnowledgeBase(TypedDict, total=False):
     response_headers: Dict[str, Dict[str, str]]  # "ip:port" -> {header: value}
     credentials: List[Dict[str, str]]      # [{"user": ..., "pass": ..., "service": ...}]
     flags: List[str]
-    attack_surface: List[str]              # Discovered paths, endpoints, vulns
+    attack_surface: List[str]              # Discovered paths, endpoints, CVEs, vulns
     notes: List[str]                       # Freeform analyst notes
+    # Work-history fields — survive compaction, prevent agents re-doing completed work
+    scan_history: Dict[str, List[str]]     # ip -> ["[agent] tool_name: key_args", ...]
+    visited_urls: List[str]                # URLs already fetched/analysed by webexplorer
+    exploit_history: List[str]             # ["tool(args): outcome", ...] — failed attempts
+    shells: List[Dict[str, str]]           # [{"user": "www-data", "host": "...", "via": "CVE-..."}]
 
 
 class TeamState(TypedDict):

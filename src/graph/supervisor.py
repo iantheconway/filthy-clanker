@@ -30,7 +30,7 @@ logger = logging.getLogger("filthy_clanker")
 
 
 # Possible routing destinations
-NEXT_OPTIONS = Literal["recon", "exploit", "privesc", "compaction", "__end__"]
+NEXT_OPTIONS = Literal["recon", "exploit", "privesc", "vulnsearch", "compaction", "__end__"]
 
 
 _PROVIDER_DEFAULT_MODELS = {
@@ -117,6 +117,7 @@ async def supervisor_node(state: TeamState) -> dict:
     kb = state.get("knowledge_base", {})
     exploit_attempts = state.get("exploit_attempts", 0)
     current_estimate = state.get("context_token_estimate", 0)
+    current_agent = state.get("current_agent", "none")
 
     # -----------------------------------------------------------------------
     # 1. Check if flag was already captured
@@ -125,6 +126,14 @@ async def supervisor_node(state: TeamState) -> dict:
     if flags:
         logger.info("[Supervisor] Flag captured: %s. Mission complete!", flags)
         return {"next": "__end__"}
+
+    # -----------------------------------------------------------------------
+    # 1b. Shell / foothold already obtained → skip straight to privesc
+    # -----------------------------------------------------------------------
+    shells = kb.get("shells", [])
+    if shells and current_agent not in ("privesc", "refusal_specialist"):
+        logger.info("[Supervisor] Foothold detected (%s) → privesc", shells)
+        return {"next": "privesc"}
 
     # -----------------------------------------------------------------------
     # 2. Context compaction check — route to summarizer before hitting limits
@@ -162,33 +171,35 @@ async def supervisor_node(state: TeamState) -> dict:
     # -----------------------------------------------------------------------
     # 4. HTTP auto-trigger — route to webexplorer the moment an HTTP port is
     #    discovered by recon, before asking the LLM to decide anything.
-    #    Only fires when recon (or refusal_specialist correcting recon) just ran,
-    #    so webexplorer isn't re-triggered on every supervisor cycle.
+    #    Only fires immediately after recon so webexplorer isn't re-triggered
+    #    on every supervisor cycle (including after refusal_specialist).
     # -----------------------------------------------------------------------
-    current_agent = state.get("current_agent", "none")
     http_svcs = _http_services(kb)
-    if http_svcs and current_agent in ("recon", "refusal_specialist"):
+    # Only auto-trigger webexplorer immediately after recon — NOT after refusal_specialist,
+    # which may have just corrected a webexplorer turn (causing an infinite loop).
+    if http_svcs and current_agent == "recon":
         logger.info("[Supervisor] HTTP service(s) detected on %s → webexplorer", http_svcs)
         return {"next": "webexplorer"}
 
     # -----------------------------------------------------------------------
-    # 4b. Tech-stack vuln research trigger — after webexplorer (or recon)
-    #     populates tech_stack, route to exploit for a CVE research pass before
-    #     any active exploitation.  Only fires once: skip if attack_surface
-    #     already contains CVE references from a previous research pass.
+    # 4b. Tech-stack vuln research trigger — after webexplorer or recon
+    #     populates tech_stack, route to vulnsearch for a CVE/searchsploit
+    #     research pass before any active exploitation.
+    #     Only fires once: skip if attack_surface already contains CVE or
+    #     EDB references from a previous vulnsearch run.
     # -----------------------------------------------------------------------
     tech_stack = kb.get("tech_stack", {})
     attack_surface = kb.get("attack_surface", [])
     cve_researched = any(
-        "cve" in entry.lower() or "searchsploit" in entry.lower()
+        "cve" in entry.lower() or "edb-" in entry.lower() or "searchsploit" in entry.lower()
         for entry in attack_surface
     )
     if (tech_stack
             and not cve_researched
-            and current_agent in ("webexplorer", "recon", "refusal_specialist")):
-        logger.info("[Supervisor] tech_stack populated (%d entries), no CVE research yet → exploit",
+            and current_agent in ("webexplorer", "recon")):
+        logger.info("[Supervisor] tech_stack populated (%d entries), no CVE research yet → vulnsearch",
                     len(tech_stack))
-        return {"next": "exploit"}
+        return {"next": "vulnsearch"}
 
     # -----------------------------------------------------------------------
     # 4c. Completed-agent loop guard — if every work agent has completed and
@@ -198,7 +209,7 @@ async def supervisor_node(state: TeamState) -> dict:
     #     to the LLM decision so it can pick a different agent.
     # -----------------------------------------------------------------------
     completed_agents_now: list[str] = list(state.get("completed_agents") or [])
-    all_work_agents = {"recon", "webexplorer", "exploit", "privesc"}
+    all_work_agents = {"recon", "webexplorer", "vulnsearch", "exploit", "privesc"}
     if all_work_agents.issubset(set(completed_agents_now)) and not flags:
         logger.warning("[Supervisor] All agents completed but no flag — requesting human input")
         human_response = interrupt({
@@ -272,14 +283,40 @@ async def supervisor_node(state: TeamState) -> dict:
             f"in a way that specifically requires their skills again.\n"
         )
 
+    # Build a concise work-history digest from the new KB fields
+    exploit_history = kb.get("exploit_history", [])
+    visited_urls = kb.get("visited_urls", [])
+    scan_history_summary = {}
+    for ip_key, entries in (kb.get("scan_history") or {}).items():
+        scan_history_summary[ip_key] = entries[-10:]  # last 10 per host to keep prompt short
+
+    work_history_block = ""
+    if shells:
+        work_history_block += f"\nShells/foothold already obtained: {json.dumps(shells)}"
+    if exploit_history:
+        work_history_block += f"\nFailed exploit attempts: {json.dumps(exploit_history[-10:])}"
+    if visited_urls:
+        work_history_block += f"\nURLs already visited: {len(visited_urls)} (not listing all)"
+    if scan_history_summary:
+        work_history_block += f"\nRecent scan history: {json.dumps(scan_history_summary)}"
+
     routing_prompt = (
-        f"Current Knowledge Base:\n{json.dumps(kb, indent=2)}\n\n"
+        f"Current Knowledge Base (summary):\n"
+        f"  IPs: {kb.get('ips', [])}\n"
+        f"  Open ports: {kb.get('open_ports', {})}\n"
+        f"  Services: {kb.get('services', {})}\n"
+        f"  Tech stack: {kb.get('tech_stack', {})}\n"
+        f"  Attack surface ({len(kb.get('attack_surface', []))} entries): "
+        f"{kb.get('attack_surface', [])[:10]}\n"
+        f"  Credentials: {len(kb.get('credentials', []))} found\n"
+        f"  Flags: {kb.get('flags', [])}\n"
+        f"{work_history_block}\n\n"
         f"Recent Activity:\n{recent_digest}\n\n"
         f"Exploit attempts so far: {exploit_attempts}\n"
         f"Current agent: {state.get('current_agent', 'none')}\n"
         f"{completed_hint}"
         f"\nDecide the next action. Respond with ONLY a JSON object:\n"
-        f'{{"next": "<recon|webexplorer|exploit|privesc|FINISH>", "reasoning": "<brief reason>", "hitl_reason": null}}'
+        f'{{"next": "<recon|webexplorer|vulnsearch|exploit|privesc|FINISH>", "reasoning": "<brief reason>", "hitl_reason": null}}'
     )
 
     routing_messages = [{"role": "user", "content": routing_prompt}]
@@ -319,7 +356,7 @@ async def supervisor_node(state: TeamState) -> dict:
 
             if raw_next == "finish":
                 next_agent = "__end__"
-            elif raw_next in ("recon", "webexplorer", "exploit", "privesc", "refusal_specialist"):
+            elif raw_next in ("recon", "webexplorer", "vulnsearch", "exploit", "privesc", "refusal_specialist"):
                 next_agent = raw_next
             else:
                 next_agent = "recon"
@@ -337,6 +374,32 @@ async def supervisor_node(state: TeamState) -> dict:
             next_agent = "__end__"
         else:
             next_agent = "recon"
+
+    # Hard guard: if the LLM wants to route back to an already-completed agent,
+    # override it with the most logical next step.  This is code-enforced, not
+    # just a hint — the LLM is free to ignore hints.
+    completed_agents_guard = list(state.get("completed_agents") or [])
+    if next_agent in completed_agents_guard and next_agent != "__end__":
+        original_next = next_agent
+        tech_stack_now = kb.get("tech_stack", {})
+        attack_surface_now = kb.get("attack_surface", [])
+        cve_done = any(
+            "cve" in e.lower() or "edb-" in e.lower() or "searchsploit" in e.lower()
+            for e in attack_surface_now
+        )
+        if tech_stack_now and not cve_done and "vulnsearch" not in completed_agents_guard:
+            next_agent = "vulnsearch"
+        elif attack_surface_now and "exploit" not in completed_agents_guard:
+            next_agent = "exploit"
+        elif kb.get("open_ports") and "exploit" not in completed_agents_guard:
+            next_agent = "exploit"
+        elif "privesc" not in completed_agents_guard and kb.get("credentials"):
+            next_agent = "privesc"
+        else:
+            # All obvious next steps exhausted — let recon make another pass
+            next_agent = "recon"
+        logger.warning("[Supervisor] Hard guard: LLM wanted %s (already completed) → redirecting to %s",
+                       original_next.upper(), next_agent.upper())
 
     # Loop guard: if the refusal_specialist just ran, the supervisor must not
     # route back to it again — the specialist already had its chance.  Pick the
