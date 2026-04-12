@@ -1,9 +1,12 @@
 import json
+import logging
 from contextlib import AsyncExitStack
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+logger = logging.getLogger("filthy_clanker")
 
 
 class HexstrikeMCPClient:
@@ -54,7 +57,14 @@ class HexstrikeMCPClient:
         if not self.session:
             raise RuntimeError("Not connected — call connect() first")
 
-        result = await self.session.call_tool(name, arguments)
+        args_snippet = json.dumps(arguments)[:200]
+        logger.info("[MCP] CALL  %s(%s)", name, args_snippet)
+
+        try:
+            result = await self.session.call_tool(name, arguments)
+        except Exception as exc:
+            logger.error("[MCP] ERROR %s — %s: %s", name, type(exc).__name__, exc)
+            raise
 
         parts = []
         for block in result.content:
@@ -62,7 +72,13 @@ class HexstrikeMCPClient:
                 parts.append(block.text)
             else:
                 parts.append(json.dumps(block.model_dump()))
-        return "\n".join(parts)
+        output = "\n".join(parts)
+
+        logger.info("[MCP] RESULT %s — %d chars: %s%s",
+                    name, len(output),
+                    output[:300].replace("\n", " "),
+                    " …" if len(output) > 300 else "")
+        return output
 
     async def disconnect(self) -> None:
         """Shut down the session and server process."""

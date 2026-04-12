@@ -1,10 +1,13 @@
 import json
+import logging
 from typing import Any
 
 from google import genai
 from google.genai import types
 
 from .base import BaseLLMClient
+
+logger = logging.getLogger("filthy_clanker")
 
 
 class GeminiClient(BaseLLMClient):
@@ -54,6 +57,15 @@ class GeminiClient(BaseLLMClient):
     ) -> dict[str, Any]:
         gemini_tools = self.format_tools(tools)
 
+        last_content = ""
+        if messages:
+            raw = messages[-1].get("content", "")
+            last_content = (raw if isinstance(raw, str) else json.dumps(raw))[:300]
+
+        logger.info("[Gemini] REQUEST  model=%s  msgs=%d  system=%.120s",
+                    self.model, len(messages), system_prompt.replace("\n", " "))
+        logger.info("[Gemini] LAST_MSG %.300s", last_content.replace("\n", " "))
+
         contents = []
         for msg in messages:
             role = "user" if msg["role"] == "user" else "model"
@@ -83,14 +95,18 @@ class GeminiClient(BaseLLMClient):
                 if parts:
                     contents.append(types.Content(role=role, parts=parts))
 
-        response = await self.client.aio.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                tools=gemini_tools,
-                system_instruction=system_prompt,
-            ),
-        )
+        try:
+            response = await self.client.aio.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    tools=gemini_tools,
+                    system_instruction=system_prompt,
+                ),
+            )
+        except Exception as exc:
+            logger.error("[Gemini] ERROR %s: %s", type(exc).__name__, exc)
+            raise
 
         text_parts = []
         tool_calls = []
@@ -107,8 +123,13 @@ class GeminiClient(BaseLLMClient):
                         "arguments": dict(fc.args) if fc.args else {},
                     })
 
+        text = "\n".join(text_parts) if text_parts else None
+        tc_names = [tc["name"] for tc in tool_calls]
+        logger.info("[Gemini] RESPONSE  tool_calls=%s  text=%.200s",
+                    tc_names, (text or "").replace("\n", " "))
+
         return {
-            "text": "\n".join(text_parts) if text_parts else None,
+            "text": text,
             "tool_calls": tool_calls,
             "raw": response,
         }

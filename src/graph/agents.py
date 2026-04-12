@@ -1,0 +1,825 @@
+"""
+Specialized agent nodes: Recon, Exploit, PrivEsc.
+
+Each node receives TeamState, runs an internal tool-call loop using the
+configured LLM and available MCP tools, then returns a state update including:
+  - New messages (tool calls + results)
+  - Updated knowledge_base
+  - Updated context_token_estimate
+  - Updated exploit_attempts (Exploit agent only)
+"""
+from __future__ import annotations
+
+import fnmatch
+import json
+import logging
+import re
+import sys
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+from .state import TeamState, KnowledgeBase
+from .summarizer import maybe_summarize
+
+# Import existing LLM clients
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from llms import AnthropicClient, GeminiClient, OllamaClient
+
+logger = logging.getLogger("filthy_clanker")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Fallback models used when a global provider override is active but the
+# per-agent model name is incompatible (e.g. "gemma4:e2b" can't run on Anthropic).
+_PROVIDER_DEFAULT_MODELS = {
+    "anthropic": "claude-opus-4-6",
+    "gemini": "gemini-2.5-flash",
+    "ollama": "llama3.2",
+}
+
+
+def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
+    """
+    Determine (provider, model, llm_client) for an agent invocation.
+
+    If state["provider"] is set it acts as a global override — useful for
+    switching all agents to Ollama for offline testing.  Otherwise each agent
+    uses its own provider / model / host from agents.yaml.
+    """
+    override = state.get("provider")  # None → use per-agent config
+
+    if override:
+        provider = override
+        if provider == "ollama":
+            host = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+            # OLLAMA_MODEL set at startup by the interactive model picker
+            model = os.getenv("OLLAMA_MODEL") or agent_cfg.get("model", "llama3.2")
+            llm = OllamaClient(host=host, model=model)
+        elif provider == "anthropic":
+            agent_model = agent_cfg.get("model", "")
+            # Ollama-style model names (contain ":") can't be used with Anthropic
+            model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["anthropic"]
+            llm = AnthropicClient(api_key=os.getenv("ANTHROPIC_API_KEY", ""), model=model)
+        elif provider == "gemini":
+            agent_model = agent_cfg.get("model", "")
+            model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["gemini"]
+            llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        else:
+            raise ValueError(f"Unknown provider override: {provider}")
+    else:
+        # Per-agent config — provider, model, and host all come from agents.yaml
+        provider = agent_cfg.get("provider", "anthropic")
+        model = agent_cfg.get("model", _PROVIDER_DEFAULT_MODELS.get(provider, ""))
+        if provider == "anthropic":
+            llm = AnthropicClient(api_key=os.getenv("ANTHROPIC_API_KEY", ""), model=model)
+        elif provider == "gemini":
+            llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        elif provider == "ollama":
+            host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+            llm = OllamaClient(host=host, model=model)
+        else:
+            raise ValueError(f"Unknown provider in agents.yaml for this agent: {provider}")
+
+    return provider, model, llm
+
+
+def _estimate_tokens(messages: list) -> int:
+    """Rough token estimate: total chars / 4."""
+    return sum(len(str(m)) for m in messages) // 4
+
+
+def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase) -> KnowledgeBase:
+    """
+    Parse tool output for common security findings and update the knowledge base.
+    Returns a new (shallow-copied) KnowledgeBase dict with any new discoveries merged in.
+    """
+    kb = dict(kb)  # shallow copy
+    text = tool_result.lower()
+
+    # Discover IPs
+    ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+    found_ips = ip_pattern.findall(tool_result)
+    if found_ips:
+        existing = set(kb.get("ips", []))
+        new_ips = [ip for ip in found_ips if ip not in existing
+                   and not ip.startswith(("127.", "0.", "255."))]
+        if new_ips:
+            kb["ips"] = list(existing | set(new_ips))
+
+    # Discover open ports (from nmap-style output: "PORT/tcp open")
+    port_pattern = re.compile(r'(\d+)/(tcp|udp)\s+open\s+(\S+)?', re.IGNORECASE)
+    for match in port_pattern.finditer(tool_result):
+        port = int(match.group(1))
+        service = (match.group(3) or "unknown").strip()
+        # Associate with the first known IP or "target"
+        target_ip = (kb.get("ips") or ["target"])[0]
+        ports = kb.get("open_ports", {})
+        ports_for_ip = ports.get(target_ip, [])
+        if port not in ports_for_ip:
+            ports_for_ip = sorted(set(ports_for_ip + [port]))
+            ports[target_ip] = ports_for_ip
+            kb["open_ports"] = ports
+
+        # Record service
+        key = f"{target_ip}:{port}"
+        services = kb.get("services", {})
+        if key not in services:
+            services[key] = service
+            kb["services"] = services
+
+    # Detect credentials (loose heuristic)
+    cred_patterns = [
+        re.compile(r'(?:password|passwd|pwd)\s*[=:]\s*(\S+)', re.IGNORECASE),
+        re.compile(r'(?:username|user|login)\s*[=:]\s*(\S+)', re.IGNORECASE),
+    ]
+    users = re.findall(r'(?:username|user|login)\s*[=:]\s*(\S+)', tool_result, re.IGNORECASE)
+    passwords = re.findall(r'(?:password|passwd|pwd)\s*[=:]\s*(\S+)', tool_result, re.IGNORECASE)
+    if users and passwords:
+        creds = kb.get("credentials", [])
+        for u, p in zip(users, passwords):
+            entry = {"user": u, "pass": p}
+            if entry not in creds:
+                creds.append(entry)
+        kb["credentials"] = creds
+
+    # Detect flags
+    flag_pattern = re.compile(r'(?:HTB|FLAG|CTF)\{[^}]+\}', re.IGNORECASE)
+    flags_found = flag_pattern.findall(tool_result)
+    if flags_found:
+        existing_flags = set(kb.get("flags", []))
+        kb["flags"] = list(existing_flags | set(flags_found))
+
+    # Interesting attack surface (directories, files from gobuster/ferox)
+    dir_pattern = re.compile(r'(?:Status: 200|Found:)\s*(\/\S+)', re.IGNORECASE)
+    found_paths = dir_pattern.findall(tool_result)
+    if found_paths:
+        surface = set(kb.get("attack_surface", []))
+        kb["attack_surface"] = list(surface | set(found_paths[:20]))  # cap at 20
+
+    # CVE and searchsploit findings → attack_surface
+    # Searchsploit output lines: "Title  | EDB-ID | ..."
+    edb_pattern = re.compile(r'(.+?)\s*\|\s*(\d{4,6})\s*\|', re.MULTILINE)
+    cve_inline = re.compile(r'(CVE-\d{4}-\d{4,})', re.IGNORECASE)
+    vuln_entries: list[str] = []
+    for m in edb_pattern.finditer(tool_result):
+        title = m.group(1).strip()
+        edb_id = m.group(2).strip()
+        if title and not title.startswith("-"):
+            vuln_entries.append(f"EDB-{edb_id}: {title}")
+    for cve in cve_inline.findall(tool_result):
+        # Only add if it's near something that looks like a title/description
+        vuln_entries.append(cve.upper())
+    if vuln_entries:
+        surface = set(kb.get("attack_surface", []))
+        kb["attack_surface"] = list(surface | set(vuln_entries[:30]))
+
+    # -----------------------------------------------------------------------
+    # Tech stack and response header extraction
+    # -----------------------------------------------------------------------
+    target_ip = (kb.get("ips") or ["target"])[0]
+
+    # Patterns that yield "Software/version" strings from various tools
+    version_patterns = [
+        # curl -I / HTTP header values:  "Server: Apache/2.4.49"
+        re.compile(r'^(?:server|x-powered-by|x-generator|x-aspnet-version|x-runtime|via)\s*:\s*(.+)$',
+                   re.IGNORECASE | re.MULTILINE),
+        # nmap -sV banner:  "80/tcp open  http  Apache httpd 2.4.49"
+        re.compile(r'\d+/tcp\s+open\s+\S+\s+(.+)', re.IGNORECASE),
+        # nmap script output:  "| http-server-header: Apache/2.4.49"
+        re.compile(r'\|\s*http-server-header:\s*(.+)', re.IGNORECASE),
+        # nikto:  "+ Server: Apache/2.4.49 (Ubuntu)"
+        re.compile(r'\+\s*Server:\s*(.+)', re.IGNORECASE),
+        # whatweb:  Apache[2.4.49], PHP[8.1.0-dev]
+        re.compile(r'(\w[\w.-]+)\[(\d[\d.a-z_-]+)\]', re.IGNORECASE),
+    ]
+
+    tech_entries: list[str] = []
+    whatweb_pat = version_patterns[-1]  # the name[version] pattern
+    for pat in version_patterns:
+        for m in pat.finditer(tool_result):
+            if pat is whatweb_pat:
+                entry = f"{m.group(1)}/{m.group(2)}"
+            else:
+                entry = m.group(1).strip()
+            if entry and len(entry) < 120:
+                tech_entries.append(entry)
+
+    if tech_entries:
+        # Associate with the port referenced in the tool call (default 80 for web)
+        port_match = re.search(r':(\d+)', tool_name) or re.search(r'\b(80|443|8080|8443)\b', tool_result)
+        port = port_match.group(1) if port_match else "80"
+        key = f"{target_ip}:{port}"
+        tech_stack = dict(kb.get("tech_stack") or {})
+        existing = set(tech_stack.get(key, []))
+        tech_stack[key] = list(existing | set(tech_entries))
+        kb["tech_stack"] = tech_stack
+
+    # Response headers from curl -I / wget --server-response output
+    # Match lines of the form "Header-Name: value" (HTTP header format)
+    header_line_pat = re.compile(
+        r'^([\w-]+):\s+(.+)$', re.MULTILINE
+    )
+    # Only extract if this looks like an HTTP response (has HTTP/ status line or
+    # at least a Server header) to avoid false positives from other tool output.
+    if re.search(r'HTTP/\d', tool_result) or re.search(r'^Server:', tool_result, re.MULTILINE | re.IGNORECASE):
+        headers_found: dict[str, str] = {}
+        for m in header_line_pat.finditer(tool_result):
+            hname = m.group(1).strip()
+            hval = m.group(2).strip()
+            # Skip obviously non-header lines (JSON keys, nmap fields, etc.)
+            if len(hname) <= 60 and len(hval) <= 256:
+                headers_found[hname] = hval
+        if headers_found:
+            port_h = re.search(r':(\d+)', tool_name)
+            port_str = port_h.group(1) if port_h else "80"
+            key = f"{target_ip}:{port_str}"
+            resp_headers = dict(kb.get("response_headers") or {})
+            existing_h = dict(resp_headers.get(key, {}))
+            existing_h.update(headers_found)
+            resp_headers[key] = existing_h
+            kb["response_headers"] = resp_headers
+
+    return kb
+
+
+def _scan_key_args(tool_name: str, raw_args: dict) -> str:
+    """Return a short, human-readable summary of the key arguments for scan_history."""
+    for key in ("target", "host", "url", "command", "ip", "address", "domain"):
+        val = raw_args.get(key)
+        if val:
+            return str(val)[:80]
+    # Fallback: first value in args
+    if raw_args:
+        first_val = next(iter(raw_args.values()))
+        return str(first_val)[:80]
+    return ""
+
+
+def _extract_url_from_args(raw_args: dict) -> Optional[str]:
+    """Extract the first HTTP/HTTPS URL from tool call arguments."""
+    for key in ("url", "target", "command", "uri", "address"):
+        val = raw_args.get(key, "")
+        if val:
+            m = re.search(r'https?://[^\s\'")\]]+', str(val))
+            if m:
+                return m.group(0).rstrip("'\")")
+    return None
+
+
+def _detect_shell_from_output(result: str, known_ips: List[str]) -> Optional[Dict[str, str]]:
+    """
+    Detect a successful shell / RCE from command output.
+    Only returns a result for strong signals to avoid false positives.
+    """
+    # uid=0(root) or uid=1000(user) — very reliable indicator of code execution
+    uid_match = re.search(r'\buid=(\d+)\((\w+)\)', result)
+    if uid_match:
+        return {
+            "user": uid_match.group(2),
+            "uid": uid_match.group(1),
+            "host": known_ips[0] if known_ips else "unknown",
+            "via": "RCE (uid output)",
+        }
+    # "root@hostname:~#" style prompts that are the LAST line of output
+    last_lines = result.strip().splitlines()[-3:]
+    for line in last_lines:
+        m = re.match(r'^(\w[\w-]*)@([\w.-]+)[:#\$]\s*(?:~.*)?[#\$]\s*$', line.strip())
+        if m:
+            return {
+                "user": m.group(1),
+                "host": m.group(2),
+                "via": "shell prompt",
+            }
+    return None
+
+
+async def _run_agent_loop(
+    agent_name: str,
+    state: TeamState,
+    tools: list,
+    mcp_client: Any,
+) -> dict:
+    """
+    Core ReAct loop shared by all specialized agents.
+    Runs the LLM with tool calls until it produces a final text response.
+    Returns a partial state update dict.
+    """
+    config = state.get("config", {})
+    agent_cfg = config.get("agents", {}).get(agent_name, {})
+    system_prompt = agent_cfg.get("system_prompt", "")
+
+    # Resolve provider/model — global override in state takes precedence, else per-agent config
+    provider, model, llm = _resolve_llm(state, agent_cfg)
+    logger.info("[%s] provider=%s model=%s", agent_name, provider, model)
+
+    # Fetch raw MCP tools — each client's generate_response formats them internally
+    all_tools = await mcp_client.list_tools()
+
+    # Filter to the agent's allowed tool set (fnmatch patterns in agents.yaml).
+    # If no 'tools' key is present, all tools are passed through.
+    allowed_patterns: list[str] = agent_cfg.get("tools", [])
+    if allowed_patterns:
+        raw_tools = [
+            t for t in all_tools
+            if any(fnmatch.fnmatch(t["name"], pat) for pat in allowed_patterns)
+        ]
+        logger.info("[%s] Tool filter: %d/%d tools allowed",
+                    agent_name, len(raw_tools), len(all_tools))
+    else:
+        raw_tools = all_tools
+
+    # Inject knowledge base into system prompt
+    kb = state.get("knowledge_base", {})
+    kb_text = json.dumps(kb, indent=2)
+    full_system = (
+        f"{system_prompt}\n\n"
+        f"=== KNOWLEDGE BASE (shared with team) ===\n{kb_text}\n"
+        f"=== CURRENT TASK ===\n{state.get('task', 'Hack the target machine.')}"
+    )
+
+    # Start from current conversation history
+    messages = list(state.get("messages", []))
+    new_messages: list = []
+    updated_kb = dict(kb)
+    exploit_delta = 0
+
+    # ReAct loop: call LLM → execute tools → repeat
+    max_iterations = 20
+    for iteration in range(max_iterations):
+        response = await llm.generate_response(
+            messages=messages + new_messages,
+            tools=raw_tools,
+            system_prompt=full_system,
+        )
+
+        tool_calls = llm.parse_tool_calls(response)
+        assistant_msg = llm.make_assistant_message(response)
+        new_messages.append(assistant_msg)
+
+        if not tool_calls:
+            # No more tool calls — agent is done with its sub-task
+            break
+
+        # Execute each tool call
+        # All clients return: {"id": str, "name": str, "arguments": dict}
+        tool_results: list = []
+        for tc in tool_calls:
+            tool_name = tc.get("name", "")
+            raw_args = tc.get("arguments") or tc.get("input", {})
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    raw_args = {}
+
+            logger.info("[%s] → %s(%s)", agent_name, tool_name, json.dumps(raw_args)[:200])
+            raw_result = await mcp_client.call_tool(tool_name, raw_args)
+
+            # Auto-summarize large outputs
+            result = maybe_summarize(raw_result, config)
+
+            if result != raw_result:
+                logger.info("[Summarizer] Condensed %s → %s chars", f"{len(raw_result):,}", f"{len(result):,}")
+
+            # Track exploit failures
+            if agent_name == "exploit" and (
+                "failed" in result.lower() or
+                "error" in result.lower()[:200] or
+                "connection refused" in result.lower()
+            ):
+                exploit_delta += 1
+
+            # Update knowledge base from tool output
+            updated_kb = _extract_kb_updates(tool_name, result, updated_kb)
+
+            # ---- scan_history: record every tool call so agents don't repeat work ----
+            _sh_target = (updated_kb.get("ips") or ["target"])[0]
+            _sh_args_summary = _scan_key_args(tool_name, raw_args)
+            _sh_entry = f"[{agent_name}] {tool_name}: {_sh_args_summary}"
+            _scan_hist = dict(updated_kb.get("scan_history") or {})
+            _target_hist = list(_scan_hist.get(_sh_target, []))
+            if _sh_entry not in _target_hist:
+                _target_hist.append(_sh_entry)
+                _scan_hist[_sh_target] = _target_hist[-60:]  # cap per-target
+                updated_kb["scan_history"] = _scan_hist
+
+            # ---- visited_urls: record HTTP fetches for webexplorer deduplication ----
+            _url = _extract_url_from_args(raw_args)
+            if _url:
+                _visited = list(updated_kb.get("visited_urls") or [])
+                if _url not in _visited:
+                    _visited.append(_url)
+                    updated_kb["visited_urls"] = _visited[-300:]  # cap
+
+            # ---- exploit_history: record failed exploit attempts ----
+            if agent_name == "exploit":
+                _fail_kws = (
+                    "failed", "connection refused", "access denied",
+                    "not vulnerable", "patched", "not found", "403", "404", "500",
+                )
+                _is_fail = any(kw in result.lower()[:600] for kw in _fail_kws)
+                if _is_fail:
+                    _exp_entry = f"{tool_name}({_sh_args_summary[:60]}): failed"
+                    _exp_hist = list(updated_kb.get("exploit_history") or [])
+                    if _exp_entry not in _exp_hist:
+                        _exp_hist.append(_exp_entry)
+                        updated_kb["exploit_history"] = _exp_hist[-40:]
+
+            # ---- shells: auto-detect successful RCE / foothold ----
+            _shell = _detect_shell_from_output(result, list(updated_kb.get("ips") or []))
+            if _shell:
+                _shells = list(updated_kb.get("shells") or [])
+                # Avoid duplicate entries for the same user@host
+                _shell_key = (_shell.get("user"), _shell.get("host"))
+                if not any(
+                    (s.get("user"), s.get("host")) == _shell_key for s in _shells
+                ):
+                    _shells.append(_shell)
+                    updated_kb["shells"] = _shells
+                    logger.info("[%s] Shell detected: %s@%s via %s",
+                                agent_name, _shell.get("user"), _shell.get("host"), _shell.get("via"))
+
+            tool_results.append((tc, result))
+
+        # Build tool result messages (provider-specific)
+        if provider == "anthropic":
+            result_blocks = [
+                llm.make_tool_result_message(tc.get("id", ""), result)
+                for tc, result in tool_results
+            ]
+            # Anthropic bundles all results in one user message
+            combined = {"role": "user", "content": []}
+            for rb in result_blocks:
+                combined["content"].extend(rb.get("content", []))
+            new_messages.append(combined)
+        else:
+            # Gemini and Ollama: one message per result
+            for tc, result in tool_results:
+                new_messages.append(llm.make_tool_result_message(tc.get("name", ""), result))
+
+    # Compute new token estimate
+    all_messages = (messages + new_messages)
+    new_estimate = _estimate_tokens(all_messages)
+
+    # Detect substantive TASK COMPLETE in the final assistant message so the
+    # supervisor knows not to re-route to this agent unnecessarily.
+    _final_text, _final_had_tool = _last_assistant_text_and_tools(new_messages)
+    _body = _final_text[len("task complete"):].strip() if _final_text.lower().lstrip().startswith("task complete") else ""
+    _is_substantive_completion = (
+        _final_text.lower().lstrip().startswith("task complete")
+        and (_final_had_tool or len(_body) >= 80)
+    )
+    existing_completed = list(state.get("completed_agents") or [])
+    if _is_substantive_completion and agent_name not in existing_completed:
+        existing_completed = existing_completed + [agent_name]
+
+    return {
+        "messages": new_messages,
+        "knowledge_base": updated_kb,
+        "current_agent": agent_name,
+        "context_token_estimate": new_estimate,
+        "exploit_attempts": state.get("exploit_attempts", 0) + exploit_delta,
+        "completed_agents": existing_completed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Refusal detection
+# ---------------------------------------------------------------------------
+
+REFUSAL_KEYWORDS: list[str] = [
+    # Explicit capability denials
+    "as an ai", "as a language model", "i cannot", "i can't", "i am unable",
+    "i'm unable", "i am not able", "i'm not able", "i don't have the ability",
+    "i cannot assist", "i cannot help", "i cannot perform", "i cannot execute",
+    "i cannot run", "i cannot access", "i won't", "i will not", "i must decline",
+    # Ethical/policy deflections
+    "against my", "ethical guidelines", "it would be unethical",
+    "against my programming", "designed to", "my purpose",
+    # Hand-off / abdication patterns (like the example log)
+    "handed over to the human", "hand off to", "handing over",
+    "the process is concluded", "process is now handed",
+    "i have provided the reconnaissance", "provided the necessary",
+    "for the human", "human operator", "human team to proceed",
+    "manual exploitation", "leaving this to",
+]
+
+
+def _last_assistant_text_and_tools(messages: list) -> tuple[str, bool]:
+    """
+    Scan backwards through messages to find the last assistant turn.
+    Returns (text_content, had_tool_use).
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
+        text = ""
+        had_tool = False
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    text += block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    had_tool = True
+        return text, had_tool
+    return "", False
+
+
+def _has_genuine_findings(text: str) -> bool:
+    """
+    Return True if the response contains structured findings that indicate the
+    agent did real work and is reporting completion — not refusing to start.
+    Used to suppress false-positive refusal detection.
+    """
+    t = text.lower()
+    # Numbered finding lists (e.g. "1.  **Port 22...")
+    if re.search(r'^\s*\d+\.\s', text, re.MULTILINE):
+        return True
+    # Open port references
+    if re.search(r'\bport\s+\d+\b|\d+/tcp|\d+/udp', t):
+        return True
+    # KB / JSON blocks in output
+    if any(marker in t for marker in ('```json', '"ports_open"', '"services"', '"open_ports"')):
+        return True
+    # "Current Findings" / "Knowledge Base Update" headers typical of completion reports
+    if any(marker in t for marker in ('current findings', 'knowledge base update', 'next steps')):
+        return True
+    # CVE / vulnerability research output
+    if re.search(r'\bcve-\d{4}-\d+\b', t):
+        return True
+    if any(marker in t for marker in ('searchsploit', 'tech_stack', 'tech stack', 'x-powered-by', 'server:')):
+        return True
+    # Explicit completion signal
+    if t.lstrip().startswith("task complete"):
+        return True
+    return False
+
+
+def lightweight_evaluator(state: TeamState) -> str:
+    """
+    LangGraph conditional edge function — runs after every agent node.
+
+    Checks the OPENING of the last assistant message (first 300 chars) for:
+      (A) Refusal/abdication keywords.
+      (B) Substantial reasoning text with zero tool calls.
+
+    Scanning only the opening avoids false positives where an agent legitimately
+    reports "I cannot do more" *after* delivering real findings.
+    Responses that contain genuine findings are also exempted from (B).
+
+    Returns "refusal_specialist" if either condition is met, else "supervisor".
+    """
+    messages = state.get("messages", [])
+    text, had_tool = _last_assistant_text_and_tools(messages)
+
+    if not text:
+        return "supervisor"
+
+    # Evaluate only the opening for keyword matching — a completion report that
+    # mentions "I cannot do more" deep in the body is not a refusal.
+    opening = text[:300].lower()
+
+    # (A) keyword match in opening — but skip entirely if the agent signalled
+    #     explicit completion with "TASK COMPLETE" at the start.
+    if opening.lstrip().startswith("task complete"):
+        # Require a meaningful body — a bare "TASK COMPLETE" with no findings
+        # means the agent is echoing the previous turn without doing any work.
+        body = text[len("task complete"):].strip()
+        if not had_tool and len(body) < 80:
+            logger.info(
+                "[Evaluator] Bare TASK COMPLETE (no tools, no body) from %s "
+                "— treating as empty turn → refusal_specialist",
+                state.get("current_agent", "?"),
+            )
+            return "refusal_specialist"
+        logger.info("[Evaluator] TASK COMPLETE signal from %s → supervisor",
+                    state.get("current_agent", "?"))
+        return "supervisor"
+
+    if any(kw in opening for kw in REFUSAL_KEYWORDS):
+        logger.info("[Evaluator] (A) Refusal keyword in opening of %s response → refusal_specialist",
+                    state.get("current_agent", "?"))
+        return "refusal_specialist"
+
+    # (B) reasoning without action — skip if this looks like a legitimate completion
+    completion_hints = ("flag", "root.txt", "user.txt", "mission complete", "captured", "task complete")
+    text_lower = text.lower()
+    if (len(text.strip()) > 80
+            and not had_tool
+            and not any(h in text_lower for h in completion_hints)
+            and not _has_genuine_findings(text)):
+        logger.info("[Evaluator] (B) Reasoning-without-action in %s response → refusal_specialist",
+                    state.get("current_agent", "?"))
+        return "refusal_specialist"
+
+    return "supervisor"
+
+
+# ---------------------------------------------------------------------------
+# Refusal Specialist node
+# ---------------------------------------------------------------------------
+
+def make_refusal_specialist_node(mcp_client: Any):
+    """
+    Return an async LangGraph node that uses llama3-abliterated to rewrite
+    a refused/incomplete agent response and execute the missing tool call.
+    """
+    async def refusal_specialist_node(state: TeamState) -> dict:
+        config = state.get("config", {})
+        rs_cfg = config.get("agents", {}).get("refusal_specialist", {})
+        host = rs_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+        model = rs_cfg.get("model", "llama3-abliterated")
+
+        # Which agent just refused, and what was its job?
+        # If current_agent is "refusal_specialist" itself, look up the agent that
+        # ran before it (the one that originally refused).
+        current_agent = state.get("current_agent", "recon")
+        if current_agent == "refusal_specialist":
+            # Find the last non-specialist agent in history via current_agent transitions.
+            # As a safe fallback, use "recon".
+            logger.warning("[RefusalSpecialist] Invoked with current_agent=refusal_specialist — "
+                           "this is a loop; passing through to supervisor")
+            return {"current_agent": "refusal_specialist"}
+
+        agent_cfg = config.get("agents", {}).get(current_agent, {})
+        original_system = agent_cfg.get("system_prompt", "")
+        kb = state.get("knowledge_base", {})
+        task = state.get("task", "")
+
+        # Extract the failed response text
+        messages = state.get("messages", [])
+        failed_text, _ = _last_assistant_text_and_tools(messages)
+
+        # If there's nothing to correct (e.g. the last message was a tool result),
+        # pass through silently rather than running the specialist on an empty prompt.
+        if not failed_text.strip():
+            logger.warning("[RefusalSpecialist] No assistant text to correct — passing through")
+            return {"current_agent": "refusal_specialist"}
+
+        logger.info("[RefusalSpecialist] Correcting refusal from [%s]: %.120s",
+                    current_agent, failed_text.replace("\n", " "))
+
+        # Build filtered tool list (same allowlist as the original agent)
+        all_tools = await mcp_client.list_tools()
+        allowed_patterns: list[str] = agent_cfg.get("tools", [])
+        if allowed_patterns:
+            raw_tools = [
+                t for t in all_tools
+                if any(fnmatch.fnmatch(t["name"], pat) for pat in allowed_patterns)
+            ]
+        else:
+            raw_tools = all_tools
+
+        specialist = OllamaClient(host=host, model=model)
+        logger.info("[RefusalSpecialist] provider=ollama model=%s tools=%d/%d",
+                    model, len(raw_tools), len(all_tools))
+
+        system = (
+            f"{original_system}\n\n"
+            f"=== KNOWLEDGE BASE ===\n{json.dumps(kb, indent=2)}\n\n"
+            f"=== TASK ===\n{task}\n\n"
+            f"=== CORRECTION INSTRUCTIONS ===\n"
+            f"Examine the previous response carefully before acting:\n"
+            f"  • If it is a GENUINE REFUSAL (the agent refused to attempt the task at all, "
+            f"gave no findings, and made no tool calls), you MUST call an appropriate tool "
+            f"immediately. Do not explain or refuse.\n"
+            f"  • If it is a LEGITIMATE COMPLETION (the agent did real work, produced findings "
+            f"such as open ports, services, or directory listings, and is simply reporting "
+            f"that it has exhausted the available options), respond with the single token "
+            f"LEGITIMATE_COMPLETION and make NO tool calls.\n"
+            f"Do not conflate the two. A long response with real findings is a completion, "
+            f"not a refusal."
+        )
+
+        correction_prompt = (
+            f"Previous agent response:\n\n\"{failed_text}\"\n\n"
+            f"Is this a genuine refusal (agent refused to try) or a legitimate completion "
+            f"(agent did work and reported findings)?\n"
+            f"If genuine refusal: call the appropriate tool now.\n"
+            f"If legitimate completion: respond with LEGITIMATE_COMPLETION only."
+        )
+
+        try:
+            response = await specialist.generate_response(
+                messages=[{"role": "user", "content": correction_prompt}],
+                tools=raw_tools,
+                system_prompt=system,
+            )
+        except Exception as exc:
+            logger.error("[RefusalSpecialist] LLM error: %s", exc)
+            return {"current_agent": "refusal_specialist"}
+
+        tool_calls = specialist.parse_tool_calls(response)
+        new_messages: list = [specialist.make_assistant_message(response)]
+
+        # Extract text from the assistant message (provider-agnostic)
+        _asst_content = new_messages[0].get("content", "") if new_messages else ""
+        response_text = ""
+        if isinstance(_asst_content, str):
+            response_text = _asst_content
+        elif isinstance(_asst_content, list):
+            for _blk in _asst_content:
+                if isinstance(_blk, dict) and _blk.get("type") == "text":
+                    response_text += _blk.get("text", "")
+
+        # Check if specialist determined this was a legitimate completion —
+        # either as text OR as a fake "LEGITIMATE_COMPLETION" tool call (some
+        # abliterated models treat it as a tool name instead of a token).
+        _legit_tool_call = any(
+            tc.get("name", "").replace(" ", "_").lower() in (
+                "legitimate_completion", "legitimate_completion_signal"
+            )
+            for tc in tool_calls
+        )
+        if "legitimate_completion" in response_text.lower() or _legit_tool_call:
+            logger.info("[RefusalSpecialist] Determined response was a legitimate completion — passing through")
+            return {"messages": new_messages, "current_agent": "refusal_specialist"}
+
+        # Strip any remaining fake LEGITIMATE_COMPLETION tool calls so they
+        # don't reach mcp_client.call_tool() and produce "Unknown tool" errors.
+        tool_calls = [
+            tc for tc in tool_calls
+            if tc.get("name", "").replace(" ", "_").lower() != "legitimate_completion"
+        ]
+
+        if not tool_calls:
+            logger.warning("[RefusalSpecialist] Specialist produced no tool calls — routing to supervisor")
+            return {"messages": new_messages, "current_agent": "refusal_specialist"}
+
+        # Execute the tool call(s) and collect results
+        updated_kb = dict(kb)
+        for tc in tool_calls:
+            tool_name = tc.get("name", "")
+            raw_args = tc.get("arguments") or tc.get("input", {})
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    raw_args = {}
+
+            result = await mcp_client.call_tool(tool_name, raw_args)
+            updated_kb = _extract_kb_updates(tool_name, result, updated_kb)
+            new_messages.append(specialist.make_tool_result_message(tool_name, result))
+
+        new_estimate = _estimate_tokens(list(messages) + new_messages)
+
+        return {
+            "messages": new_messages,
+            "knowledge_base": updated_kb,
+            "current_agent": "refusal_specialist",
+            "context_token_estimate": new_estimate,
+        }
+
+    return refusal_specialist_node
+
+
+# ---------------------------------------------------------------------------
+# Agent node factories — called by graph.py when building the StateGraph
+# ---------------------------------------------------------------------------
+
+def make_recon_node(mcp_client: Any, tools: list):
+    """Return an async node function for the Recon agent."""
+    async def recon_node(state: TeamState) -> dict:
+        logger.info("[Recon Agent] Starting reconnaissance...")
+        return await _run_agent_loop("recon", state, tools, mcp_client)
+    return recon_node
+
+
+def make_exploit_node(mcp_client: Any, tools: list):
+    """Return an async node function for the Exploit agent."""
+    async def exploit_node(state: TeamState) -> dict:
+        logger.info("[Exploit Agent] Attempting exploitation...")
+        return await _run_agent_loop("exploit", state, tools, mcp_client)
+    return exploit_node
+
+
+def make_privesc_node(mcp_client: Any, tools: list):
+    """Return an async node function for the PrivEsc agent."""
+    async def privesc_node(state: TeamState) -> dict:
+        logger.info("[PrivEsc Agent] Escalating privileges...")
+        return await _run_agent_loop("privesc", state, tools, mcp_client)
+    return privesc_node
+
+
+def make_webexplorer_node(mcp_client: Any, tools: list):
+    """Return an async node function for the Web Explorer agent."""
+    async def webexplorer_node(state: TeamState) -> dict:
+        logger.info("[WebExplorer Agent] Browsing and mapping web content...")
+        return await _run_agent_loop("webexplorer", state, tools, mcp_client)
+    return webexplorer_node
+
+
+def make_vulnsearch_node(mcp_client: Any, tools: list):
+    """Return an async node function for the Vulnerability Search agent."""
+    async def vulnsearch_node(state: TeamState) -> dict:
+        logger.info("[VulnSearch Agent] Researching vulnerabilities in tech stack...")
+        return await _run_agent_loop("vulnsearch", state, tools, mcp_client)
+    return vulnsearch_node
