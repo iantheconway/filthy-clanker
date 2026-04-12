@@ -170,8 +170,32 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase) -> 
         if title and not title.startswith("-"):
             vuln_entries.append(f"EDB-{edb_id}: {title}")
     for cve in cve_inline.findall(tool_result):
-        # Only add if it's near something that looks like a title/description
         vuln_entries.append(cve.upper())
+
+    # Web search results (brave_web_search etc.) — extract sentences from
+    # Title/Description fields that contain general exploit-class vocabulary.
+    # This is intentionally broad: the goal is to capture any confirmed finding
+    # that an agent could act on, not to match specific CVEs or software names.
+    _VULN_VOCAB = re.compile(
+        r'\b(exploit(?:able|ed)?|backdoor|rce|remote\s+code\s+exec(?:ution)?'
+        r'|command\s+injection|sql\s+inject(?:ion)?|path\s+travers(?:al)?'
+        r'|lfi|rfi|ssrf|xss|xxe|deseri[a-z]+|auth(?:entication)?\s+bypass'
+        r'|privilege\s+escal(?:ation)?|arbitrary\s+(?:code|command|file)'
+        r'|unauthenticated|unauth(?:orized)?)\b',
+        re.IGNORECASE,
+    )
+    # Match "Title: ..." and "Description: ..." lines from search result blocks
+    search_field_pattern = re.compile(
+        r'(?:Title|Description)\s*:\s*([^\n]{10,300})', re.IGNORECASE
+    )
+    for m in search_field_pattern.finditer(tool_result):
+        sentence = m.group(1).strip()
+        if _VULN_VOCAB.search(sentence):
+            # Strip HTML-like strong tags that some search APIs return
+            clean = re.sub(r'<[^>]+>', '', sentence).strip()
+            if clean:
+                vuln_entries.append(clean[:150])
+
     if vuln_entries:
         surface = set(kb.get("attack_surface", []))
         kb["attack_surface"] = list(surface | set(vuln_entries[:30]))
@@ -243,6 +267,27 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase) -> 
             kb["response_headers"] = resp_headers
 
     return kb
+
+
+# Vocabulary that indicates a confirmed, directly exploitable finding in attack_surface.
+# These terms match what the general web-search extractor and CVE/EDB patterns produce.
+# Kept intentionally broad — the same words used in _VULN_VOCAB extraction above.
+_HIGH_VALUE_EXPLOIT_SIGNALS = (
+    "exploit", "backdoor", "rce", "remote code exec",
+    "command injection", "sql inject", "path travers",
+    "lfi", "rfi", "ssrf", "xxe", "auth bypass",
+    "privilege escal", "arbitrary code", "arbitrary command",
+    "unauthenticated", "unauthor",
+)
+
+
+def _has_confirmed_exploit_path(kb: KnowledgeBase) -> bool:
+    """Return True if attack_surface contains a confirmed, directly exploitable finding."""
+    for entry in kb.get("attack_surface", []):
+        el = entry.lower()
+        if any(s in el for s in _HIGH_VALUE_EXPLOIT_SIGNALS):
+            return True
+    return False
 
 
 def _scan_key_args(tool_name: str, raw_args: dict) -> str:
@@ -331,11 +376,14 @@ async def _run_agent_loop(
     else:
         raw_tools = all_tools
 
-    # Inject knowledge base into system prompt
+    # Inject knowledge base and exact tool names into system prompt.
+    # Listing the tool names directly prevents the model from guessing.
     kb = state.get("knowledge_base", {})
     kb_text = json.dumps(kb, indent=2)
+    tool_names_list = ", ".join(t["name"] for t in raw_tools) if raw_tools else "(none)"
     full_system = (
         f"{system_prompt}\n\n"
+        f"=== AVAILABLE TOOLS (exact names — use only these) ===\n{tool_names_list}\n\n"
         f"=== KNOWLEDGE BASE (shared with team) ===\n{kb_text}\n"
         f"=== CURRENT TASK ===\n{state.get('task', 'Hack the target machine.')}"
     )
@@ -348,6 +396,10 @@ async def _run_agent_loop(
 
     # ReAct loop: call LLM → execute tools → repeat
     max_iterations = 20
+    # Tracks the iteration at which a high-value exploit path was first confirmed.
+    # Recon/webexplorer are given one more iteration to write up then forced to stop.
+    _exploit_found_at: Optional[int] = None
+
     for iteration in range(max_iterations):
         response = await llm.generate_response(
             messages=messages + new_messages,
@@ -366,6 +418,7 @@ async def _run_agent_loop(
         # Execute each tool call
         # All clients return: {"id": str, "name": str, "arguments": dict}
         tool_results: list = []
+        _all_unknown_this_iter = True  # will be cleared when any real tool succeeds
         for tc in tool_calls:
             tool_name = tc.get("name", "")
             raw_args = tc.get("arguments") or tc.get("input", {})
@@ -377,6 +430,21 @@ async def _run_agent_loop(
 
             logger.info("[%s] → %s(%s)", agent_name, tool_name, json.dumps(raw_args)[:200])
             raw_result = await mcp_client.call_tool(tool_name, raw_args)
+
+            # Detect unknown-tool errors and replace with a corrective message that
+            # lists the actual available tools so the model stops guessing.
+            if raw_result.startswith("Unknown tool:"):
+                available_names = [t["name"] for t in raw_tools]
+                raw_result = (
+                    f"Error: tool '{tool_name}' does not exist.\n"
+                    f"You MUST only call tools from this exact list "
+                    f"(no others exist):\n  {', '.join(available_names)}\n"
+                    f"Choose the correct tool from the list above and call it now."
+                )
+                logger.warning("[%s] Unknown tool '%s' called — injecting corrective feedback",
+                               agent_name, tool_name)
+            else:
+                _all_unknown_this_iter = False
 
             # Auto-summarize large outputs
             result = maybe_summarize(raw_result, config)
@@ -459,6 +527,33 @@ async def _run_agent_loop(
             # Gemini and Ollama: one message per result
             for tc, result in tool_results:
                 new_messages.append(llm.make_tool_result_message(tc.get("name", ""), result))
+
+        # ---- Early exit: stop recon/webexplorer once a confirmed exploit path is found ----
+        # Tool result messages are built first so the conversation stays well-formed.
+        # We mark the discovery iteration, then force stop one iteration later so the
+        # agent has had one chance to react to the finding.
+        if agent_name in ("recon", "webexplorer") and _exploit_found_at is None:
+            if _has_confirmed_exploit_path(updated_kb):
+                _exploit_found_at = iteration
+                logger.info(
+                    "[%s] Confirmed exploit path detected at iteration %d — "
+                    "one more iteration allowed, then forcing TASK COMPLETE",
+                    agent_name, iteration,
+                )
+        if _exploit_found_at is not None and iteration >= _exploit_found_at + 1:
+            surface_preview = updated_kb.get("attack_surface", [])[:5]
+            forced_completion = (
+                "TASK COMPLETE\n\n"
+                "A confirmed exploitation path has been identified. Stopping recon and "
+                "handing off to the exploit agent.\n\n"
+                f"Key findings in attack_surface: {surface_preview}"
+            )
+            new_messages.append({"role": "assistant", "content": forced_completion})
+            logger.info(
+                "[%s] Early exit enforced (exploit path found at iteration %d, now at %d)",
+                agent_name, _exploit_found_at, iteration,
+            )
+            break
 
     # Compute new token estimate
     all_messages = (messages + new_messages)

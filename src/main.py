@@ -26,7 +26,7 @@ from langgraph.types import Command
 
 from config import build_system_prompt
 from htb_client import HTB
-from mcp_client import HexstrikeMCPClient
+from mcp_client import HexstrikeMCPClient, MCPClientPool
 from graph import build_graph, create_checkpointer, TeamState
 from graph.graph import initial_state
 from data_capture import TrajectoryLogger
@@ -592,27 +592,47 @@ async def main():
     # --- Provider selection ---
     provider = select_provider(config)
 
-    # --- MCP client ---
+    # --- MCP client pool ---
+    mcp_pool = MCPClientPool()
+
+    # Hexstrike server (security tools)
     mcp_command = os.getenv("MCP_COMMAND", HEXSTRIKE_VENV_PYTHON)
     mcp_args_str = os.getenv(
         "MCP_ARGS",
         f"{HEXSTRIKE_MCP_SCRIPT} --server http://127.0.0.1:{HEXSTRIKE_PORT}",
     )
     mcp_args = mcp_args_str.split() if mcp_args_str else []
+    hexstrike_client = HexstrikeMCPClient(command=mcp_command, args=mcp_args)
+    mcp_pool.add_server("hexstrike", hexstrike_client)
 
-    mcp_client = HexstrikeMCPClient(command=mcp_command, args=mcp_args)
-    print(f"[*] Connecting to MCP server...")
+    # Brave Search server (web search — optional, requires BRAVE_API_KEY)
+    brave_api_key = os.getenv("BRAVE_API_KEY", "")
+    if brave_api_key:
+        brave_client = HexstrikeMCPClient(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-brave-search"],
+            env={"BRAVE_API_KEY": brave_api_key},
+        )
+        mcp_pool.add_server("brave-search", brave_client)
+        print("[*] Brave Search MCP server configured.")
+    else:
+        print("[*] BRAVE_API_KEY not set — Brave Search tools unavailable.")
+
+    print(f"[*] Connecting to MCP servers...")
     try:
-        await mcp_client.connect()
+        await mcp_pool.connect()
     except Exception as e:
         if server_proc:
             server_proc.terminate()
-        sys.exit(f"Failed to connect to MCP server: {e}")
-    print("[*] MCP session initialized.")
+        sys.exit(f"Failed to connect to MCP servers: {e}")
+    print("[*] MCP sessions initialized.")
 
     # List available tools
-    tools = await mcp_client.list_tools()
+    tools = await mcp_pool.list_tools()
     print(f"[*] {len(tools)} MCP tools available.")
+
+    # Alias so the rest of the function uses a single name
+    mcp_client = mcp_pool
 
     trajectory_logger = TrajectoryLogger(training_dir)
 

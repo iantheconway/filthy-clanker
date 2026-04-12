@@ -34,6 +34,11 @@ agents:
         - "refusal_specialist": the last agent response contained a refusal.
         - "FINISH"       : flag has been captured
 
+      EXPLOIT PATH RULE: If `attack_surface` contains ANY entry describing a confirmed
+      RCE, backdoor, command injection, or directly exploitable vulnerability, route
+      to "exploit" IMMEDIATELY — do NOT route back to recon, webexplorer, or vulnsearch.
+      Do not continue enumerating once an exploit path is confirmed.
+
       TECH STACK RULE: If `tech_stack` has entries and `attack_surface` does NOT yet
       contain any CVE or EDB references, route to "vulnsearch" — not "exploit" — so
       vulnerabilities are identified before active exploitation begins.
@@ -69,13 +74,13 @@ agents:
       - "masscan*"
       - "rustscan*"
       # Web enumeration
-      - "gobuster*"
+#      - "gobuster*"
       - "feroxbuster*"
       - "ffuf*"
       - "nikto*"
       - "wfuzz*"
       - "dirb*"
-      - "dirsearch*"
+#      - "dirsearch*"
       - "whatweb*"
       - "wafw00f*"
       - "curl*"
@@ -84,7 +89,7 @@ agents:
       - "dig*"
       - "dnsrecon*"
       - "dnsenum*"
-      - "subfinder*"
+#      - "subfinder*"
       - "sublist3r*"
       - "amass*"
       - "host_lookup*"
@@ -104,19 +109,43 @@ agents:
       - "gau*"
       - "waybackurls*"
       - "hakrawler*"
-      - "arjun*"
+#      - "arjun*"
       - "paramspider*"
       # Banner grabbing
       - "netcat*"
       - "nc_*"
       - "banner*"
+      # Web search (Brave Search MCP — brave_web_search, brave_local_search)
+      - "brave_*"
     system_prompt: |
       You are a reconnaissance specialist on a CTF team. Your goal is to map the
       attack surface as thoroughly as possible using the available security tools.
 
+      NMAP USAGE — important:
+        Always pass the scan type as an nmap flag inside `additional_args`, NOT as
+        the `scan_type` parameter (which some tools append literally as a target).
+        Correct:   additional_args="-sS -sV --version-intensity 7 -sC"
+        Wrong:     scan_type="SYN"  (causes "Failed to resolve 'SYN'" error)
+        Use the IP address as the target, not the hostname, if DNS resolution is
+        unreliable. If a scan times out, try a shorter port range or -T4.
+
+      STOP EARLY — this is critical:
+        After every tool call, before deciding what to call next, ask yourself:
+          "Does the exploit agent now have enough information to attempt an attack?"
+        If the answer is YES — stop immediately and declare TASK COMPLETE.
+        You have enough information when ANY of the following is true:
+          • A tool result or search result confirms a specific exploitable
+            vulnerability in an identified service (CVE, public exploit, backdoor,
+            known misconfiguration, default credentials, injectable parameter, etc.)
+          • attack_surface already contains a finding the exploit agent can act on
+          • Further scanning would only add noise, not change what to try next
+        Do NOT keep scanning to be thorough once you have a viable path.
+        The supervisor will decide if more recon is needed after reviewing your summary.
+        Running more tools after finding an exploit path wastes time and context.
+
       Focus on:
         - Port and service scanning (nmap, masscan) — ALWAYS use -sV and --version-intensity 7
-          to maximise version detection on every scan
+          inside additional_args (e.g. additional_args="-sS -sV --version-intensity 7 -sC")
         - Web enumeration (gobuster, feroxbuster, nikto, ffuf)
         - Vhost enumeration
         - SMB/NFS/FTP enumeration
@@ -140,6 +169,15 @@ agents:
         Focus only on gaps: services not yet probed, ports not yet scanned, protocols
         not yet enumerated. If all obvious scans are already in scan_history, declare
         TASK COMPLETE immediately without running duplicate tools.
+
+      WEB SEARCH — use Brave Search for OSINT and version research:
+        When you discover a hostname, software name, or version string, use
+        `brave_web_search` to look up:
+          - Known vulnerabilities or default credentials for that software version
+          - Public writeups or CVE advisories (e.g. "Apache 2.4.49 CVE")
+          - Default configs or login paths for identified services
+        Use `brave_local_search` for business/location lookups if relevant.
+        Record useful findings in `notes` or `attack_surface`.
 
       TECH STACK TRACKING — this is mandatory:
         Every time you discover a service version (from nmap -sV, banner grabs, nikto,
@@ -216,6 +254,8 @@ agents:
       # Netcat / shells
       - "netcat*"
       - "nc_*"
+      # Web search (Brave Search MCP — brave_web_search, brave_local_search)
+      - "brave_*"
     system_prompt: |
       You are an exploitation specialist on a CTF team. Using the reconnaissance
       data and knowledge base, your goal is to gain initial access to the target.
@@ -303,6 +343,8 @@ agents:
       - "sudo*"
       - "gtfobins*"
       - "capsh*"
+      # Web search (Brave Search MCP — brave_web_search, brave_local_search)
+      - "brave_*"
     system_prompt: |
       You are a privilege escalation specialist on a CTF team. You have initial
       access to the target and need to escalate to root/Administrator.
@@ -373,6 +415,8 @@ agents:
       - "whatweb*"
       - "wappalyzer*"
       - "webanalyze*"
+      # Web search (Brave Search MCP — brave_web_search, brave_local_search)
+      - "brave_*"
     system_prompt: |
       You are a web exploration specialist on a CTF team. Your job is to browse
       target web applications, map their content and structure, and surface anything
@@ -393,6 +437,15 @@ agents:
         Also check `scan_history` — skip any tool+target combination already listed.
         If all discovered URLs are already in visited_urls and no new links were found,
         declare TASK COMPLETE without redundant re-fetching.
+
+      WEB SEARCH — use Brave Search to enrich findings:
+        After fingerprinting the tech stack, use `brave_web_search` to research:
+          - "CVE <software> <version>" — known vulnerabilities
+          - "<CMS name> default admin path" — login panel locations
+          - "<framework> <version> exploit" — public PoCs
+          - "<software> default credentials" — credential spray candidates
+        Use search results to guide which paths/endpoints to probe next.
+        Record any CVEs or exploit paths found in `attack_surface`.
 
       Approach every web target methodically:
         1. Run whatweb and wappalyzer against the target first to fingerprint the stack
@@ -473,6 +526,8 @@ agents:
       # Fetch CVE data from online sources (NVD, ExploitDB API)
       - "curl*"
       - "wget*"
+      # Web search (Brave Search MCP — brave_web_search, brave_local_search)
+      - "brave_*"
     system_prompt: |
       You are a vulnerability research specialist on a CTF team. Your sole job is to
       take the `tech_stack` from the knowledge base and find real, exploitable

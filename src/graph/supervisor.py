@@ -136,6 +136,28 @@ async def supervisor_node(state: TeamState) -> dict:
         return {"next": "privesc"}
 
     # -----------------------------------------------------------------------
+    # 1c. Confirmed exploit path in attack_surface → route to exploit immediately.
+    #     Prevents recon/webexplorer from continuing to enumerate after a clear
+    #     attack vector (RCE, backdoor, etc.) has already been identified.
+    # -----------------------------------------------------------------------
+    _hv_signals = (
+        "exploit", "backdoor", "rce", "remote code exec",
+        "command injection", "sql inject", "path travers",
+        "lfi", "rfi", "ssrf", "xxe", "auth bypass",
+        "privilege escal", "arbitrary code", "arbitrary command",
+        "unauthenticated", "unauthor",
+    )
+    attack_surface_entries = kb.get("attack_surface", [])
+    _has_confirmed_exploit = any(
+        any(s in e.lower() for s in _hv_signals) for e in attack_surface_entries
+    )
+    if (_has_confirmed_exploit
+            and not shells
+            and current_agent in ("recon", "webexplorer", "vulnsearch", "refusal_specialist")):
+        logger.info("[Supervisor] Confirmed exploit path found → exploit (skipping further recon)")
+        return {"next": "exploit"}
+
+    # -----------------------------------------------------------------------
     # 2. Context compaction check — route to summarizer before hitting limits
     # -----------------------------------------------------------------------
     if current_estimate > context_limit:
