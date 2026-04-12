@@ -176,7 +176,9 @@ class MCPClientPool:
             try:
                 await client.disconnect()
                 logger.info("[MCPPool] Disconnected from %s", name)
-            except Exception as exc:
-                logger.error("[MCPPool] Error disconnecting from %s: %s", name, exc)
+            except BaseException as exc:
+                # CancelledError is BaseException (not Exception) in Python 3.8+;
+                # swallow all disconnect errors — the process is exiting anyway.
+                logger.debug("[MCPPool] Ignored error disconnecting from %s: %s", name, exc)
         self._tool_router = {}
         self._tools_cache = None

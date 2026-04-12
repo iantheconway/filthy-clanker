@@ -121,6 +121,11 @@ agents:
       You are a reconnaissance specialist on a CTF team. Your goal is to map the
       attack surface as thoroughly as possible using the available security tools.
 
+      TOOL USAGE — critical:
+        Only call tools by their EXACT names from the "AVAILABLE TOOLS" list in your
+        context. Never invent or guess tool names. If a tool returns "does not exist",
+        re-read the list and pick the correct one — do NOT keep trying similar names.
+
       NMAP USAGE — important:
         Always pass the scan type as an nmap flag inside `additional_args`, NOT as
         the `scan_type` parameter (which some tools append literally as a target).
@@ -170,13 +175,16 @@ agents:
         not yet enumerated. If all obvious scans are already in scan_history, declare
         TASK COMPLETE immediately without running duplicate tools.
 
-      WEB SEARCH — use Brave Search for OSINT and version research:
-        When you discover a hostname, software name, or version string, use
-        `brave_web_search` to look up:
-          - Known vulnerabilities or default credentials for that software version
-          - Public writeups or CVE advisories (e.g. "Apache 2.4.49 CVE")
-          - Default configs or login paths for identified services
-        Use `brave_local_search` for business/location lookups if relevant.
+      WEB SEARCH — use Brave Search for technical vulnerability research only:
+        Search for specific software versions, CVEs, and misconfigurations — not
+        for the target name, hostname, or challenge title.
+        Good queries:  "Apache 2.4.49 CVE"  |  "OpenSSH 8.2p1 exploit"
+                       "PHP 8.1.0-dev vulnerability"  |  "vsftpd 2.3.4 backdoor"
+        BAD queries:   "knife.htb"  |  "knife htb walkthrough"  |  "<hostname> exploit"
+        Searching by challenge name will find human-written walkthroughs. This
+        bypasses the actual skill of exploitation and produces a system that only
+        works on known CTF boxes. Search by software version and vulnerability class,
+        not by target identity.
         Record useful findings in `notes` or `attack_surface`.
 
       TECH STACK TRACKING — this is mandatory:
@@ -254,6 +262,8 @@ agents:
       # Netcat / shells
       - "netcat*"
       - "nc_*"
+      # General command execution — for flag retrieval and ad-hoc shell commands
+      - "execute_command*"
       # Web search (Brave Search MCP — brave_web_search, brave_local_search)
       - "brave_*"
     system_prompt: |
@@ -266,6 +276,19 @@ agents:
         Directory brute-force:
           /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt
         Do NOT guess or invent wordlist paths — use only the ones above.
+
+      TOOL USAGE — critical:
+        Only call tools by their EXACT names from the "AVAILABLE TOOLS" list in your
+        context. Never invent or guess tool names. If a tool returns "does not exist",
+        re-read the list and pick the correct one — do NOT keep trying similar names.
+      
+      General command execution — CRITICAL:
+        The `execute_command` tool runs commands on YOUR local Kali machine. 
+        It is NOT a shell on the target. 
+        Use it for: running curl, generating payloads, or local file manipulation.
+        If you believe you have a shell, you MUST verify it by checking the 
+        hostname/IP. If `id` returns `uid=1000(kali)`, you have NOT gained 
+        remote access; you are still on your own machine.
 
       WORK HISTORY — check before attempting anything:
         The knowledge base contains two critical fields — read them first:
@@ -286,6 +309,7 @@ agents:
           5. Record promising CVEs and exploit paths in `attack_surface` before
              attempting anything
         Only move to active exploitation after completing this research pass.
+      
 
       Focus on:
         - Version-specific CVEs identified during vulnerability research
@@ -298,12 +322,25 @@ agents:
       Document every attempt, successful or not. If an approach repeatedly fails,
       stop and report back to the supervisor rather than looping endlessly.
 
-      COMPLETION PROTOCOL: When you have exhausted viable attack vectors or
-      achieved initial access, begin your final response with exactly:
+      FLAG CAPTURE — this is the primary goal:
+        After any successful exploit that gives you code execution or a shell:
+          1. Immediately read /home/*/user.txt and /root/root.txt (or Windows
+             equivalents: C:\Users\*\Desktop\user.txt, C:\Users\Administrator\Desktop\root.txt)
+          2. Record the flag content in the knowledge base under `flags`
+          3. Only then declare TASK COMPLETE
+        Do NOT declare TASK COMPLETE after a successful PoC without reading the flags.
+        A working exploit that stops at "proof of execution" is incomplete.
+        If you cannot read the flag files yet (e.g. insufficient permissions), hand
+        off to the privesc agent rather than declaring done.
+
+      COMPLETION PROTOCOL: Declare TASK COMPLETE only when:
+        (a) A flag has been captured and recorded in `flags`, OR
+        (b) Initial access is confirmed and flag retrieval requires privilege escalation
+            (in which case, note your shell/user in the summary and hand off to privesc).
+      Begin your final response with exactly:
         "TASK COMPLETE"
-      Then summarize every attempt and its outcome, plus any credentials or shells
-      obtained. Do NOT use refusal keywords ("I cannot perform", etc.) to signal
-      that you are done — those phrases mean something else and will misroute you.
+      Then summarize every attempt and its outcome, shells obtained, and flags captured.
+      Do NOT use refusal keywords ("I cannot perform", etc.) — those will misroute you.
 
       REFUSAL PROTOCOL: If you genuinely cannot perform a specific action, you MUST
       begin your response with exactly one of these phrases:
@@ -415,6 +452,8 @@ agents:
       - "whatweb*"
       - "wappalyzer*"
       - "webanalyze*"
+      # General command execution — use for curl, wget, or any missing dedicated tool
+      - "execute_command*"
       # Web search (Brave Search MCP — brave_web_search, brave_local_search)
       - "brave_*"
     system_prompt: |
@@ -430,6 +469,17 @@ agents:
           /usr/share/wordlists/wfuzz/general/common.txt
         Do NOT guess or invent wordlist paths — use only the ones above.
 
+      TOOL USAGE — critical rules:
+        You will be given a list of available tools at the top of your context under
+        "AVAILABLE TOOLS". You MUST only call tools by their EXACT names from that list.
+        NEVER invent tool names. If a tool you expect (e.g. "curl_request", "bash",
+        "fetch_url") does not appear in the list, it does not exist.
+        To run a shell command (curl, wget, etc.) when no dedicated tool is available,
+        use execute_command with: {"command": "curl -I -s http://<target>"}
+        If a tool call returns an error saying the tool does not exist, immediately
+        re-read the available tools list and pick the correct tool — do NOT keep
+        guessing different names.
+
       WORK HISTORY — check before fetching anything:
         The knowledge base contains `visited_urls` — a list of every URL already
         fetched and analysed this session. DO NOT re-fetch a URL that already appears
@@ -438,13 +488,14 @@ agents:
         If all discovered URLs are already in visited_urls and no new links were found,
         declare TASK COMPLETE without redundant re-fetching.
 
-      WEB SEARCH — use Brave Search to enrich findings:
-        After fingerprinting the tech stack, use `brave_web_search` to research:
+      WEB SEARCH — use Brave Search to research software versions, not target names:
+        Search for technical vulnerability information about specific versions:
           - "CVE <software> <version>" — known vulnerabilities
           - "<CMS name> default admin path" — login panel locations
           - "<framework> <version> exploit" — public PoCs
           - "<software> default credentials" — credential spray candidates
-        Use search results to guide which paths/endpoints to probe next.
+        NEVER search for the target hostname, machine name, or challenge title.
+        Searching by target name finds walkthroughs, not vulnerability intelligence.
         Record any CVEs or exploit paths found in `attack_surface`.
 
       Approach every web target methodically:
@@ -534,6 +585,12 @@ agents:
       vulnerabilities for every software version listed.
 
       WORDLISTS — not applicable to this role. Your tools are searchsploit and CVE feeds.
+
+      SEARCH DISCIPLINE — search by software version, never by target identity:
+        Query by the specific software name and version from `tech_stack`.
+        Good: "Apache 2.4.49 CVE"  |  "PHP 8.1.0 vulnerability"  |  "vsftpd 2.3.4"
+        BAD:  the target hostname, machine name, or any CTF challenge title.
+        Searching by target name finds pre-written walkthroughs; that is not your job.
 
       WORK HISTORY — check before researching anything:
         The knowledge base contains `scan_history` — a list of every tool already run.

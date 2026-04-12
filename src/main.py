@@ -380,11 +380,36 @@ async def run_session(
     thread_config = {"configurable": {"thread_id": session_id}}
 
     if resume:
-        # Resume from checkpoint — inject a continuation message
+        # Resume from checkpoint
         current_graph_state = await graph.aget_state(thread_config)
         if current_graph_state.values:
             print(f"[*] Resuming session {session_id} from checkpoint.")
-            input_payload = Command(resume=f"[Resuming session. Continue from where we left off. Task: {task}]")
+            trajectory_logger.set_session(session_id)
+
+            # Check whether there is a pending interrupt() call waiting for a value
+            pending_interrupts = current_graph_state.tasks and any(
+                hasattr(t, "interrupts") and t.interrupts
+                for t in current_graph_state.tasks
+            )
+
+            if task and not pending_interrupts:
+                # User provided a task override but there is no pending interrupt.
+                # Command(resume=...) would be silently ignored in this case.
+                # Instead, inject the override message and re-schedule via the
+                # compaction → supervisor unconditional edge so the supervisor
+                # sees the full KB + override and makes a fresh routing decision.
+                override_msg = {"role": "user", "content": f"[Human Override]: {task}"}
+                await graph.update_state(
+                    thread_config,
+                    {"messages": [override_msg]},
+                    as_node="compaction",
+                )
+                print(f"[*] Task override injected — routing through supervisor.")
+                input_payload = None  # astream(None, config) continues from updated checkpoint
+            else:
+                # Either no override, or there is a pending interrupt that needs a value.
+                resume_text = f"[Resuming session. Continue from where we left off. Task: {task}]" if task else "Continue from where we left off."
+                input_payload = Command(resume=resume_text)
         else:
             print(f"[!] No checkpoint found for {session_id}. Starting fresh.")
             resume = False

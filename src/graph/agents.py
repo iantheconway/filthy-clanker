@@ -399,6 +399,8 @@ async def _run_agent_loop(
     # Tracks the iteration at which a high-value exploit path was first confirmed.
     # Recon/webexplorer are given one more iteration to write up then forced to stop.
     _exploit_found_at: Optional[int] = None
+    # Counts consecutive iterations where every tool call was an unknown-tool error.
+    _consecutive_unknown_iters: int = 0
 
     for iteration in range(max_iterations):
         response = await llm.generate_response(
@@ -528,6 +530,29 @@ async def _run_agent_loop(
             for tc, result in tool_results:
                 new_messages.append(llm.make_tool_result_message(tc.get("name", ""), result))
 
+        # ---- Unknown-tool loop guard ----
+        # If every tool call this iteration was an unknown-tool error, increment the
+        # counter.  After 3 consecutive all-unknown iterations the model is stuck in a
+        # hallucination loop — force TASK COMPLETE so the supervisor can reroute.
+        if _all_unknown_this_iter:
+            _consecutive_unknown_iters += 1
+            logger.warning("[%s] All tool calls this iteration were unknown tools (%d consecutive)",
+                           agent_name, _consecutive_unknown_iters)
+            if _consecutive_unknown_iters >= 3:
+                available_names = [t["name"] for t in raw_tools]
+                forced_completion = (
+                    "TASK COMPLETE\n\n"
+                    f"Unable to proceed: the last {_consecutive_unknown_iters} attempts all called "
+                    f"non-existent tools. Available tools are: {available_names}. "
+                    "Handing back to supervisor."
+                )
+                new_messages.append({"role": "assistant", "content": forced_completion})
+                logger.warning("[%s] Forcing exit after %d consecutive unknown-tool iterations",
+                               agent_name, _consecutive_unknown_iters)
+                break
+        else:
+            _consecutive_unknown_iters = 0
+
         # ---- Early exit: stop recon/webexplorer once a confirmed exploit path is found ----
         # Tool result messages are built first so the conversation stays well-formed.
         # We mark the discovery iteration, then force stop one iteration later so the
@@ -567,6 +592,22 @@ async def _run_agent_loop(
         _final_text.lower().lstrip().startswith("task complete")
         and (_final_had_tool or len(_body) >= 80)
     )
+
+    # For the exploit agent: only mark complete if a flag was actually captured.
+    # If exploit ran and failed (no flag in KB), do NOT add it to completed_agents —
+    # the exploit_attempts counter + HITL handles the exhaustion case, and we want
+    # the supervisor to be able to re-route to exploit after human guidance or after
+    # other agents surface new information.
+    # For all other agents: the substantive-completion check is sufficient.
+    _flag_captured = bool(updated_kb.get("flags"))
+    if agent_name == "exploit" and _is_substantive_completion and not _flag_captured:
+        _is_substantive_completion = False
+        logger.info(
+            "[%s] TASK COMPLETE received but no flag captured — "
+            "NOT marking as completed so supervisor can retry after new leads",
+            agent_name,
+        )
+
     existing_completed = list(state.get("completed_agents") or [])
     if _is_substantive_completion and agent_name not in existing_completed:
         existing_completed = existing_completed + [agent_name]
