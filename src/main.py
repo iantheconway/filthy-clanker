@@ -336,7 +336,12 @@ def _print_agent_output(node_name: str, output: dict) -> None:
         return
 
     messages = output.get("messages", [])
+    # Unwrap the compaction replacement sentinel — it's a dict, not a list.
+    if isinstance(messages, dict) and "__replace__" in messages:
+        messages = messages["__replace__"]
     for msg in messages:
+        if not isinstance(msg, dict):
+            continue
         role = msg.get("role", "")
         content = msg.get("content", "")
         if role == "assistant":
@@ -399,7 +404,7 @@ async def run_session(
                 # compaction → supervisor unconditional edge so the supervisor
                 # sees the full KB + override and makes a fresh routing decision.
                 override_msg = {"role": "user", "content": f"[Human Override]: {task}"}
-                await graph.update_state(
+                await graph.aupdate_state(
                     thread_config,
                     {"messages": [override_msg]},
                     as_node="compaction",
