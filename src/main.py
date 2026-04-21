@@ -382,7 +382,18 @@ async def run_session(
     Drive the LangGraph graph for one CTF session.
     Handles streaming output, HITL interrupts, and trajectory logging.
     """
-    thread_config = {"configurable": {"thread_id": session_id}}
+    thread_config: dict = {"configurable": {"thread_id": session_id}}
+
+    # Attach LangSmith tracer so all LLM calls and tool calls appear as
+    # child spans under the LangGraph node traces in Smith.
+    if os.getenv("LANGSMITH_TRACING", "").lower() == "true":
+        try:
+            from langchain_core.tracers.langchain import LangChainTracer
+            _project = os.getenv("LANGSMITH_PROJECT", "filthy-clanker")
+            thread_config["callbacks"] = [LangChainTracer(project_name=_project)]
+            print(f"[*] LangSmith tracing enabled → project '{_project}'")
+        except Exception as _e:
+            print(f"[!] LangSmith tracer init failed: {_e}")
 
     if resume:
         # Resume from checkpoint

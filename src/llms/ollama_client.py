@@ -5,6 +5,8 @@ import uuid
 from typing import Any
 
 import requests
+from langsmith import traceable
+import langsmith
 
 from .base import BaseLLMClient
 
@@ -36,12 +38,17 @@ class OllamaClient(BaseLLMClient):
             })
         return tools
 
+    @traceable(run_type="llm", name="Ollama")
     async def generate_response(
         self,
         messages: list[dict],
         tools: list[dict],
         system_prompt: str,
     ) -> dict[str, Any]:
+        rt = langsmith.get_current_run_tree()
+        if rt:
+            rt.name = f"Ollama / {self.model}"
+
         ollama_tools = self.format_tools(tools)
         ollama_messages = [{"role": "system", "content": system_prompt}] + list(messages)
 
@@ -110,6 +117,10 @@ class OllamaClient(BaseLLMClient):
             "text": text,
             "tool_calls": tool_calls,
             "raw": data,
+            "usage": {
+                "input_tokens": data.get("prompt_eval_count", 0),
+                "output_tokens": data.get("eval_count", 0),
+            },
         }
 
     def parse_tool_calls(self, response: dict[str, Any]) -> list[dict[str, Any]]:

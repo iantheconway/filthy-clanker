@@ -91,7 +91,8 @@ def _estimate_tokens(messages: list) -> int:
     return sum(len(str(m)) for m in messages) // 4
 
 
-def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase) -> KnowledgeBase:
+def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase,
+                        tool_args: dict | None = None) -> KnowledgeBase:
     """
     Parse tool output for common security findings and update the knowledge base.
     Returns a new (shallow-copied) KnowledgeBase dict with any new discoveries merged in.
@@ -145,9 +146,16 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase) -> 
                 creds.append(entry)
         kb["credentials"] = creds
 
-    # Detect flags
+    # Detect flags — bracket format (HTB{...}) and raw 32-char hex (user.txt/root.txt)
     flag_pattern = re.compile(r'(?:HTB|FLAG|CTF)\{[^}]+\}', re.IGNORECASE)
+    hex_flag_pattern = re.compile(r'\b([0-9a-f]{32})\b', re.IGNORECASE)
     flags_found = flag_pattern.findall(tool_result)
+    # Only capture bare hex strings when the context suggests a flag file
+    # Check both the tool result and the tool arguments (e.g. the command string)
+    _args_str = json.dumps(tool_args) if tool_args else ""
+    _flag_file_ctx = re.search(r'(?:user|root|flag)\.txt', tool_result + _args_str, re.IGNORECASE)
+    if _flag_file_ctx:
+        flags_found += hex_flag_pattern.findall(tool_result)
     if flags_found:
         existing_flags = set(kb.get("flags", []))
         kb["flags"] = list(existing_flags | set(flags_found))
@@ -463,7 +471,7 @@ async def _run_agent_loop(
                 exploit_delta += 1
 
             # Update knowledge base from tool output
-            updated_kb = _extract_kb_updates(tool_name, result, updated_kb)
+            updated_kb = _extract_kb_updates(tool_name, result, updated_kb, raw_args)
 
             # ---- scan_history: record every tool call so agents don't repeat work ----
             _sh_target = (updated_kb.get("ips") or ["target"])[0]
@@ -516,14 +524,12 @@ async def _run_agent_loop(
 
         # Build tool result messages (provider-specific)
         if provider == "anthropic":
-            result_blocks = [
-                llm.make_tool_result_message(tc.get("id", ""), result)
-                for tc, result in tool_results
-            ]
-            # Anthropic bundles all results in one user message
+            # Anthropic bundles all tool results in a single user message whose
+            # `content` is a list of tool_result blocks (one per tool call).
             combined = {"role": "user", "content": []}
-            for rb in result_blocks:
-                combined["content"].extend(rb.get("content", []))
+            for tc, result in tool_results:
+                block = llm.make_tool_result_message(tc.get("id", ""), result)
+                combined["content"].append(block)
             new_messages.append(combined)
         else:
             # Gemini and Ollama: one message per result
@@ -592,6 +598,20 @@ async def _run_agent_loop(
         _final_text.lower().lstrip().startswith("task complete")
         and (_final_had_tool or len(_body) >= 80)
     )
+
+    # Also scan the agent's final text response for flags — agents sometimes
+    # summarize flag values in their TASK COMPLETE message even when the tool
+    # result was already processed (e.g. after summarization stripped context).
+    if _final_text:
+        _text_flags = re.findall(r'(?:HTB|FLAG|CTF)\{[^}]+\}', _final_text, re.IGNORECASE)
+        # Hex flags in text: only if flagfile context nearby
+        if re.search(r'(?:user|root|flag)\.txt', _final_text, re.IGNORECASE):
+            _text_flags += re.findall(r'\b([0-9a-f]{32})\b', _final_text, re.IGNORECASE)
+        if _text_flags:
+            _existing = set(updated_kb.get("flags", []))
+            updated_kb = dict(updated_kb)
+            updated_kb["flags"] = list(_existing | set(_text_flags))
+            logger.info("[%s] Flags extracted from agent text: %s", agent_name, _text_flags)
 
     # For the exploit agent: only mark complete if a flag was actually captured.
     # If exploit ran and failed (no flag in KB), do NOT add it to completed_agents —
@@ -851,7 +871,10 @@ def make_refusal_specialist_node(mcp_client: Any):
             )
         except Exception as exc:
             logger.error("[RefusalSpecialist] LLM error: %s", exc)
-            return {"current_agent": "refusal_specialist"}
+            # Append a user-role recovery message so the next agent doesn't
+            # receive a conversation ending in an assistant turn.
+            recovery = {"role": "user", "content": "[Refusal specialist unavailable — continue with best effort.]"}
+            return {"messages": [recovery], "current_agent": "refusal_specialist"}
 
         tool_calls = specialist.parse_tool_calls(response)
         new_messages: list = [specialist.make_assistant_message(response)]
@@ -902,7 +925,7 @@ def make_refusal_specialist_node(mcp_client: Any):
                     raw_args = {}
 
             result = await mcp_client.call_tool(tool_name, raw_args)
-            updated_kb = _extract_kb_updates(tool_name, result, updated_kb)
+            updated_kb = _extract_kb_updates(tool_name, result, updated_kb, raw_args)
             new_messages.append(specialist.make_tool_result_message(tool_name, result))
 
         new_estimate = _estimate_tokens(list(messages) + new_messages)

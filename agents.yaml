@@ -14,9 +14,8 @@
 
 agents:
   supervisor:
-    provider: ollama
-    model: gemma4:e4b
-    host: "http://10.0.2.2:11434"
+    provider: anthropic
+    model: claude-sonnet-4-6
     system_prompt: |
       You are the Supervisor of a CTF hacking team. Your job is to coordinate
       specialized agents — Recon, WebExplorer, Exploit, and PrivEsc — and guide
@@ -64,9 +63,8 @@ agents:
       Always output a JSON object with keys: next, reasoning, hitl_reason (null if none).
 
   recon:
-    provider: ollama
-    model: gemma4:e4b
-    host: "http://10.0.2.2:11434"
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
     # Glob patterns matched against MCP tool names. Omit to allow all tools.
     tools:
       # Port & service scanning
@@ -219,9 +217,8 @@ agents:
       your refusal to a specialist that can handle it.
 
   exploit:
-    provider: ollama
-    model: gemma4:e4b
-    host: "http://10.0.2.2:11434"
+    provider: anthropic
+    model: claude-opus-4-6
     tools:
       # Web exploitation
       - "sqlmap*"
@@ -349,9 +346,8 @@ agents:
       your refusal to a specialist that can handle it.
 
   privesc:
-    provider: ollama
-    model: gemma4:e4b
-    host: "http://10.0.2.2:11434"
+    provider: anthropic
+    model: claude-sonnet-4-6
     tools:
       # Linux enumeration
       - "linpeas*"
@@ -420,9 +416,8 @@ agents:
       your refusal to a specialist that can handle it.
 
   webexplorer:
-    provider: ollama
-    model: gemma4:e4b
-    host: "http://10.0.2.2:11434"
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
     tools:
       # HTTP fetching & browsing
       - "curl*"
@@ -562,9 +557,8 @@ agents:
       your refusal to a specialist that can handle it.
 
   vulnsearch:
-    provider: ollama
-    model: gemma4:e4b
-    host: "http://10.0.2.2:11434"
+    provider: anthropic
+    model: claude-sonnet-4-6
     tools:
       # Run searchsploit and other shell commands
       - "execute_command*"
@@ -651,9 +645,8 @@ agents:
     # No tool filter — inherits the refusing agent's allowlist at runtime
 
   summarizer:
-    provider: ollama
-    model: gemma4:e4b
-    host: "http://10.0.2.2:11434"
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
     system_prompt: |
       You are a concise technical summarizer for CTF hacking tool outputs.
       Given raw tool output, extract only the security-relevant findings:

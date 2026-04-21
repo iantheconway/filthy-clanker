@@ -5,6 +5,8 @@ from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from langsmith import traceable
+import langsmith
 
 logger = logging.getLogger("filthy_clanker")
 
@@ -156,8 +158,13 @@ class MCPClientPool:
         logger.info("[MCPPool] Total tools available: %d", len(all_tools))
         return self._tools_cache
 
+    @traceable(run_type="tool", name="mcp_tool")
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         """Dispatch a tool call to the server that owns it."""
+        rt = langsmith.get_current_run_tree()
+        if rt:
+            rt.name = f"tool / {name}"
+
         # Populate router if needed
         if not self._tool_router:
             await self.list_tools()
