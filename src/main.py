@@ -26,7 +26,7 @@ from langgraph.types import Command
 
 from config import build_system_prompt
 from htb_client import HTB
-from mcp_client import HexstrikeMCPClient
+from mcp_client import HexstrikeMCPClient, MCPClientPool
 from graph import build_graph, create_checkpointer, TeamState
 from graph.graph import initial_state
 from data_capture import TrajectoryLogger
@@ -336,7 +336,12 @@ def _print_agent_output(node_name: str, output: dict) -> None:
         return
 
     messages = output.get("messages", [])
+    # Unwrap the compaction replacement sentinel — it's a dict, not a list.
+    if isinstance(messages, dict) and "__replace__" in messages:
+        messages = messages["__replace__"]
     for msg in messages:
+        if not isinstance(msg, dict):
+            continue
         role = msg.get("role", "")
         content = msg.get("content", "")
         if role == "assistant":
@@ -377,14 +382,50 @@ async def run_session(
     Drive the LangGraph graph for one CTF session.
     Handles streaming output, HITL interrupts, and trajectory logging.
     """
-    thread_config = {"configurable": {"thread_id": session_id}}
+    thread_config: dict = {"configurable": {"thread_id": session_id}}
+
+    # Attach LangSmith tracer so all LLM calls and tool calls appear as
+    # child spans under the LangGraph node traces in Smith.
+    if os.getenv("LANGSMITH_TRACING", "").lower() == "true":
+        try:
+            from langchain_core.tracers.langchain import LangChainTracer
+            _project = os.getenv("LANGSMITH_PROJECT", "filthy-clanker")
+            thread_config["callbacks"] = [LangChainTracer(project_name=_project)]
+            print(f"[*] LangSmith tracing enabled → project '{_project}'")
+        except Exception as _e:
+            print(f"[!] LangSmith tracer init failed: {_e}")
 
     if resume:
-        # Resume from checkpoint — inject a continuation message
+        # Resume from checkpoint
         current_graph_state = await graph.aget_state(thread_config)
         if current_graph_state.values:
             print(f"[*] Resuming session {session_id} from checkpoint.")
-            input_payload = Command(resume=f"[Resuming session. Continue from where we left off. Task: {task}]")
+            trajectory_logger.set_session(session_id)
+
+            # Check whether there is a pending interrupt() call waiting for a value
+            pending_interrupts = current_graph_state.tasks and any(
+                hasattr(t, "interrupts") and t.interrupts
+                for t in current_graph_state.tasks
+            )
+
+            if task and not pending_interrupts:
+                # User provided a task override but there is no pending interrupt.
+                # Command(resume=...) would be silently ignored in this case.
+                # Instead, inject the override message and re-schedule via the
+                # compaction → supervisor unconditional edge so the supervisor
+                # sees the full KB + override and makes a fresh routing decision.
+                override_msg = {"role": "user", "content": f"[Human Override]: {task}"}
+                await graph.aupdate_state(
+                    thread_config,
+                    {"messages": [override_msg]},
+                    as_node="compaction",
+                )
+                print(f"[*] Task override injected — routing through supervisor.")
+                input_payload = None  # astream(None, config) continues from updated checkpoint
+            else:
+                # Either no override, or there is a pending interrupt that needs a value.
+                resume_text = f"[Resuming session. Continue from where we left off. Task: {task}]" if task else "Continue from where we left off."
+                input_payload = Command(resume=resume_text)
         else:
             print(f"[!] No checkpoint found for {session_id}. Starting fresh.")
             resume = False
@@ -592,27 +633,47 @@ async def main():
     # --- Provider selection ---
     provider = select_provider(config)
 
-    # --- MCP client ---
+    # --- MCP client pool ---
+    mcp_pool = MCPClientPool()
+
+    # Hexstrike server (security tools)
     mcp_command = os.getenv("MCP_COMMAND", HEXSTRIKE_VENV_PYTHON)
     mcp_args_str = os.getenv(
         "MCP_ARGS",
         f"{HEXSTRIKE_MCP_SCRIPT} --server http://127.0.0.1:{HEXSTRIKE_PORT}",
     )
     mcp_args = mcp_args_str.split() if mcp_args_str else []
+    hexstrike_client = HexstrikeMCPClient(command=mcp_command, args=mcp_args)
+    mcp_pool.add_server("hexstrike", hexstrike_client)
 
-    mcp_client = HexstrikeMCPClient(command=mcp_command, args=mcp_args)
-    print(f"[*] Connecting to MCP server...")
+    # Brave Search server (web search — optional, requires BRAVE_API_KEY)
+    brave_api_key = os.getenv("BRAVE_API_KEY", "")
+    if brave_api_key:
+        brave_client = HexstrikeMCPClient(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-brave-search"],
+            env={"BRAVE_API_KEY": brave_api_key},
+        )
+        mcp_pool.add_server("brave-search", brave_client)
+        print("[*] Brave Search MCP server configured.")
+    else:
+        print("[*] BRAVE_API_KEY not set — Brave Search tools unavailable.")
+
+    print(f"[*] Connecting to MCP servers...")
     try:
-        await mcp_client.connect()
+        await mcp_pool.connect()
     except Exception as e:
         if server_proc:
             server_proc.terminate()
-        sys.exit(f"Failed to connect to MCP server: {e}")
-    print("[*] MCP session initialized.")
+        sys.exit(f"Failed to connect to MCP servers: {e}")
+    print("[*] MCP sessions initialized.")
 
     # List available tools
-    tools = await mcp_client.list_tools()
+    tools = await mcp_pool.list_tools()
     print(f"[*] {len(tools)} MCP tools available.")
+
+    # Alias so the rest of the function uses a single name
+    mcp_client = mcp_pool
 
     trajectory_logger = TrajectoryLogger(training_dir)
 

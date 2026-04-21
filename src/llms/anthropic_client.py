@@ -3,6 +3,8 @@ import logging
 from typing import Any
 
 import anthropic
+from langsmith import traceable
+import langsmith
 
 from .base import BaseLLMClient
 
@@ -29,12 +31,17 @@ class AnthropicClient(BaseLLMClient):
             })
         return formatted
 
+    @traceable(run_type="llm", name="Anthropic")
     async def generate_response(
         self,
         messages: list[dict],
         tools: list[dict],
         system_prompt: str,
     ) -> dict[str, Any]:
+        rt = langsmith.get_current_run_tree()
+        if rt:
+            rt.name = f"Anthropic / {self.model}"
+
         formatted_tools = self.format_tools(tools)
 
         last_content = ""
@@ -47,17 +54,26 @@ class AnthropicClient(BaseLLMClient):
                     system_prompt.replace("\n", " "))
         logger.info("[Anthropic] LAST_MSG %.300s", last_content.replace("\n", " "))
 
+        # Anthropic requires the conversation to end with a user message.
+        # When one agent finishes and another starts, the shared message history
+        # may end with an assistant turn — add a continuation user message if so.
+        if messages and messages[-1].get("role") == "assistant":
+            messages = list(messages) + [{"role": "user", "content": "Continue."}]
+
+        # Adaptive thinking is only supported on Opus and Sonnet — not Haiku.
+        _supports_thinking = "haiku" not in self.model.lower()
+        create_kwargs: dict = dict(
+            model=self.model,
+            max_tokens=16000,
+            system=system_prompt,
+            messages=messages,
+            tools=formatted_tools,
+        )
+        if _supports_thinking:
+            create_kwargs["thinking"] = {"type": "adaptive"}
+
         try:
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=16000,
-                system=system_prompt,
-                messages=messages,
-                tools=formatted_tools,
-                thinking={
-                    "type": "adaptive",
-                },
-            )
+            response = await self.client.messages.create(**create_kwargs)
         except anthropic.APITimeoutError as exc:
             logger.error("[Anthropic] TIMEOUT after %s", exc)
             raise
@@ -83,11 +99,16 @@ class AnthropicClient(BaseLLMClient):
                     response.stop_reason, tc_names,
                     (text or "").replace("\n", " "))
 
+        usage = getattr(response, "usage", None)
         return {
             "text": text,
             "tool_calls": tool_calls,
             "raw": response,
             "stop_reason": response.stop_reason,
+            "usage": {
+                "input_tokens": getattr(usage, "input_tokens", 0),
+                "output_tokens": getattr(usage, "output_tokens", 0),
+            } if usage else {},
         }
 
     def parse_tool_calls(self, response: dict[str, Any]) -> list[dict[str, Any]]:

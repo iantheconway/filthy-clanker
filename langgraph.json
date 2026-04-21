@@ -1,0 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "filthy_clanker": "./src/studio.py:graph"
+  },
+  "env": ".env",
+  "python_version": "3.13"
+}

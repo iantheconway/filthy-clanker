@@ -118,6 +118,7 @@ async def supervisor_node(state: TeamState) -> dict:
     exploit_attempts = state.get("exploit_attempts", 0)
     current_estimate = state.get("context_token_estimate", 0)
     current_agent = state.get("current_agent", "none")
+    completed_agents_now: list[str] = list(state.get("completed_agents") or [])
 
     # -----------------------------------------------------------------------
     # 1. Check if flag was already captured
@@ -134,6 +135,42 @@ async def supervisor_node(state: TeamState) -> dict:
     if shells and current_agent not in ("privesc", "refusal_specialist"):
         logger.info("[Supervisor] Foothold detected (%s) → privesc", shells)
         return {"next": "privesc"}
+
+    # -----------------------------------------------------------------------
+    # 1c. Confirmed exploit path in attack_surface → route to exploit immediately.
+    #     Prevents recon/webexplorer from continuing to enumerate after a clear
+    #     attack vector (RCE, backdoor, etc.) has already been identified.
+    # -----------------------------------------------------------------------
+    _hv_signals = (
+        "exploit", "backdoor", "rce", "remote code exec",
+        "command injection", "sql inject", "path travers",
+        "lfi", "rfi", "ssrf", "xxe", "auth bypass",
+        "privilege escal", "arbitrary code", "arbitrary command",
+        "unauthenticated", "unauthor",
+    )
+    attack_surface_entries = kb.get("attack_surface", [])
+    _has_confirmed_exploit = any(
+        any(s in e.lower() for s in _hv_signals) for e in attack_surface_entries
+    )
+    if (_has_confirmed_exploit
+            and not shells
+            and current_agent in ("recon", "webexplorer", "vulnsearch", "refusal_specialist")):
+        logger.info("[Supervisor] Confirmed exploit path found → exploit (skipping further recon)")
+        return {"next": "exploit"}
+
+    # -----------------------------------------------------------------------
+    # 1d. Tech stack known + vuln research done + exploit not yet attempted
+    #     The attack_surface may be empty because vulnsearch ran but found nothing
+    #     structured to add — don't keep looping through research agents.
+    #     Move directly to exploit so the agent can work from the full message
+    #     history and its own searchsploit/web access.
+    # -----------------------------------------------------------------------
+    if (kb.get("tech_stack")
+            and "vulnsearch" in completed_agents_now
+            and "exploit" not in completed_agents_now
+            and not shells):
+        logger.info("[Supervisor] Tech stack known + vuln research done + exploit not yet attempted → exploit")
+        return {"next": "exploit"}
 
     # -----------------------------------------------------------------------
     # 2. Context compaction check — route to summarizer before hitting limits
@@ -156,14 +193,17 @@ async def supervisor_node(state: TeamState) -> dict:
         }
         logger.info("[Supervisor] Exploit loop detected (%s failures). Requesting human input...", exploit_attempts)
         human_response = interrupt(hitl_payload)
-        # Resume after human provides input — inject as a user message and reset counter
+        # Resume after human provides input — inject as a user message, reset counter,
+        # and clear exploit from completed_agents so it can run again with new direction.
         new_message = {
             "role": "user",
             "content": f"[Human Operator]: {human_response}",
         }
+        refreshed_completed = [a for a in completed_agents_now if a != "exploit"]
         return {
             "messages": [new_message],
             "exploit_attempts": 0,
+            "completed_agents": refreshed_completed,
             "hitl_reason": None,
             "next": "exploit",
         }
@@ -196,7 +236,8 @@ async def supervisor_node(state: TeamState) -> dict:
     )
     if (tech_stack
             and not cve_researched
-            and current_agent in ("webexplorer", "recon")):
+            and current_agent in ("webexplorer", "recon")
+            and "vulnsearch" not in completed_agents_now):
         logger.info("[Supervisor] tech_stack populated (%d entries), no CVE research yet → vulnsearch",
                     len(tech_stack))
         return {"next": "vulnsearch"}
@@ -204,11 +245,8 @@ async def supervisor_node(state: TeamState) -> dict:
     # -----------------------------------------------------------------------
     # 4c. Completed-agent loop guard — if every work agent has completed and
     #     no flag exists, we're stuck; trigger HITL so the human can provide
-    #     a new direction.  Also: if the current_agent is already completed
-    #     and there's nothing new in the KB to justify re-running them, skip
-    #     to the LLM decision so it can pick a different agent.
+    #     a new direction.
     # -----------------------------------------------------------------------
-    completed_agents_now: list[str] = list(state.get("completed_agents") or [])
     all_work_agents = {"recon", "webexplorer", "vulnsearch", "exploit", "privesc"}
     if all_work_agents.issubset(set(completed_agents_now)) and not flags:
         logger.warning("[Supervisor] All agents completed but no flag — requesting human input")
@@ -240,8 +278,11 @@ async def supervisor_node(state: TeamState) -> dict:
             "role": "user",
             "content": f"[Human Operator]: {human_response}",
         }
+        # Clear exploit from completed so it can retry with the human's guidance.
+        refreshed_completed = [a for a in completed_agents_now if a != "exploit"]
         return {
             "messages": [new_message],
+            "completed_agents": refreshed_completed,
             "hitl_reason": None,
             "next": "exploit",
         }
@@ -273,14 +314,15 @@ async def supervisor_node(state: TeamState) -> dict:
 
     # Agents that have already signalled a substantive TASK COMPLETE — read
     # directly from state (maintained by _run_agent_loop in agents.py).
-    completed_agents: list[str] = list(state.get("completed_agents") or [])
     completed_hint = ""
-    if completed_agents:
-        done_list = ", ".join(completed_agents)
+    if completed_agents_now:
+        done_list = ", ".join(completed_agents_now)
         completed_hint = (
             f"\nAgents that have already reported TASK COMPLETE this session: {done_list}. "
             f"Do NOT re-route to them unless the knowledge base has materially changed "
             f"in a way that specifically requires their skills again.\n"
+            f"Available (not yet run): "
+            f"{', '.join(a for a in ['recon','webexplorer','vulnsearch','exploit','privesc'] if a not in completed_agents_now) or 'none'}\n"
         )
 
     # Build a concise work-history digest from the new KB fields
@@ -375,29 +417,48 @@ async def supervisor_node(state: TeamState) -> dict:
         else:
             next_agent = "recon"
 
+    # No-flag guard: the LLM must not end the session without a captured flag.
+    # If it tries, solicit human feedback instead — the team may have stalled.
+    if next_agent == "__end__" and not kb.get("flags"):
+        logger.warning(
+            "[Supervisor] LLM requested FINISH but no flag captured — triggering HITL"
+        )
+        human_response = interrupt({
+            "reason": "finish_without_flag",
+            "message": (
+                "The supervisor decided to finish, but no flag has been captured.\n"
+                f"Knowledge Base:\n{json.dumps(kb, indent=2)}\n\n"
+                "Please provide a new attack direction, missing credentials, or hints "
+                "so the team can continue."
+            ),
+        })
+        refreshed_completed = [a for a in completed_agents_now if a != "exploit"]
+        return {
+            "messages": [{"role": "user", "content": f"[Human Operator]: {human_response}"}],
+            "completed_agents": refreshed_completed,
+            "exploit_attempts": 0,
+            "hitl_reason": None,
+            "next": "exploit",
+        }
+
     # Hard guard: if the LLM wants to route back to an already-completed agent,
-    # override it with the most logical next step.  This is code-enforced, not
-    # just a hint — the LLM is free to ignore hints.
-    completed_agents_guard = list(state.get("completed_agents") or [])
+    # find the highest-priority uncompleted work agent instead.  This is
+    # code-enforced — the LLM is free to ignore prompt hints but not this guard.
+    completed_agents_guard = completed_agents_now  # already computed above
     if next_agent in completed_agents_guard and next_agent != "__end__":
         original_next = next_agent
-        tech_stack_now = kb.get("tech_stack", {})
-        attack_surface_now = kb.get("attack_surface", [])
-        cve_done = any(
-            "cve" in e.lower() or "edb-" in e.lower() or "searchsploit" in e.lower()
-            for e in attack_surface_now
-        )
-        if tech_stack_now and not cve_done and "vulnsearch" not in completed_agents_guard:
-            next_agent = "vulnsearch"
-        elif attack_surface_now and "exploit" not in completed_agents_guard:
-            next_agent = "exploit"
-        elif kb.get("open_ports") and "exploit" not in completed_agents_guard:
-            next_agent = "exploit"
-        elif "privesc" not in completed_agents_guard and kb.get("credentials"):
-            next_agent = "privesc"
+        # Walk priority order — pick the first agent that hasn't run yet.
+        # If all are completed, step 4c (HITL) will catch it on the next
+        # supervisor pass; routing to "__end__" here would be too drastic.
+        _priority = ["exploit", "privesc", "vulnsearch", "webexplorer", "recon"]
+        for _candidate in _priority:
+            if _candidate not in completed_agents_guard:
+                next_agent = _candidate
+                break
         else:
-            # All obvious next steps exhausted — let recon make another pass
-            next_agent = "recon"
+            # Every work agent is marked complete — let the graph reach END
+            # (the all-agents HITL at step 4c above should have caught this).
+            next_agent = "__end__"
         logger.warning("[Supervisor] Hard guard: LLM wanted %s (already completed) → redirecting to %s",
                        original_next.upper(), next_agent.upper())
 

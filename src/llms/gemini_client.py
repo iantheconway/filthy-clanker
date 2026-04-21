@@ -4,6 +4,8 @@ from typing import Any
 
 from google import genai
 from google.genai import types
+from langsmith import traceable
+import langsmith
 
 from .base import BaseLLMClient
 
@@ -49,12 +51,17 @@ class GeminiClient(BaseLLMClient):
             ))
         return [types.Tool(function_declarations=declarations)]
 
+    @traceable(run_type="llm", name="Gemini")
     async def generate_response(
         self,
         messages: list[dict],
         tools: list[dict],
         system_prompt: str,
     ) -> dict[str, Any]:
+        rt = langsmith.get_current_run_tree()
+        if rt:
+            rt.name = f"Gemini / {self.model}"
+
         gemini_tools = self.format_tools(tools)
 
         last_content = ""
@@ -128,10 +135,15 @@ class GeminiClient(BaseLLMClient):
         logger.info("[Gemini] RESPONSE  tool_calls=%s  text=%.200s",
                     tc_names, (text or "").replace("\n", " "))
 
+        usage = getattr(response, "usage_metadata", None)
         return {
             "text": text,
             "tool_calls": tool_calls,
             "raw": response,
+            "usage": {
+                "input_tokens": getattr(usage, "prompt_token_count", 0),
+                "output_tokens": getattr(usage, "candidates_token_count", 0),
+            } if usage else {},
         }
 
     def parse_tool_calls(self, response: dict[str, Any]) -> list[dict[str, Any]]:

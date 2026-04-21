@@ -4,9 +4,20 @@ TeamState and supporting types for the LangGraph multi-agent workflow.
 from typing import TypedDict, Annotated, List, Dict, Optional, Any
 
 
-def _append_messages(left: list, right: list) -> list:
-    """Simple append reducer — keeps raw dicts compatible with all providers."""
-    return left + (right if right else [])
+def _append_messages(left: list, right) -> list:
+    """
+    Append reducer for the messages field.
+
+    Normal use: right is a list → append to left.
+    Compaction use: right is {"__replace__": [...]}} → replace left entirely.
+    This lets compaction_node swap out the full history without changing the
+    state schema or the reducer annotation.
+    """
+    if not right:
+        return left
+    if isinstance(right, dict) and "__replace__" in right:
+        return list(right["__replace__"])
+    return left + list(right)
 
 
 class KnowledgeBase(TypedDict, total=False):

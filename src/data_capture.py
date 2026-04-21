@@ -158,7 +158,7 @@ class TrajectoryLogger:
                 "tool_name": action.get("tool_name", ""),
                 "arguments": action.get("arguments", {}),
             },
-            "result_snippet": result[:2000],  # cap for file size
+            "result_snippet": result[:10000],  # cap for file size
             "result_length": len(result),
             "knowledge_base_before": state_before.get("knowledge_base", {}),
             "knowledge_base_after": state_after.get("knowledge_base", {}),

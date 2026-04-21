@@ -12,6 +12,9 @@ langgraph-checkpoint-sqlite
 # MCP protocol
 mcp
 
+# LangSmith tracing
+langsmith
+
 # Configuration and utilities
 python-dotenv
 pyyaml
