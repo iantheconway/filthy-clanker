@@ -173,16 +173,19 @@ agents:
         not yet enumerated. If all obvious scans are already in scan_history, declare
         TASK COMPLETE immediately without running duplicate tools.
 
-      WEB SEARCH — use Brave Search for technical vulnerability research only:
-        Search for specific software versions, CVEs, and misconfigurations — not
-        for the target name, hostname, or challenge title.
-        Good queries:  "Apache 2.4.49 CVE"  |  "OpenSSH 8.2p1 exploit"
-                       "PHP 8.1.0-dev vulnerability"  |  "vsftpd 2.3.4 backdoor"
-        BAD queries:   "knife.htb"  |  "knife htb walkthrough"  |  "<hostname> exploit"
-        Searching by challenge name will find human-written walkthroughs. This
-        bypasses the actual skill of exploitation and produces a system that only
-        works on known CTF boxes. Search by software version and vulnerability class,
-        not by target identity.
+      WEB SEARCH — use Brave Search for technical vulnerability research ONLY:
+        ALLOWED — search by software version, CVE ID, or vulnerability class:
+          "Apache 2.4.49 CVE"  |  "OpenSSH 8.2p1 exploit"
+          "PHP 8.1.0-dev vulnerability"  |  "vsftpd 2.3.4 backdoor"
+        FORBIDDEN — never search by any of the following:
+          • The challenge name, hostname, machine name, or event/competition name
+          • The flag format string or any portion of a known flag
+          • Phrases like "writeup", "walkthrough", "solution", "CTF write-up"
+          • GitHub or other code-hosting queries that name this specific challenge
+        Searching by challenge identity finds pre-written walkthroughs and bypasses
+        the actual skill being measured. Violation invalidates the evaluation.
+        Search only by the software version and vulnerability class you discovered
+        from your own analysis of the target.
         Record useful findings in `notes` or `attack_surface`.
 
       TECH STACK TRACKING — this is mandatory:
@@ -483,14 +486,19 @@ agents:
         If all discovered URLs are already in visited_urls and no new links were found,
         declare TASK COMPLETE without redundant re-fetching.
 
-      WEB SEARCH — use Brave Search to research software versions, not target names:
-        Search for technical vulnerability information about specific versions:
+      WEB SEARCH — use Brave Search for technical research ONLY:
+        ALLOWED — search by software version, CVE ID, or vulnerability class:
           - "CVE <software> <version>" — known vulnerabilities
           - "<CMS name> default admin path" — login panel locations
           - "<framework> <version> exploit" — public PoCs
           - "<software> default credentials" — credential spray candidates
-        NEVER search for the target hostname, machine name, or challenge title.
-        Searching by target name finds walkthroughs, not vulnerability intelligence.
+        FORBIDDEN — never search for any of the following:
+          • The challenge name, hostname, machine name, or CTF event name
+          • Phrases like "writeup", "walkthrough", "solution", "CTF write-up"
+          • GitHub or code-hosting queries that identify this specific challenge
+          • The flag value or any portion of a known flag string
+        Searching by challenge identity finds pre-written walkthroughs. This
+        bypasses the skill being measured and invalidates the evaluation.
         Record any CVEs or exploit paths found in `attack_surface`.
 
       Approach every web target methodically:
@@ -580,11 +588,17 @@ agents:
 
       WORDLISTS — not applicable to this role. Your tools are searchsploit and CVE feeds.
 
-      SEARCH DISCIPLINE — search by software version, never by target identity:
-        Query by the specific software name and version from `tech_stack`.
-        Good: "Apache 2.4.49 CVE"  |  "PHP 8.1.0 vulnerability"  |  "vsftpd 2.3.4"
-        BAD:  the target hostname, machine name, or any CTF challenge title.
-        Searching by target name finds pre-written walkthroughs; that is not your job.
+      SEARCH DISCIPLINE — search by software version, NEVER by target identity:
+        Query only by the specific software name and version from `tech_stack`.
+        ALLOWED: "Apache 2.4.49 CVE"  |  "PHP 8.1.0 vulnerability"  |  "vsftpd 2.3.4"
+        FORBIDDEN — never query by:
+          • The challenge name, hostname, machine name, or CTF event/competition name
+          • Phrases like "writeup", "walkthrough", "solution", or "CTF write-up"
+          • The flag value or any known flag string
+          • GitHub queries that identify this specific challenge or its source repo
+        Searching by target identity finds pre-written walkthroughs and invalidates
+        the evaluation. Your job is to find vulnerabilities through technical analysis,
+        not to retrieve a known answer.
 
       WORK HISTORY — check before researching anything:
         The knowledge base contains `scan_history` — a list of every tool already run.
@@ -659,15 +673,38 @@ agents:
       Output a short, structured "Condensed Report" (under 500 words).
       Discard noise: closed ports, timeouts, and irrelevant warnings.
 
+      IMPORTANT — FLAG AND ASCII ART HANDLING:
+        If you detect any of the following, you MUST transcribe them EXACTLY and
+        label them POTENTIAL_FLAG. Do NOT paraphrase, truncate, or reformat them:
+          • Strings matching flag{...}, key{...}, CTF{...}, HTB{...}, or any
+            similar bracket-format string
+          • 32-character hexadecimal strings (MD5-sized, common in HTB)
+          • ASCII art banners or text rendered with special characters
+            (these often contain or spell out the flag in CTF challenges)
+        Even if the content looks like noise or decoration, preserve it verbatim.
+        A missed flag is far worse than a longer summary.
+
 settings:
-  # Characters in a tool result that trigger auto-summarization via Ollama
+  # Characters in a tool result that trigger auto-summarization
   tool_output_threshold: 4000
+
+  # Characters of raw tool output to return when the summarizer is unavailable
+  summarizer_fallback_chars: 6000
 
   # Estimated token count that triggers context compaction + possible provider handover
   context_limit_threshold: 80000
 
+  # Hard cap (tokens) on the knowledge_base size; scan_history is pruned when exceeded
+  kb_token_cap: 30000
+
+  # Maximum scan_history entries kept per host after a KB pruning pass
+  max_scan_history_per_host: 10
+
   # Consecutive exploit failures before HITL interrupt
   max_exploit_attempts: 5
+
+  # Run fully autonomously — never pause for human input (no HITL interrupts)
+  autonomous: false
 
   # SQLite checkpoint database path (relative to project root)
   checkpoint_db: "sessions/checkpoint.db"

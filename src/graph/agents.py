@@ -11,6 +11,7 @@ configured LLM and available MCP tools, then returns a state update including:
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import re
@@ -19,13 +20,35 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from .state import TeamState, KnowledgeBase
-from .summarizer import maybe_summarize
+from .summarizer import maybe_summarize, _FLAG_RE, _HEX_FLAG_RE
 
 # Import existing LLM clients
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from llms import AnthropicClient, GeminiClient, OllamaClient
 
 logger = logging.getLogger("filthy_clanker")
+
+
+# ---------------------------------------------------------------------------
+# Raw-output flag extraction (runs BEFORE summarisation)
+# ---------------------------------------------------------------------------
+
+def _extract_flags_from_raw(raw: str, tool_args: dict | None = None) -> list[str]:
+    """
+    Scan the RAW (un-summarised) tool output for flag strings and return them.
+    Called before maybe_summarize() so a lossy summary can never hide a flag.
+    """
+    flags: list[str] = []
+    # Bracket-format flags: flag{...}, key{...}, HTB{...}, etc.
+    flags += _FLAG_RE.findall(raw)
+    # Broader single-word bracket flags that _FLAG_RE might miss
+    _broad = re.findall(r'\b\w{2,20}\{[^}]{1,200}\}', raw)
+    flags += [f for f in _broad if f not in flags]
+    # 32-char hex strings when a flag-file context is present
+    _args_str = json.dumps(tool_args) if tool_args else ""
+    if re.search(r'(?:user|root|flag)\.txt', raw + _args_str, re.IGNORECASE):
+        flags += _HEX_FLAG_RE.findall(raw)
+    return list(dict.fromkeys(flags))  # deduplicate preserving order
 
 
 # ---------------------------------------------------------------------------
@@ -373,11 +396,14 @@ async def _run_agent_loop(
 
     # Filter to the agent's allowed tool set (fnmatch patterns in agents.yaml).
     # If no 'tools' key is present, all tools are passed through.
+    # Special tools that must always be visible regardless of the allowlist:
+    _ALWAYS_ALLOWED = {"submit_flag"}
     allowed_patterns: list[str] = agent_cfg.get("tools", [])
     if allowed_patterns:
         raw_tools = [
             t for t in all_tools
-            if any(fnmatch.fnmatch(t["name"], pat) for pat in allowed_patterns)
+            if t["name"] in _ALWAYS_ALLOWED
+            or any(fnmatch.fnmatch(t["name"], pat) for pat in allowed_patterns)
         ]
         logger.info("[%s] Tool filter: %d/%d tools allowed",
                     agent_name, len(raw_tools), len(all_tools))
@@ -389,11 +415,22 @@ async def _run_agent_loop(
     kb = state.get("knowledge_base", {})
     kb_text = json.dumps(kb, indent=2)
     tool_names_list = ", ".join(t["name"] for t in raw_tools) if raw_tools else "(none)"
+
+    # Add a submit_flag reminder if the tool is available (eval mode).
+    _has_submit_flag = any(t["name"] == "submit_flag" for t in raw_tools)
+    _submit_flag_note = (
+        "\n\n=== FLAG SUBMISSION ===\n"
+        "When you capture the flag, call submit_flag(flag='<full flag string>') IMMEDIATELY.\n"
+        "This is required — do not just write the flag in text. submit_flag must be called."
+        if _has_submit_flag else ""
+    )
+
     full_system = (
         f"{system_prompt}\n\n"
         f"=== AVAILABLE TOOLS (exact names — use only these) ===\n{tool_names_list}\n\n"
         f"=== KNOWLEDGE BASE (shared with team) ===\n{kb_text}\n"
         f"=== CURRENT TASK ===\n{state.get('task', 'Hack the target machine.')}"
+        f"{_submit_flag_note}"
     )
 
     # Start from current conversation history
@@ -409,6 +446,9 @@ async def _run_agent_loop(
     _exploit_found_at: Optional[int] = None
     # Counts consecutive iterations where every tool call was an unknown-tool error.
     _consecutive_unknown_iters: int = 0
+    # Duplicate-output detection: tool_name → set of MD5 hashes of raw results.
+    # If a tool returns the exact same bytes twice, we inject a strategy-change hint.
+    _seen_output_hashes: dict[str, set] = {}
 
     for iteration in range(max_iterations):
         response = await llm.generate_response(
@@ -456,18 +496,63 @@ async def _run_agent_loop(
             else:
                 _all_unknown_this_iter = False
 
+                # ---- Raw flag extraction (BEFORE summarization) ----
+                # Run on the un-summarised output so a lossy summary can never
+                # hide a flag.  Captured flags go directly into the KB.
+                _raw_flags = _extract_flags_from_raw(raw_result, raw_args)
+                if _raw_flags:
+                    _existing_flags = set(updated_kb.get("flags", []))
+                    _new_flags = [f for f in _raw_flags if f not in _existing_flags]
+                    if _new_flags:
+                        updated_kb = dict(updated_kb)
+                        updated_kb["flags"] = list(_existing_flags | set(_raw_flags))
+                        logger.info(
+                            "[%s] Flags extracted from RAW output (pre-summarisation): %s",
+                            agent_name, _new_flags,
+                        )
+
+                # ---- Duplicate output detection ----
+                # If this tool returns the exact same bytes as a previous call,
+                # replace the result with a strategy-change prompt so the agent
+                # doesn't just loop with the same input.
+                _out_hash = hashlib.md5(
+                    raw_result.encode(errors="replace")
+                ).hexdigest()
+                _tool_hashes = _seen_output_hashes.setdefault(tool_name, set())
+                if _out_hash in _tool_hashes:
+                    logger.warning(
+                        "[%s] Duplicate output detected from %s — injecting strategy-change prompt",
+                        agent_name, tool_name,
+                    )
+                    raw_result = (
+                        f"[DUPLICATE OUTPUT DETECTED]\n"
+                        f"'{tool_name}' returned the EXACT same output as a previous call.\n"
+                        f"Calling it again with the same arguments WILL NOT help.\n"
+                        f"You MUST change your strategy: use different arguments, a different "
+                        f"tool, or a completely different approach.\n\n"
+                        f"Previous output (first 800 chars for reference):\n"
+                        f"{raw_result[:800]}"
+                    )
+                else:
+                    _tool_hashes.add(_out_hash)
+
             # Auto-summarize large outputs
             result = maybe_summarize(raw_result, config)
 
             if result != raw_result:
                 logger.info("[Summarizer] Condensed %s → %s chars", f"{len(raw_result):,}", f"{len(result):,}")
 
-            # Track exploit failures
-            if agent_name == "exploit" and (
-                "failed" in result.lower() or
-                "error" in result.lower()[:200] or
-                "connection refused" in result.lower()
-            ):
+            # Track exploit failures — only count hard failures, not data returns.
+            # A non-zero exit code or stderr output signals genuine failure.
+            _is_hard_fail = (
+                bool(re.search(r'(?:exit\s*code|returncode|return\s*code)\s*[=:]\s*[1-9]', result, re.IGNORECASE))
+                or bool(re.search(r'(?:stderr|STDERR)\s*:\s*\S', result))
+                or any(kw in result.lower() for kw in (
+                    "connection refused", "no route to host",
+                    "connection timed out", "access denied",
+                ))
+            )
+            if agent_name == "exploit" and _is_hard_fail:
                 exploit_delta += 1
 
             # Update knowledge base from tool output
@@ -492,19 +577,32 @@ async def _run_agent_loop(
                     _visited.append(_url)
                     updated_kb["visited_urls"] = _visited[-300:]  # cap
 
-            # ---- exploit_history: record failed exploit attempts ----
+            # ---- exploit_history: record outcomes of exploit tool calls ----
+            # A "failure" requires hard evidence: non-zero exit code, stderr output,
+            # or an unambiguous connection error.  Commands that return data (even
+            # partial or unexpected) are recorded as "discovery" so the agent can
+            # act on the output rather than being told to skip it next time.
             if agent_name == "exploit":
-                _fail_kws = (
-                    "failed", "connection refused", "access denied",
-                    "not vulnerable", "patched", "not found", "403", "404", "500",
-                )
-                _is_fail = any(kw in result.lower()[:600] for kw in _fail_kws)
-                if _is_fail:
+                _exit_nonzero = bool(re.search(
+                    r'(?:exit\s*code|returncode|return\s*code)\s*[=:]\s*[1-9]',
+                    result, re.IGNORECASE,
+                ))
+                _has_stderr = bool(re.search(r'(?:stderr|STDERR)\s*:\s*\S', result))
+                _conn_fail = any(kw in result.lower() for kw in (
+                    "connection refused", "no route to host",
+                    "connection timed out", "access denied",
+                ))
+                _exp_hist = list(updated_kb.get("exploit_history") or [])
+                if _exit_nonzero or _has_stderr or _conn_fail:
                     _exp_entry = f"{tool_name}({_sh_args_summary[:60]}): failed"
-                    _exp_hist = list(updated_kb.get("exploit_history") or [])
-                    if _exp_entry not in _exp_hist:
-                        _exp_hist.append(_exp_entry)
-                        updated_kb["exploit_history"] = _exp_hist[-40:]
+                elif result.strip() and not result.startswith("[Summarizer"):
+                    # Command returned data — record as a discovery, not a failure
+                    _exp_entry = f"{tool_name}({_sh_args_summary[:60]}): discovery"
+                else:
+                    _exp_entry = None
+                if _exp_entry and _exp_entry not in _exp_hist:
+                    _exp_hist.append(_exp_entry)
+                    updated_kb["exploit_history"] = _exp_hist[-40:]
 
             # ---- shells: auto-detect successful RCE / foothold ----
             _shell = _detect_shell_from_output(result, list(updated_kb.get("ips") or []))
@@ -585,6 +683,26 @@ async def _run_agent_loop(
                 agent_name, _exploit_found_at, iteration,
             )
             break
+
+    # -----------------------------------------------------------------------
+    # KB pruning — keep scan_history from bloating the context estimate.
+    # If the current message payload already exceeds the configured cap,
+    # trim each host's scan_history down to the last N entries.
+    # -----------------------------------------------------------------------
+    _settings = config.get("settings", {})
+    _kb_token_cap: int = _settings.get("kb_token_cap", 30_000)
+    _max_scan_per_host: int = _settings.get("max_scan_history_per_host", 10)
+    _rough_kb_tokens = len(json.dumps(updated_kb)) // 4
+    if _rough_kb_tokens > _kb_token_cap:
+        _scan_hist_raw = dict(updated_kb.get("scan_history") or {})
+        for _host_key in _scan_hist_raw:
+            _scan_hist_raw[_host_key] = _scan_hist_raw[_host_key][-_max_scan_per_host:]
+        updated_kb = dict(updated_kb)
+        updated_kb["scan_history"] = _scan_hist_raw
+        logger.info(
+            "[%s] KB token estimate %d > cap %d — pruned scan_history to last %d per host",
+            agent_name, _rough_kb_tokens, _kb_token_cap, _max_scan_per_host,
+        )
 
     # Compute new token estimate
     all_messages = (messages + new_messages)

@@ -4,6 +4,7 @@ from typing import Any
 
 import anthropic
 from langsmith import traceable
+from langsmith.wrappers import wrap_anthropic
 import langsmith
 
 from .base import BaseLLMClient
@@ -13,7 +14,7 @@ logger = logging.getLogger("filthy_clanker")
 
 class AnthropicClient(BaseLLMClient):
     def __init__(self, api_key: str, model: str = "claude-opus-4-6"):
-        self.client = anthropic.AsyncAnthropic(api_key=api_key)
+        self.client = wrap_anthropic(anthropic.AsyncAnthropic(api_key=api_key))
         self.model = model
 
     @staticmethod

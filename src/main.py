@@ -198,7 +198,7 @@ def _select_and_set_ollama_model(config: dict) -> None:
     If the configured host is unreachable, prompts the user to enter the correct one."""
     default_host = (
         config.get("agents", {}).get("summarizer", {}).get("host")
-        or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        or os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
     )
 
     # Try up to 3 hosts (let user correct if needed)
@@ -234,8 +234,11 @@ def _select_and_set_ollama_model(config: dict) -> None:
             os.environ["OLLAMA_MODEL"] = selected
             os.environ["OLLAMA_HOST"] = host
             print(f"[*] Ollama model: {selected}")
-            # Also update the summarizer host in the loaded config so compaction works
-            config.setdefault("agents", {}).setdefault("summarizer", {})["host"] = host
+            # Update the summarizer host in the loaded config, but only if the
+            # summarizer is actually using Ollama — don't leak 'host' into Anthropic/Gemini configs.
+            summarizer_cfg = config.get("agents", {}).get("summarizer", {})
+            if summarizer_cfg.get("provider", "ollama").lower().strip() == "ollama":
+                config.setdefault("agents", {}).setdefault("summarizer", {})["host"] = host
             return
         print("Invalid choice.")
 

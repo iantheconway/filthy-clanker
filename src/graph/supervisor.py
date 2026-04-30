@@ -113,6 +113,7 @@ async def supervisor_node(state: TeamState) -> dict:
     settings = config.get("settings", {})
     max_attempts: int = settings.get("max_exploit_attempts", 5)
     context_limit: int = settings.get("context_limit_threshold", 80000)
+    autonomous: bool = bool(settings.get("autonomous", False))
 
     kb = state.get("knowledge_base", {})
     exploit_attempts = state.get("exploit_attempts", 0)
@@ -127,6 +128,50 @@ async def supervisor_node(state: TeamState) -> dict:
     if flags:
         logger.info("[Supervisor] Flag captured: %s. Mission complete!", flags)
         return {"next": "__end__"}
+
+    # -----------------------------------------------------------------------
+    # 1e. Autonomous win scan — scan recent message text for flag patterns that
+    #     the KB extractor may have missed (e.g. inside a summarized block).
+    #     Only in autonomous mode to avoid unnecessary parsing overhead in HITL.
+    # -----------------------------------------------------------------------
+    if autonomous:
+        import re as _re
+        _FLAG_SCAN = _re.compile(
+            r'(?:flag|key|ctf|htb|thm|picoctf|csaw|crypto|web|pwn|misc|rev|forensics'
+            r'|rtcp|ductf|darkctf|bucket|nite|jctf|cyber)\{[^}]{1,200}\}',
+            _re.IGNORECASE,
+        )
+        _HEX_SCAN = _re.compile(r'\b([0-9a-f]{32})\b', _re.IGNORECASE)
+        messages = state.get("messages", [])
+        # Only scan the last few messages — earlier ones are already processed.
+        _scan_msgs = messages[-6:] if len(messages) > 6 else messages
+        _found_flags: list[str] = []
+        for _msg in _scan_msgs:
+            _content = _msg.get("content", "")
+            if isinstance(_content, list):
+                _content = " ".join(
+                    b.get("text", "") or b.get("content", "")
+                    for b in _content if isinstance(b, dict)
+                )
+            _content = str(_content)
+            _found_flags += _FLAG_SCAN.findall(_content)
+            # Hex flags only when a flag-file reference is nearby
+            if _re.search(r'(?:user|root|flag)\.txt', _content, _re.IGNORECASE):
+                _found_flags += _HEX_SCAN.findall(_content)
+
+        if _found_flags:
+            _existing = set(kb.get("flags", []))
+            _new = [f for f in _found_flags if f not in _existing]
+            if _new:
+                logger.info(
+                    "[Supervisor] Autonomous win scan found flags in message text: %s", _new
+                )
+                updated_kb = dict(kb)
+                updated_kb["flags"] = list(_existing | set(_new))
+                return {
+                    "knowledge_base": updated_kb,
+                    "next": "__end__",
+                }
 
     # -----------------------------------------------------------------------
     # 1b. Shell / foothold already obtained → skip straight to privesc
@@ -180,9 +225,24 @@ async def supervisor_node(state: TeamState) -> dict:
         return {"next": "compaction"}
 
     # -----------------------------------------------------------------------
-    # 3. Exploit loop detection — HITL interrupt
+    # 3. Exploit loop detection — HITL interrupt (skipped in autonomous mode)
     # -----------------------------------------------------------------------
     if exploit_attempts >= max_attempts:
+        if autonomous:
+            # In autonomous mode: reset the counter and route to recon for a
+            # fresh angle rather than looping the exploit agent forever.
+            logger.info(
+                "[Supervisor] Autonomous mode — exploit loop (%d failures) detected. "
+                "Resetting counter and routing to recon for a fresh angle.",
+                exploit_attempts,
+            )
+            refreshed_completed = [a for a in completed_agents_now if a not in ("exploit", "recon")]
+            return {
+                "exploit_attempts": 0,
+                "completed_agents": refreshed_completed,
+                "hitl_reason": None,
+                "next": "recon",
+            }
         hitl_payload = {
             "reason": "exploit_loop",
             "message": (
@@ -245,10 +305,21 @@ async def supervisor_node(state: TeamState) -> dict:
     # -----------------------------------------------------------------------
     # 4c. Completed-agent loop guard — if every work agent has completed and
     #     no flag exists, we're stuck; trigger HITL so the human can provide
-    #     a new direction.
+    #     a new direction (or in autonomous mode, reset and retry from recon).
     # -----------------------------------------------------------------------
     all_work_agents = {"recon", "webexplorer", "vulnsearch", "exploit", "privesc"}
     if all_work_agents.issubset(set(completed_agents_now)) and not flags:
+        if autonomous:
+            logger.warning(
+                "[Supervisor] Autonomous mode — all agents completed but no flag. "
+                "Resetting completed_agents and retrying from recon."
+            )
+            return {
+                "completed_agents": [],
+                "exploit_attempts": 0,
+                "hitl_reason": None,
+                "next": "recon",
+            }
         logger.warning("[Supervisor] All agents completed but no flag — requesting human input")
         human_response = interrupt({
             "reason": "all_agents_complete_no_flag",
@@ -266,10 +337,19 @@ async def supervisor_node(state: TeamState) -> dict:
         }
 
     # -----------------------------------------------------------------------
-    # 5. Propagate an existing hitl_reason
+    # 5. Propagate an existing hitl_reason (suppressed in autonomous mode)
     # -----------------------------------------------------------------------
     hitl_reason = state.get("hitl_reason")
     if hitl_reason:
+        if autonomous:
+            logger.info(
+                "[Supervisor] Autonomous mode — ignoring hitl_reason and continuing: %s",
+                str(hitl_reason)[:120],
+            )
+            return {
+                "hitl_reason": None,
+                "next": "exploit",
+            }
         human_response = interrupt({
             "reason": "manual_intervention",
             "message": hitl_reason,
@@ -421,8 +501,17 @@ async def supervisor_node(state: TeamState) -> dict:
     # If it tries, solicit human feedback instead — the team may have stalled.
     if next_agent == "__end__" and not kb.get("flags"):
         logger.warning(
-            "[Supervisor] LLM requested FINISH but no flag captured — triggering HITL"
+            "[Supervisor] LLM requested FINISH but no flag captured — %s",
+            "continuing autonomously" if autonomous else "triggering HITL",
         )
+        if autonomous:
+            refreshed_completed = [a for a in completed_agents_now if a != "exploit"]
+            return {
+                "completed_agents": refreshed_completed,
+                "exploit_attempts": 0,
+                "hitl_reason": None,
+                "next": "exploit",
+            }
         human_response = interrupt({
             "reason": "finish_without_flag",
             "message": (
