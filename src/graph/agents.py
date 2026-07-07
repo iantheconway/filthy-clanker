@@ -47,13 +47,50 @@ def _estimate_tokens(messages: list) -> int:
     return sum(len(str(m)) for m in messages) // 4
 
 
+# Concrete signals that an exploit tool call clearly failed. Kept conservative:
+# a false positive inflates the exploit failure counter and can trip a spurious
+# HITL breakpoint, so we avoid bare substrings like "error" that appear in plenty
+# of successful output.
+_FAILURE_SIGNALS = (
+    "connection refused", "connection timed out", "connection reset",
+    "no route to host", "could not connect", "unable to connect",
+    "authentication failed", "login failed", "permission denied",
+    "access denied", "exploit failed", "exploit completed, but no session",
+    "no session was created", "command not found",
+    "traceback (most recent call last)",
+)
+
+
+def _looks_like_failure(result: str) -> bool:
+    """Return True if the tool output contains a concrete failure signal."""
+    head = result.lower()[:1000]
+    return any(sig in head for sig in _FAILURE_SIGNALS)
+
+
+def _cred_keys(kb: KnowledgeBase) -> set:
+    """Stable set of credential fingerprints for progress comparison."""
+    return {json.dumps(c, sort_keys=True) for c in kb.get("credentials", [])}
+
+
+def _made_progress(before: KnowledgeBase, after: KnowledgeBase) -> bool:
+    """Did this agent turn surface a genuinely new high-value finding?"""
+    return bool(
+        (set(after.get("flags", [])) - set(before.get("flags", [])))
+        or (_cred_keys(after) - _cred_keys(before))
+        or (set(after.get("attack_surface", [])) - set(before.get("attack_surface", [])))
+    )
+
+
 def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase) -> KnowledgeBase:
     """
     Parse tool output for common security findings and update the knowledge base.
-    Returns a new (shallow-copied) KnowledgeBase dict with any new discoveries merged in.
+
+    Returns a new KnowledgeBase dict with any new discoveries merged in. Nested
+    containers are copied rather than mutated in place — the input `kb` may be a
+    checkpointed state object shared across nodes, and mutating it in place would
+    corrupt the persisted graph state.
     """
-    kb = dict(kb)  # shallow copy
-    text = tool_result.lower()
+    kb = dict(kb)  # shallow copy; nested containers copied on write below
 
     # Discover IPs
     ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
@@ -72,29 +109,24 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase) -> 
         service = (match.group(3) or "unknown").strip()
         # Associate with the first known IP or "target"
         target_ip = (kb.get("ips") or ["target"])[0]
-        ports = kb.get("open_ports", {})
+        ports = dict(kb.get("open_ports", {}))
         ports_for_ip = ports.get(target_ip, [])
         if port not in ports_for_ip:
-            ports_for_ip = sorted(set(ports_for_ip + [port]))
-            ports[target_ip] = ports_for_ip
+            ports[target_ip] = sorted(set(ports_for_ip + [port]))
             kb["open_ports"] = ports
 
         # Record service
         key = f"{target_ip}:{port}"
-        services = kb.get("services", {})
+        services = dict(kb.get("services", {}))
         if key not in services:
             services[key] = service
             kb["services"] = services
 
-    # Detect credentials (loose heuristic)
-    cred_patterns = [
-        re.compile(r'(?:password|passwd|pwd)\s*[=:]\s*(\S+)', re.IGNORECASE),
-        re.compile(r'(?:username|user|login)\s*[=:]\s*(\S+)', re.IGNORECASE),
-    ]
+    # Detect credentials (loose heuristic pairing users with passwords)
     users = re.findall(r'(?:username|user|login)\s*[=:]\s*(\S+)', tool_result, re.IGNORECASE)
     passwords = re.findall(r'(?:password|passwd|pwd)\s*[=:]\s*(\S+)', tool_result, re.IGNORECASE)
     if users and passwords:
-        creds = kb.get("credentials", [])
+        creds = list(kb.get("credentials", []))
         for u, p in zip(users, passwords):
             entry = {"user": u, "pass": p}
             if entry not in creds:
@@ -137,9 +169,10 @@ async def _run_agent_loop(
     # Build LLM client
     llm = _build_llm_client(provider, agent_cfg)
 
-    # Format tools for the LLM provider
+    # Fetch the raw MCP tool schemas. Each client's generate_response() calls
+    # its own format_tools() internally, so we pass the raw schemas through
+    # (pre-formatting here would double-format and strip the input schemas).
     raw_tools = await mcp_client.list_tools()
-    formatted_tools = llm.format_tools(raw_tools)
 
     # Inject knowledge base into system prompt
     kb = state.get("knowledge_base", {})
@@ -161,7 +194,7 @@ async def _run_agent_loop(
     for iteration in range(max_iterations):
         response = await llm.generate_response(
             messages=messages + new_messages,
-            tools=formatted_tools,
+            tools=raw_tools,
             system=full_system,
         )
 
@@ -173,11 +206,12 @@ async def _run_agent_loop(
             # No more tool calls — agent is done with its sub-task
             break
 
-        # Execute each tool call
+        # Execute each tool call. parse_tool_calls() normalizes every provider
+        # to {"id": ..., "name": ..., "arguments": ...}.
         tool_results: list = []
         for tc in tool_calls:
-            tool_name = tc.get("name") or tc.get("function", {}).get("name", "")
-            raw_args = tc.get("input") or tc.get("function", {}).get("arguments", {})
+            tool_name = tc.get("name", "")
+            raw_args = tc.get("arguments", {})
             if isinstance(raw_args, str):
                 try:
                     raw_args = json.loads(raw_args)
@@ -194,44 +228,49 @@ async def _run_agent_loop(
             if result != raw_result:
                 print(f"  [Summarizer] Condensed {len(raw_result):,} → {len(result):,} chars")
 
-            # Track exploit failures
-            if agent_name == "exploit" and (
-                "failed" in result.lower() or
-                "error" in result.lower()[:200] or
-                "connection refused" in result.lower()
-            ):
+            # Track exploit failures (used to trigger a HITL breakpoint when the
+            # exploit agent is stuck).
+            if agent_name == "exploit" and _looks_like_failure(result):
                 exploit_delta += 1
 
             # Update knowledge base from tool output
             updated_kb = _extract_kb_updates(tool_name, result, updated_kb)
             tool_results.append((tc, result))
 
-        # Build tool result messages (provider-specific)
+        # Build tool result messages (provider-specific).
         if provider == "anthropic":
-            result_blocks = [
-                llm.make_tool_result_message(tc, result)
+            # Anthropic bundles every tool_result block into one user message.
+            content_blocks = [
+                llm.make_tool_result_message(tc.get("id"), result)
                 for tc, result in tool_results
             ]
-            # Anthropic bundles all results in one user message
-            combined = {"role": "user", "content": []}
-            for rb in result_blocks:
-                combined["content"].extend(rb.get("content", []))
-            new_messages.append(combined)
+            new_messages.append({"role": "user", "content": content_blocks})
         else:
-            # Gemini and Ollama: one message per result
+            # Gemini and Ollama: one message per result, keyed by tool name.
             for tc, result in tool_results:
-                new_messages.append(llm.make_tool_result_message(tc, result))
+                new_messages.append(
+                    llm.make_tool_result_message(tc.get("name", ""), result)
+                )
 
     # Compute new token estimate
     all_messages = (messages + new_messages)
     new_estimate = _estimate_tokens(all_messages)
+
+    # Exploit-loop bookkeeping: accumulate consecutive failures, but reset the
+    # streak whenever the team surfaces a genuinely new high-value finding — a
+    # breakthrough means we're no longer stuck, so we shouldn't trip HITL.
+    prev_attempts = state.get("exploit_attempts", 0)
+    if _made_progress(kb, updated_kb):
+        exploit_attempts = 0
+    else:
+        exploit_attempts = prev_attempts + exploit_delta
 
     return {
         "messages": new_messages,
         "knowledge_base": updated_kb,
         "current_agent": agent_name,
         "context_token_estimate": new_estimate,
-        "exploit_attempts": state.get("exploit_attempts", 0) + exploit_delta,
+        "exploit_attempts": exploit_attempts,
     }
 
 

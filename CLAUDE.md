@@ -25,12 +25,12 @@ pip install -r requirements.txt
 
 Key packages: `anthropic`, `google-genai`, `mcp`, `langgraph`, `langchain-core`, `langgraph-checkpoint-sqlite`, `pyyaml`, `aiosqlite`.
 
-Python 3.13+ required. No test suite or linter configured.
+Python 3.12+ required. Tests use `pytest` + `pytest-asyncio` (`pip install pytest pytest-asyncio`); run with `pytest`. No linter configured.
 
 ## Architecture
 
 ```
-User → main.py → LangGraph StateGraph (SqliteSaver checkpoint)
+User → main.py → LangGraph StateGraph (AsyncSqliteSaver checkpoint)
                        │
                    supervisor ──► recon ──────────────────┐
                        ▲          exploit ───────────────►│
@@ -65,7 +65,7 @@ Each agent: LLM client → MCP tool loop → knowledge_base update → superviso
 
 - **LangChain tool wrappers** (`src/graph/tools.py`): `build_langchain_tools(mcp_client)` creates one `MCPTool(BaseTool)` instance per MCP tool, with dynamically-generated Pydantic args schemas from the MCP inputSchema. Usable standalone in LangChain agents.
 
-- **SqliteSaver checkpointing**: Every node execution is checkpointed. Sessions are identified by `thread_id` (= `session_id` in state). Resume by passing the same `thread_id` to `graph.get_state()` or by selecting a previous session at startup.
+- **AsyncSqliteSaver checkpointing**: The graph is driven with `astream`/`aget_state`, so an async checkpointer is required (the sync `SqliteSaver` raises `NotImplementedError` under async streaming). Every node execution is checkpointed. Sessions are identified by `thread_id` (= `session_id` in state). Resume by passing the same `thread_id` to `graph.aget_state()` or by selecting a previous session at startup.
 
 - **LLM abstraction**: `src/llms/base.py` defines `BaseLLMClient` ABC. Three implementations: `AnthropicClient`, `GeminiClient`, `OllamaClient`. Agent nodes instantiate these from `agents.yaml` config per-agent, so different agents can use different providers.
 

@@ -1,32 +1,38 @@
 # Filthy-Clanker
 
-An AI-powered CTF (Capture The Flag) challenge solver that uses LLMs and 130+ security tools to assist with HackTheBox challenges. It connects large language models (Claude or Gemini) to the [Hexstrike-AI](https://github.com/your-org/hexstrike-ai) tool server via the Model Context Protocol (MCP), enabling the AI to autonomously run reconnaissance, enumeration, and exploitation tools based on conversational input.
+An AI-powered CTF (Capture The Flag) challenge solver that connects LLMs to 130+ security tools via the Model Context Protocol (MCP). It uses a **LangGraph multi-agent architecture** — a Supervisor routes work between three specialized agents (Recon, Exploit, PrivEsc), an Ollama-powered summarizer distills large tool outputs, and every step is checkpointed to SQLite so sessions can be paused, resumed, and steered by a human operator.
 
 ## Architecture
 
 ```
-User Input
-    |
-Filthy-Clanker (this repo)
-    |
-LLM (Claude / Gemini) -- decides which tools to call
-    |
-MCP Client -- communicates over stdio
-    |
-Hexstrike MCP Server -- translates to HTTP
-    |
-Hexstrike Flask Server -- executes tools
-    |
-Security Tools (nmap, gobuster, etc.)
+User → main.py → LangGraph StateGraph (AsyncSqliteSaver checkpoint)
+                       │
+                   supervisor ──► recon ──────────────────┐
+                       ▲          exploit ───────────────►│
+                       │          privesc ───────────────►│
+                       │          compaction (Ollama) ───►│
+                       └──────────────────────────────────┘
+                            (loop until flag found or FINISH)
+
+Each agent: LLM client → MCP tool loop → knowledge_base update → supervisor
+                                    │
+                            Hexstrike MCP server → Flask server → nmap/gobuster/…
 ```
+
+The Supervisor decides which agent runs next based on the shared **knowledge base**
+(IPs, ports, services, credentials, flags, attack surface). It triggers a
+human-in-the-loop (HITL) breakpoint when the exploit agent stalls, and routes to the
+compaction node before the context window fills. See [CLAUDE.md](CLAUDE.md) for a full
+architecture reference.
 
 ## Prerequisites
 
-- Python 3.13+
+- Python 3.12+
 - [Hexstrike-AI](https://github.com/your-org/hexstrike-ai) cloned to `/home/kali/hexstrike-ai` (or set `HEXSTRIKE_DIR`)
 - An API key for at least one LLM provider:
   - [Anthropic](https://console.anthropic.com/) (Claude)
-  - [Google3 AI Studio](https://aistudio.google.com/) (Gemini)
+  - [Google AI Studio](https://aistudio.google.com/) (Gemini)
+  - [Ollama](https://ollama.com/) running locally (used for the summarizer, and optionally as a primary provider)
 
 ## Installation
 
@@ -37,7 +43,11 @@ cd filthy-clanker
 python3 -m venv venv
 source venv/bin/activate
 
-pip install anthropic google-genai mcp python-dotenv requests pyhackthebox
+pip install -r requirements.txt
+
+# Optional — HackTheBox commands (/spawn, /flag, …). pyhackthebox pins an old
+# `requests`, so install it without its dependency pins:
+pip install --no-deps pyhackthebox
 ```
 
 ## Configuration
@@ -80,10 +90,11 @@ On startup the program will:
 
 1. Connect to HackTheBox (if `HTB_APP_TOKEN` is set) and detect any active machine
 2. Start the Hexstrike Flask server (or detect it if already running)
-3. Prompt you to select an LLM provider (Anthropic or Gemini)
+3. Prompt you to select a primary LLM provider (Anthropic, Gemini, or Ollama)
 4. Connect to the Hexstrike MCP server and list available tools
-5. Build a system prompt tailored to the active machine (or a generic one if none is running)
-6. Enter an interactive chat loop
+5. Build the LangGraph StateGraph with SQLite checkpointing
+6. Offer a **new session** or to **resume** a previous one from its last checkpoint
+7. Run the autonomous agent loop, pausing for human input at HITL breakpoints
 
 Example session:
 
@@ -92,27 +103,31 @@ Example session:
 [*] Active machine: Headless (Linux, Easy) @ 10.10.11.8
 [*] Hexstrike server is ready.
 
-Select LLM provider:
+Select primary LLM provider:
   1) Anthropic (Claude)
   2) Gemini
-Enter 1 or 2: 1
+  3) Ollama (local)
+Enter 1, 2, or 3: 1
 
 [*] MCP session initialized.
-[*] 134 MCP tools available:
-    - nmap_scan: Run an nmap scan against a target
-    ...
+[*] 134 MCP tools available.
 
-Chat started. Type 'exit' or 'quit' to stop.
-Commands: /save [name], /resume [name], /sessions
-HTB:      /machine [name], /spawn <name>, /stop, /reset, /flag <flag>, /vpn
+[*] Session ID: session-2026-07-06-...
+[*] Running autonomous agents. Press Ctrl+C to interrupt.
 
-You: let's start with a quick scan
-[tool] Calling nmap_scan({"target": "10.10.11.8", "arguments": "-sC -sV"})
-[tool] nmap_scan returned (2340 chars)
-Assistant: Based on the scan results, I can see ports 22 (SSH) and 5000 (HTTP) are open...
+[Supervisor] → RECON | need to enumerate the target
+  [recon] → nmap_scan({"target": "10.10.11.8"})
+[Supervisor] → EXPLOIT | web service on 5000 looks promising
+  [exploit] → ...
 ```
 
-Type `exit` or `quit` to stop. On exit, the Hexstrike server is automatically shut down.
+While running:
+
+- **`Ctrl+C`** — interrupt the loop; choose to continue, inject a message, or exit
+- **HITL breakpoints** — the run pauses automatically when the exploit agent stalls
+  (too many consecutive failures) or credentials are needed; type a hint to resume
+- On exit, state is checkpointed to `sessions/checkpoint.db` and the Hexstrike server
+  is shut down. Re-run and pick **Resume** to continue from the last checkpoint.
 
 ## HackTheBox Integration
 
@@ -160,15 +175,36 @@ You: /stop
 ## Project Structure
 
 ```
+agents.yaml              # Agent definitions (model/provider/prompt) + global settings
 src/
-├── main.py              # Entry point, server management, chat loop
-├── config.py            # Dynamic system prompt builder
+├── main.py              # Entry point, server management, graph session loop, HITL
+├── config.py            # System prompt helper
 ├── htb_client.py        # HackTheBox API wrapper
-├── session.py           # Session save/resume logic
+├── session.py           # Legacy JSON session save/resume helpers
+├── data_capture.py      # Trajectory (State, Action, Result) logging for fine-tuning
+├── graph/
+│   ├── graph.py         # StateGraph assembly + AsyncSqliteSaver checkpointer
+│   ├── state.py         # TeamState + KnowledgeBase types
+│   ├── supervisor.py    # Routing brain + HITL interrupts
+│   ├── agents.py        # Recon / Exploit / PrivEsc ReAct tool loops
+│   ├── summarizer.py    # Ollama tool-output condensing + context compaction node
+│   └── tools.py         # LangChain-compatible MCP tool wrappers
 ├── llms/
 │   ├── base.py          # Abstract LLM client interface
 │   ├── anthropic_client.py  # Claude integration
-│   └── gemini_client.py     # Gemini integration
+│   ├── gemini_client.py     # Gemini integration
+│   └── ollama_client.py     # Ollama integration
 └── mcp_client/
     └── client.py        # MCP protocol client
 ```
+
+## Testing
+
+```bash
+pip install pytest pytest-asyncio
+pytest
+```
+
+The suite covers the LLM client message-shaping, the session helpers, and the
+multi-agent graph wiring (tool dispatch, knowledge-base extraction, exploit-loop
+detection, supervisor routing, and HITL interrupt/resume).

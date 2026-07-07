@@ -289,7 +289,7 @@ async def run_session(
 
     if resume:
         # Resume from checkpoint — inject a continuation message
-        current_graph_state = graph.get_state(thread_config)
+        current_graph_state = await graph.aget_state(thread_config)
         if current_graph_state.values:
             print(f"[*] Resuming session {session_id} from checkpoint.")
             input_payload = Command(resume=f"[Resuming session. Continue from where we left off. Task: {task}]")
@@ -381,7 +381,7 @@ async def run_session(
 
             elif isinstance(input_payload, Command):
                 # We sent a Command(resume=...) — check if graph still has work
-                graph_state = graph.get_state(thread_config)
+                graph_state = await graph.aget_state(thread_config)
                 if not graph_state.next:
                     print("[*] Graph completed.")
                     break
@@ -396,7 +396,7 @@ async def run_session(
         signal.signal(signal.SIGINT, prev_handler)
         # Record session end
         try:
-            final_state = graph.get_state(thread_config)
+            final_state = await graph.aget_state(thread_config)
             if final_state.values:
                 trajectory_logger.record_session_end(final_state.values)
                 stats = trajectory_logger.get_stats()
@@ -523,7 +523,7 @@ async def main():
     print(f"[*] {len(tools)} MCP tools available.")
 
     # --- Build LangGraph ---
-    checkpointer = create_checkpointer(checkpoint_db)
+    checkpointer = await create_checkpointer(checkpoint_db)
     graph = build_graph(mcp_client, config, checkpointer)
     trajectory_logger = TrajectoryLogger(training_dir)
 
@@ -619,6 +619,10 @@ async def main():
     finally:
         await mcp_client.disconnect()
         print("[*] MCP session closed.")
+        try:
+            await checkpointer.conn.close()
+        except Exception:
+            pass
         if server_proc:
             server_proc.terminate()
             server_proc.wait()

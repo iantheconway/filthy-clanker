@@ -1,4 +1,5 @@
 import json
+import os
 from typing import Any
 
 import anthropic
@@ -7,8 +8,10 @@ from .base import BaseLLMClient
 
 
 class AnthropicClient(BaseLLMClient):
-    def __init__(self, api_key: str, model: str = "claude-opus-4-6"):
-        self.client = anthropic.AsyncAnthropic(api_key=api_key)
+    def __init__(self, api_key: str | None = None, model: str = "claude-opus-4-8"):
+        # api_key defaults to the ANTHROPIC_API_KEY environment variable (the SDK
+        # reads it automatically when api_key is None).
+        self.client = anthropic.AsyncAnthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
         self.model = model
 
     @staticmethod
@@ -30,19 +33,20 @@ class AnthropicClient(BaseLLMClient):
         self,
         messages: list[dict],
         tools: list[dict],
-        system_prompt: str,
+        system: str,
     ) -> dict[str, Any]:
         formatted_tools = self.format_tools(tools)
 
         response = await self.client.messages.create(
             model=self.model,
             max_tokens=16000,
-            system=system_prompt,
+            system=system,
             messages=messages,
             tools=formatted_tools,
             thinking={
                 "type": "adaptive",
             },
+            output_config={"effort": "high"},
         )
 
         text_parts = []

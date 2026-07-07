@@ -164,7 +164,6 @@ async def supervisor_node(state: TeamState) -> dict:
     )
 
     # Parse the routing decision
-    tool_calls = llm.parse_tool_calls(response)
     assistant_msg = llm.make_assistant_message(response)
 
     # Extract text from the response

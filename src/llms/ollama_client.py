@@ -37,10 +37,10 @@ class OllamaClient(BaseLLMClient):
         self,
         messages: list[dict],
         tools: list[dict],
-        system_prompt: str,
+        system: str,
     ) -> dict[str, Any]:
         ollama_tools = self.format_tools(tools)
-        ollama_messages = [{"role": "system", "content": system_prompt}] + list(messages)
+        ollama_messages = [{"role": "system", "content": system}] + list(messages)
 
         payload = {
             "model": self.model,

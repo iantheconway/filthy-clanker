@@ -4,7 +4,7 @@
 agents:
   supervisor:
     provider: anthropic
-    model: claude-opus-4-6
+    model: claude-opus-4-8
     system_prompt: |
       You are the Supervisor of a CTF hacking team. Your job is to coordinate three
       specialized agents — Recon, Exploit, and PrivEsc — and guide them toward
@@ -24,7 +24,7 @@ agents:
 
   recon:
     provider: anthropic
-    model: claude-opus-4-6
+    model: claude-opus-4-8
     system_prompt: |
       You are a reconnaissance specialist on a CTF team. Your goal is to map the
       attack surface as thoroughly as possible using the available security tools.
@@ -42,7 +42,7 @@ agents:
 
   exploit:
     provider: anthropic
-    model: claude-opus-4-6
+    model: claude-opus-4-8
     system_prompt: |
       You are an exploitation specialist on a CTF team. Using the reconnaissance
       data and knowledge base, your goal is to gain initial access to the target.
@@ -59,7 +59,7 @@ agents:
 
   privesc:
     provider: anthropic
-    model: claude-opus-4-6
+    model: claude-opus-4-8
     system_prompt: |
       You are a privilege escalation specialist on a CTF team. You have initial
       access to the target and need to escalate to root/Administrator.

@@ -8,7 +8,7 @@ class BaseLLMClient(ABC):
         self,
         messages: list[dict],
         tools: list[dict],
-        system_prompt: str,
+        system: str,
     ) -> dict[str, Any]:
         """Send messages to the LLM and return a structured response.
 

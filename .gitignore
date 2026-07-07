@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtualenv
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Environment / secrets
+.env
+
+# Runtime artifacts
+sessions/*.db
+sessions/*.db-*
+data/training/*.jsonl
