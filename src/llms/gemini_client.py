@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Any
 
 from google import genai
@@ -13,8 +14,9 @@ logger = logging.getLogger("filthy_clanker")
 
 
 class GeminiClient(BaseLLMClient):
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, api_key: str | None = None, model: str = "gemini-2.5-flash"):
+        # api_key falls back to the GEMINI_API_KEY environment variable.
+        self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
         self.model = model
 
     @staticmethod

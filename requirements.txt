@@ -21,5 +21,10 @@ pyyaml
 requests
 aiosqlite
 
-# HTB integration (optional)
-pyhackthebox
+# HTB integration (optional).
+# pyhackthebox pins requests==2.27.1, which conflicts with the versions the
+# LLM/MCP stack needs, so it is NOT listed here — installing it normally makes
+# the whole resolve fail. If you want the /spawn, /flag, etc. HTB commands,
+# install it separately without its dependency pins:
+#     pip install --no-deps pyhackthebox
+# (The rest of the app runs fine without it; HTB commands are simply disabled.)

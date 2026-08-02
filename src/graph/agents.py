@@ -140,7 +140,9 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase,
         service = (match.group(3) or "unknown").strip()
         # Associate with the first known IP or "target"
         target_ip = (kb.get("ips") or ["target"])[0]
-        ports = kb.get("open_ports", {})
+        # Copy nested containers before mutating — kb may be checkpointed shared
+        # state, and a shallow dict(kb) still aliases these inner dicts/lists.
+        ports = dict(kb.get("open_ports", {}))
         ports_for_ip = ports.get(target_ip, [])
         if port not in ports_for_ip:
             ports_for_ip = sorted(set(ports_for_ip + [port]))
@@ -149,7 +151,7 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase,
 
         # Record service
         key = f"{target_ip}:{port}"
-        services = kb.get("services", {})
+        services = dict(kb.get("services", {}))
         if key not in services:
             services[key] = service
             kb["services"] = services
@@ -162,7 +164,7 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase,
     users = re.findall(r'(?:username|user|login)\s*[=:]\s*(\S+)', tool_result, re.IGNORECASE)
     passwords = re.findall(r'(?:password|passwd|pwd)\s*[=:]\s*(\S+)', tool_result, re.IGNORECASE)
     if users and passwords:
-        creds = kb.get("credentials", [])
+        creds = list(kb.get("credentials", []))
         for u, p in zip(users, passwords):
             entry = {"user": u, "pass": p}
             if entry not in creds:
