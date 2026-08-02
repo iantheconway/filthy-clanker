@@ -1,0 +1,20 @@
+# profiles/opus.yaml — "Opus everywhere" overlay.
+#
+# Overlaid on agents.yaml at load time (deep-merged): every reasoning/worker
+# agent runs on Claude Opus. Only provider/model are set here — prompts, tool
+# allowlists, and settings are inherited from agents.yaml.
+#
+# refusal_specialist is intentionally NOT overridden: its job is to handle
+# responses that a safety-tuned model refused, so it must stay on the abliterated
+# local model from agents.yaml. Pointing it at Opus would defeat its purpose.
+#
+# Run with:  python src/main.py --profile opus   (then pick "per-agent config")
+# Tip: bump model to claude-opus-5 once it's enabled on your account.
+agents:
+  supervisor:  {provider: anthropic, model: claude-opus-4-8}
+  recon:       {provider: anthropic, model: claude-opus-4-8}
+  exploit:     {provider: anthropic, model: claude-opus-4-8}
+  privesc:     {provider: anthropic, model: claude-opus-4-8}
+  webexplorer: {provider: anthropic, model: claude-opus-4-8}
+  vulnsearch:  {provider: anthropic, model: claude-opus-4-8}
+  summarizer:  {provider: anthropic, model: claude-opus-4-8}

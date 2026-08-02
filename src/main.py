@@ -8,6 +8,7 @@ Entry point. Orchestrates:
   4. Interactive HITL loop with autonomous agent execution
   5. Trajectory logging to data/training/
 """
+import argparse
 import asyncio
 import logging
 import os
@@ -20,11 +21,10 @@ import uuid
 from datetime import datetime
 
 import requests
-import yaml
 from dotenv import load_dotenv
 from langgraph.types import Command
 
-from config import build_system_prompt
+from config import build_system_prompt, load_config, list_profiles
 from htb_client import HTB
 from mcp_client import HexstrikeMCPClient, MCPClientPool
 from graph import build_graph, create_checkpointer, TeamState
@@ -153,13 +153,23 @@ def start_hexstrike_server() -> subprocess.Popen | None:
 # Configuration loading
 # ---------------------------------------------------------------------------
 
-def load_config(path: str = "agents.yaml") -> dict:
-    """Load and return the agents.yaml config dict."""
-    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), path)
-    if not os.path.exists(config_path):
-        sys.exit(f"Error: {config_path} not found. Copy agents.yaml.example or check the path.")
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+def _parse_cli_args() -> "argparse.Namespace":
+    """Parse launch-time config selection flags.
+
+    --config PATH   base config file (default agents.yaml, env AGENTS_CONFIG)
+    --profile NAME  overlay from profiles/ (env AGENTS_PROFILE); e.g. opus, cheap, ollama
+    Unknown args are ignored so this stays compatible with any future flags.
+    """
+    parser = argparse.ArgumentParser(
+        prog="filthy-clanker",
+        description="AI-powered CTF solver (LangGraph multi-agent).",
+    )
+    parser.add_argument("--config", default=os.getenv("AGENTS_CONFIG", "agents.yaml"),
+                        help="Base config file (default: agents.yaml).")
+    parser.add_argument("--profile", default=os.getenv("AGENTS_PROFILE"),
+                        help="Overlay profile from profiles/ (e.g. opus, cheap, ollama).")
+    args, _ = parser.parse_known_args()
+    return args
 
 
 def select_provider(config: dict) -> str | None:
@@ -599,8 +609,18 @@ def _log_node_trajectories(node_name: str, output: dict, logger: TrajectoryLogge
 async def main():
     load_dotenv()
 
-    # --- Load config ---
-    config = load_config("agents.yaml")
+    # --- Load config (optionally with an overlay profile) ---
+    args = _parse_cli_args()
+    try:
+        config = load_config(args.config, args.profile)
+    except FileNotFoundError as exc:
+        sys.exit(f"Error: {exc}")
+    if args.profile:
+        print(f"[*] Config: {args.config} + profile '{args.profile}'")
+    else:
+        available = ", ".join(list_profiles()) or "(none)"
+        print(f"[*] Config: {args.config} (no profile). Available profiles: {available}")
+        print("    Select one with --profile <name> or AGENTS_PROFILE=<name>.")
     settings = config.get("settings", {})
     checkpoint_db = settings.get("checkpoint_db", "sessions/checkpoint.db")
     training_dir = settings.get("training_data_dir", "data/training")
