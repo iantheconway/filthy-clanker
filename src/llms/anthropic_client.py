@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Any
 
 import anthropic
@@ -13,8 +14,13 @@ logger = logging.getLogger("filthy_clanker")
 
 
 class AnthropicClient(BaseLLMClient):
-    def __init__(self, api_key: str, model: str = "claude-opus-4-6"):
-        self.client = wrap_anthropic(anthropic.AsyncAnthropic(api_key=api_key))
+    def __init__(self, api_key: str | None = None, model: str = "claude-opus-4-6"):
+        # api_key falls back to the ANTHROPIC_API_KEY environment variable so the
+        # graph can construct a client with only model= (the SDK also reads the
+        # env var itself, but we pass it explicitly to keep the wrap consistent).
+        self.client = wrap_anthropic(
+            anthropic.AsyncAnthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
+        )
         self.model = model
 
     @staticmethod
