@@ -47,13 +47,16 @@ WORKDIR /home/kali/filthy-clanker
 # breaks the whole resolve. Install everything else first, then pyhackthebox with
 # --no-deps so the optional HTB commands still work without dragging in the bad
 # pin. (Robust whether or not requirements.txt still lists pyhackthebox.)
+#
+# NOTE: Hexstrike's own requirements (angr, pwntools, mitmproxy, selenium, …) are
+# deliberately NOT installed here. Hexstrike is designed to run in its own venv
+# (see its requirements.txt header and MCP_COMMAND in .env.example), and that
+# stack needs a C/Rust build toolchain and is ~1GB+. Standing up the Hexstrike
+# env is a separate step, tracked outside SPEC-01; this image only clones it.
 COPY requirements.txt ./
 RUN grep -viE '^[[:space:]]*pyhackthebox([[:space:]<>=!~;#].*)?$' requirements.txt > /tmp/requirements.core.txt \
     && pip install --break-system-packages --no-cache-dir -r /tmp/requirements.core.txt \
-    && pip install --break-system-packages --no-cache-dir --no-deps pyhackthebox \
-    && if [ -f "$HEXSTRIKE_DIR/requirements.txt" ]; then \
-         pip install --break-system-packages --no-cache-dir -r "$HEXSTRIKE_DIR/requirements.txt"; \
-       fi
+    && pip install --break-system-packages --no-cache-dir --no-deps pyhackthebox
 
 # --- Harness source -----------------------------------------------------------
 COPY . .
