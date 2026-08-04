@@ -1,4 +1,5 @@
 import os
+import re
 
 import yaml
 
@@ -11,6 +12,34 @@ _GUIDANCE = (
 
 # Directory (relative to project root) holding thin per-run config overlays.
 _PROFILES_DIR = "profiles"
+
+# ${VAR} or ${VAR:-default} — shell/compose-style interpolation used in the config
+# so a single OLLAMA_HOST env var flips the whole team between local and cloud.
+_ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _expand_env(value, missing: set):
+    """Recursively expand ${VAR} / ${VAR:-default} in every string in ``value``.
+
+    A ${VAR} with no default whose variable is unset is left untouched and its
+    name is collected in ``missing`` so the caller can fail loudly with the full
+    list rather than silently substituting an empty string.
+    """
+    if isinstance(value, str):
+        def _repl(m: "re.Match") -> str:
+            name, default = m.group(1), m.group(2)
+            if name in os.environ:
+                return os.environ[name]
+            if default is not None:
+                return default
+            missing.add(name)
+            return m.group(0)
+        return _ENV_VAR_RE.sub(_repl, value)
+    if isinstance(value, dict):
+        return {k: _expand_env(v, missing) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env(v, missing) for v in value]
+    return value
 
 
 def _project_root() -> str:
@@ -89,6 +118,19 @@ def load_config(path: str = "agents.yaml", profile: str | None = None) -> dict:
         with open(overlay_path, "r", encoding="utf-8") as fh:
             overlay = yaml.safe_load(fh) or {}
         config = _deep_merge(config, overlay)
+
+    # Interpolate ${VAR} / ${VAR:-default} from the environment (e.g. the
+    # Ollama-only agents.yaml sets host: "${OLLAMA_HOST}"). Fail loudly if a
+    # referenced variable has no value and no default — a silent empty host would
+    # surface much later as an opaque connection error.
+    missing: set = set()
+    config = _expand_env(config, missing)
+    if missing:
+        raise RuntimeError(
+            "Config references unset environment variable(s): "
+            f"{', '.join(sorted(missing))}. Set them before starting "
+            "(e.g. OLLAMA_HOST=http://host.docker.internal:11434)."
+        )
 
     return config
 

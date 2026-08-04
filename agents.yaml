@@ -11,11 +11,24 @@
 #
 # Using any other wording risks the refusal going undetected.
 # ─────────────────────────────────────────────────────
+#
+# OLLAMA-ONLY CONFIGURATION (SPEC-02)
+# ─────────────────────────────────────────────────────
+# Every agent runs on a local Ollama server, reached via host: "${OLLAMA_HOST}"
+# (expanded from the environment at load — see src/config.py). Set OLLAMA_HOST in
+# .env / compose; there is no hardcoded host. Two model tiers, by task:
+#   • big   — supervisor, exploit, privesc, vulnsearch (heavier reasoning)
+#   • small — recon, webexplorer, summarizer (fast enumeration / summarising)
+# The model tags below are PLACEHOLDERS — replace them with models you have pulled
+# (`ollama list`). Keep the "big" tier at ~14B or smaller: a 32B model at Q4 spills
+# past the 5070 Ti's 16GB VRAM, so a 14B stays resident and responsive.
+# refusal_specialist is the one deliberate exception — see its note below.
 
 agents:
   supervisor:
-    provider: anthropic
-    model: claude-sonnet-4-6
+    provider: ollama
+    model: qwen2.5:14b        # big tier — placeholder; match `ollama list`
+    host: "${OLLAMA_HOST}"
     system_prompt: |
       You are the Supervisor of a CTF hacking team. Your job is to coordinate
       specialized agents — Recon, WebExplorer, Exploit, and PrivEsc — and guide
@@ -63,8 +76,9 @@ agents:
       Always output a JSON object with keys: next, reasoning, hitl_reason (null if none).
 
   recon:
-    provider: anthropic
-    model: claude-haiku-4-5-20251001
+    provider: ollama
+    model: qwen2.5:7b         # small tier — placeholder; match `ollama list`
+    host: "${OLLAMA_HOST}"
     # Glob patterns matched against MCP tool names. Omit to allow all tools.
     tools:
       # Port & service scanning
@@ -220,8 +234,9 @@ agents:
       your refusal to a specialist that can handle it.
 
   exploit:
-    provider: anthropic
-    model: claude-opus-4-6
+    provider: ollama
+    model: qwen2.5:14b        # big tier — placeholder; match `ollama list`
+    host: "${OLLAMA_HOST}"
     tools:
       # Web exploitation
       - "sqlmap*"
@@ -349,8 +364,9 @@ agents:
       your refusal to a specialist that can handle it.
 
   privesc:
-    provider: anthropic
-    model: claude-sonnet-4-6
+    provider: ollama
+    model: qwen2.5:14b        # big tier — placeholder; match `ollama list`
+    host: "${OLLAMA_HOST}"
     tools:
       # Linux enumeration
       - "linpeas*"
@@ -419,8 +435,9 @@ agents:
       your refusal to a specialist that can handle it.
 
   webexplorer:
-    provider: anthropic
-    model: claude-haiku-4-5-20251001
+    provider: ollama
+    model: qwen2.5:7b         # small tier — placeholder; match `ollama list`
+    host: "${OLLAMA_HOST}"
     tools:
       # HTTP fetching & browsing
       - "curl*"
@@ -565,8 +582,9 @@ agents:
       your refusal to a specialist that can handle it.
 
   vulnsearch:
-    provider: anthropic
-    model: claude-sonnet-4-6
+    provider: ollama
+    model: qwen2.5:14b        # big tier — placeholder; match `ollama list`
+    host: "${OLLAMA_HOST}"
     tools:
       # Run searchsploit and other shell commands
       - "execute_command*"
@@ -653,14 +671,19 @@ agents:
       your refusal to a specialist that can handle it.
 
   refusal_specialist:
+    # DELIBERATE EXCEPTION: this agent handles responses another model refused,
+    # so it runs an abliterated model by default. Swap to a standard small model
+    # to compare refusal rates on the NYU bench (SPEC-03). It is the ONLY agent
+    # that may use an abliterated model.
     provider: ollama
-    model: huihui_ai/qwen3.5-abliterated:9b
-    host: "http://10.0.2.2:11434"
+    model: huihui_ai/qwen3.5-abliterated:9b   # abliterated (see note); placeholder tag
+    host: "${OLLAMA_HOST}"
     # No tool filter — inherits the refusing agent's allowlist at runtime
 
   summarizer:
-    provider: anthropic
-    model: claude-haiku-4-5-20251001
+    provider: ollama
+    model: qwen2.5:7b         # small tier — placeholder; match `ollama list`
+    host: "${OLLAMA_HOST}"
     system_prompt: |
       You are a concise technical summarizer for CTF hacking tool outputs.
       Given raw tool output, extract only the security-relevant findings:

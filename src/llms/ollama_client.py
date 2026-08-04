@@ -12,7 +12,7 @@ from .base import BaseLLMClient
 
 logger = logging.getLogger("filthy_clanker")
 
-_DEFAULT_HOST = "http://10.0.2.2:11434"
+_DEFAULT_HOST = "http://host.docker.internal:11434"
 
 
 class OllamaClient(BaseLLMClient):

@@ -4,6 +4,10 @@ Profiles are thin overlays in profiles/ that change only per-agent
 provider/model/host; everything else (prompts, tool allowlists, most settings)
 is inherited from agents.yaml. These tests pin that contract.
 """
+import os
+
+import pytest
+
 import config
 
 
@@ -49,7 +53,27 @@ def test_base_config_loads():
 
 def test_profiles_are_discoverable():
     profiles = config.list_profiles()
-    assert {"opus", "cheap", "ollama"} <= set(profiles)
+    # opus/cheap flip the Ollama base to hosted Claude for frontier comparison.
+    # There is no "ollama" profile — the base agents.yaml is already Ollama-only.
+    assert {"opus", "cheap"} <= set(profiles)
+    assert "ollama" not in profiles
+
+
+def test_base_config_is_ollama_only_with_host_expanded():
+    cfg = config.load_config("agents.yaml")  # OLLAMA_HOST defaulted in conftest
+    providers = {c["provider"] for c in cfg["agents"].values()}
+    assert providers == {"ollama"}
+    # host: "${OLLAMA_HOST}" is interpolated from the env, not left literal.
+    assert cfg["agents"]["supervisor"]["host"] == os.environ["OLLAMA_HOST"]
+    assert "${" not in cfg["agents"]["supervisor"]["host"]
+
+
+def test_only_refusal_specialist_may_use_an_abliterated_model():
+    cfg = config.load_config("agents.yaml")
+    for name, c in cfg["agents"].items():
+        if name == "refusal_specialist":
+            continue
+        assert "abliterated" not in c["model"].lower(), name
 
 
 def test_opus_profile_sets_every_worker_to_opus_but_keeps_prompts():
@@ -69,25 +93,42 @@ def test_cheap_profile_uses_haiku():
     assert "haiku" in cfg["agents"]["exploit"]["model"]
 
 
-def test_ollama_profile_switches_provider_and_lowers_thresholds():
-    base = config.load_config("agents.yaml")
-    cfg = config.load_config("agents.yaml", profile="ollama")
-    assert cfg["agents"]["exploit"]["provider"] == "ollama"
-    assert cfg["agents"]["exploit"]["host"]  # host supplied for the local server
-    # Settings overlay narrows the context window for small local models.
-    assert cfg["settings"]["context_limit_threshold"] < base["settings"]["context_limit_threshold"]
-
-
-def test_refusal_specialist_stays_local_across_profiles():
-    """refusal_specialist must remain on the abliterated local model in every
-    profile — its role is to answer where a safety-tuned model refused."""
-    for profile in ("opus", "cheap", "ollama"):
+def test_refusal_specialist_stays_ollama_across_profiles():
+    """refusal_specialist stays on its local (abliterated) model even when a
+    profile flips the other agents to a hosted provider."""
+    for profile in (None, "opus", "cheap"):
         cfg = config.load_config("agents.yaml", profile=profile)
         assert cfg["agents"]["refusal_specialist"]["provider"] == "ollama"
 
 
 def test_unknown_profile_raises_with_available_list():
-    import pytest
     with pytest.raises(FileNotFoundError) as exc:
         config.load_config("agents.yaml", profile="does-not-exist")
     assert "opus" in str(exc.value)  # error lists what IS available
+
+
+# ---------------------------------------------------------------------------
+# Environment interpolation (${VAR} / ${VAR:-default})
+# ---------------------------------------------------------------------------
+
+def test_env_expansion_uses_value_then_default(monkeypatch):
+    monkeypatch.setenv("FC_TEST_VAR", "xyz")
+    missing = set()
+    assert config._expand_env("a-${FC_TEST_VAR}-b", missing) == "a-xyz-b"
+    monkeypatch.delenv("FC_TEST_VAR", raising=False)
+    assert config._expand_env("${FC_TEST_VAR:-fallback}", missing) == "fallback"
+    assert missing == set()  # default satisfied the unset var
+
+
+def test_env_expansion_collects_missing_unset_vars():
+    missing = set()
+    out = config._expand_env({"host": "${FC_DEFINITELY_UNSET}"}, missing)
+    assert out == {"host": "${FC_DEFINITELY_UNSET}"}  # left untouched
+    assert "FC_DEFINITELY_UNSET" in missing
+
+
+def test_load_config_raises_when_ollama_host_unset(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    with pytest.raises(RuntimeError) as exc:
+        config.load_config("agents.yaml")
+    assert "OLLAMA_HOST" in str(exc.value)

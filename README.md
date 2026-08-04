@@ -156,7 +156,7 @@ agents:
   refusal_specialist:
     provider: ollama
     model: huihui_ai/qwen3.5-abliterated:9b
-    host: "http://10.0.2.2:11434"
+    host: "http://host.docker.internal:11434"
 
 settings:
   tool_output_threshold: 4000    # chars before auto-summarisation

@@ -1,0 +1,67 @@
+# docker-compose.yml — SPEC-02
+#
+# One knob flips the whole stack between local and cloud: OLLAMA_HOST. Ollama is
+# NOT a service here — it runs on the host (with the GPUs) and is reached over the
+# network. Locally that's host.docker.internal; in the cloud, an explicit host:port.
+#
+#   Local:  docker compose up --build
+#   Cloud:  OLLAMA_HOST=http://<box>:11434 docker compose up --build
+#   Eval:   docker compose --profile eval up --build   (also starts nyu-bench)
+#
+# Host prep (see README): set system env OLLAMA_HOST=0.0.0.0:11434 and restart
+# Ollama so the container can reach it; firewall-scope 11434 to the Docker/WSL subnet.
+
+services:
+  harness:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: filthy-clanker:latest
+    env_file:
+      - path: .env
+        required: false        # .env is optional; OLLAMA_HOST can come from the shell
+    environment:
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
+      HEXSTRIKE_DIR: /home/kali/hexstrike-ai
+      HEXSTRIKE_PORT: "8888"
+    # Narrow raw-socket capabilities for the scanning tools — never --privileged.
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    # Make host.docker.internal resolve on Linux hosts and cloud too (not just
+    # Docker Desktop, which provides it automatically).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./:/home/kali/filthy-clanker                                   # live code (dev)
+      - clanker-sessions:/home/kali/filthy-clanker/sessions            # checkpoint db
+      - clanker-logs:/home/kali/filthy-clanker/logs                    # per-session logs
+      - clanker-training:/home/kali/filthy-clanker/data/training       # trajectories
+    stdin_open: true            # main.py has interactive startup prompts
+    tty: true
+    restart: unless-stopped
+
+  # NYU CTF benchmark runner — only starts under the `eval` profile.
+  # Its image/Dockerfile and runner wiring land in SPEC-03; the service is defined
+  # here so the eval profile and its host-Docker-socket mount are in place.
+  nyu-bench:
+    profiles: ["eval"]
+    build:
+      context: ./evals/nyu_bench
+    image: filthy-clanker-nyu-bench:latest
+    environment:
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Launch per-challenge containers as SIBLINGS via the host daemon, not
+      # Docker-in-Docker.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - clanker-eval-results:/results
+    restart: "no"
+
+volumes:
+  clanker-sessions:
+  clanker-logs:
+  clanker-training:
+  clanker-eval-results:

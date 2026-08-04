@@ -39,7 +39,7 @@ HEXSTRIKE_PORT = os.getenv("HEXSTRIKE_PORT", "8888")
 HEXSTRIKE_VENV_PYTHON = os.path.join(HEXSTRIKE_DIR, "hexstrike-env", "bin", "python3")
 HEXSTRIKE_SERVER_SCRIPT = os.path.join(HEXSTRIKE_DIR, "hexstrike_server.py")
 HEXSTRIKE_MCP_SCRIPT = os.path.join(HEXSTRIKE_DIR, "hexstrike_mcp.py")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
 
 _sigint_received = False
 _active_task: asyncio.Task | None = None
@@ -208,7 +208,7 @@ def _select_and_set_ollama_model(config: dict) -> None:
     If the configured host is unreachable, prompts the user to enter the correct one."""
     default_host = (
         config.get("agents", {}).get("summarizer", {}).get("host")
-        or os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+        or os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
     )
 
     # Try up to 3 hosts (let user correct if needed)
