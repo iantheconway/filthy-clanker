@@ -1,0 +1,28 @@
+# Secrets — never bake credentials into the image. Keep the example only.
+.env
+*.env
+!.env.example
+
+# Runtime artifacts (mounted as volumes at run time, not part of the image)
+sessions/
+logs/
+data/training/
+
+# Local virtualenvs
+venv/
+.venv/
+
+# Benchmark is not part of the app image (built separately under the eval profile)
+evals/nyu_bench/
+
+# Python cruft
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# VCS + editor/IDE
+.git/
+.gitignore
+.idea/
+.vscode/
