@@ -16,18 +16,24 @@
 # ─────────────────────────────────────────────────────
 # Every agent runs on a local Ollama server, reached via host: "${OLLAMA_HOST}"
 # (expanded from the environment at load — see src/config.py). Set OLLAMA_HOST in
-# .env / compose; there is no hardcoded host. Two model tiers, by task:
-#   • big   — supervisor, exploit, privesc, vulnsearch (heavier reasoning)
-#   • small — recon, webexplorer, summarizer (fast enumeration / summarising)
-# The model tags below are PLACEHOLDERS — replace them with models you have pulled
-# (`ollama list`). Keep the "big" tier at ~14B or smaller: a 32B model at Q4 spills
-# past the 5070 Ti's 16GB VRAM, so a 14B stays resident and responsive.
-# refusal_specialist is the one deliberate exception — see its note below.
+# .env / compose; there is no hardcoded host.
+#
+# Models are ALL ABLITERATED — this is offensive-security work, which safety-tuned
+# models refuse. Swap tags for models you have pulled (`ollama list`):
+#   • Worker agents (supervisor, recon, webexplorer, vulnsearch, exploit, privesc):
+#       huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M — Qwen3 MoE (~3B active, so fast
+#       despite 30B total), tool-calling. ~18GB, resident across the dual GPUs.
+#   • summarizer + refusal_specialist:
+#       huihui_ai/qwen3.5-abliterated:9b — cheap, 262k ctx. ~6.6GB.
+# Both stay resident together (~24.6GB of the 16+11GB GPUs) so the graph doesn't
+# thrash reloading models as it hops between agents.
+# refusal_specialist keeps its abliterated model as the one deliberate exception
+# (see its note below) — standard-vs-abliterated is the SPEC-03 refusal-rate study.
 
 agents:
   supervisor:
     provider: ollama
-    model: qwen2.5:14b        # big tier — placeholder; match `ollama list`
+    model: huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M   # Qwen3 30B-A3B MoE, abliterated (fast: ~3B active, no refusals, tools)
     host: "${OLLAMA_HOST}"
     system_prompt: |
       You are the Supervisor of a CTF hacking team. Your job is to coordinate
@@ -77,7 +83,7 @@ agents:
 
   recon:
     provider: ollama
-    model: qwen2.5:7b         # small tier — placeholder; match `ollama list`
+    model: huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M   # Qwen3 30B-A3B MoE, abliterated (fast: ~3B active, no refusals, tools)
     host: "${OLLAMA_HOST}"
     # Glob patterns matched against MCP tool names. Omit to allow all tools.
     tools:
@@ -235,7 +241,7 @@ agents:
 
   exploit:
     provider: ollama
-    model: qwen2.5:14b        # big tier — placeholder; match `ollama list`
+    model: huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M   # Qwen3 30B-A3B MoE, abliterated (fast: ~3B active, no refusals, tools)
     host: "${OLLAMA_HOST}"
     tools:
       # Web exploitation
@@ -365,7 +371,7 @@ agents:
 
   privesc:
     provider: ollama
-    model: qwen2.5:14b        # big tier — placeholder; match `ollama list`
+    model: huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M   # Qwen3 30B-A3B MoE, abliterated (fast: ~3B active, no refusals, tools)
     host: "${OLLAMA_HOST}"
     tools:
       # Linux enumeration
@@ -436,7 +442,7 @@ agents:
 
   webexplorer:
     provider: ollama
-    model: qwen2.5:7b         # small tier — placeholder; match `ollama list`
+    model: huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M   # Qwen3 30B-A3B MoE, abliterated (fast: ~3B active, no refusals, tools)
     host: "${OLLAMA_HOST}"
     tools:
       # HTTP fetching & browsing
@@ -583,7 +589,7 @@ agents:
 
   vulnsearch:
     provider: ollama
-    model: qwen2.5:14b        # big tier — placeholder; match `ollama list`
+    model: huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M   # Qwen3 30B-A3B MoE, abliterated (fast: ~3B active, no refusals, tools)
     host: "${OLLAMA_HOST}"
     tools:
       # Run searchsploit and other shell commands
@@ -682,7 +688,7 @@ agents:
 
   summarizer:
     provider: ollama
-    model: qwen2.5:7b         # small tier — placeholder; match `ollama list`
+    model: huihui_ai/qwen3.5-abliterated:9b   # Qwen3.5 9B abliterated (cheap summarising, 262k ctx)
     host: "${OLLAMA_HOST}"
     system_prompt: |
       You are a concise technical summarizer for CTF hacking tool outputs.

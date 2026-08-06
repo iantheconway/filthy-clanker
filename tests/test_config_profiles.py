@@ -68,14 +68,6 @@ def test_base_config_is_ollama_only_with_host_expanded():
     assert "${" not in cfg["agents"]["supervisor"]["host"]
 
 
-def test_only_refusal_specialist_may_use_an_abliterated_model():
-    cfg = config.load_config("agents.yaml")
-    for name, c in cfg["agents"].items():
-        if name == "refusal_specialist":
-            continue
-        assert "abliterated" not in c["model"].lower(), name
-
-
 def test_opus_profile_sets_every_worker_to_opus_but_keeps_prompts():
     base = config.load_config("agents.yaml")
     cfg = config.load_config("agents.yaml", profile="opus")
