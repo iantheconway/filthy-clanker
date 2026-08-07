@@ -139,8 +139,12 @@ def _compose_run(compose_file: Path, *args: str, check: bool = True) -> subproce
 # ---------------------------------------------------------------------------
 
 def load_config(path: Path) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+    # Delegate to the harness loader so ${OLLAMA_HOST}/${VAR} interpolation (and
+    # profile overlays) are applied. A bare yaml.safe_load would leave
+    # host: "${OLLAMA_HOST}" literal, and the Ollama client would POST to an
+    # invalid URL ("${OLLAMA_HOST}/api/chat").
+    from config import load_config as _load_agent_config
+    return _load_agent_config(str(path))
 
 
 def validate_api_keys(config: dict) -> None:
