@@ -353,6 +353,22 @@ class FlagCheckingMCPPool:
 # Docker helpers
 # ---------------------------------------------------------------------------
 
+def ensure_ctfnet_network() -> None:
+    """NYU challenge compose files attach to an external `ctfnet` network. Create
+    it on the host daemon if missing so `docker-compose up` doesn't fail with
+    'network ctfnet declared as external, but could not be found'."""
+    try:
+        import docker as _docker
+        client = _docker.from_env(timeout=5)
+        if not client.networks.list(names=["ctfnet"]):
+            client.networks.create("ctfnet", driver="bridge")
+            log.info("Created external 'ctfnet' network for challenge containers.")
+        else:
+            log.info("ctfnet network present.")
+    except Exception as exc:
+        log.warning("Could not ensure ctfnet network (%s); container challenges may fail.", exc)
+
+
 def _start_container(compose_file: Path) -> None:
     """Bring up all services defined in a docker-compose file."""
     _compose_run(compose_file, "up", "-d", "--force-recreate")
@@ -384,7 +400,10 @@ def _get_exposed_port(compose_file: Path, internal_port: int) -> Optional[str]:
                 key = f"{internal_port}/{proto}"
                 bindings = container.ports.get(key) or []
                 if bindings:
-                    return f"127.0.0.1:{bindings[0]['HostPort']}"
+                    # host.docker.internal, not 127.0.0.1: the harness runs inside
+                    # the eval container, so the challenge's published port lives on
+                    # the host, not on loopback.
+                    return f"host.docker.internal:{bindings[0]['HostPort']}"
     except Exception as exc:
         log.debug("Docker SDK port lookup failed: %s", exc)
 
@@ -399,8 +418,9 @@ def _get_exposed_port(compose_file: Path, internal_port: int) -> Optional[str]:
             r = _compose_run(compose_file, "port", services[0], str(internal_port), check=False)
             out = r.stdout.decode(errors="replace").strip()
             if r.returncode == 0 and out:
-                # output is '0.0.0.0:PORT' or '127.0.0.1:PORT'
-                return f"127.0.0.1:{out.split(':')[-1]}"
+                # output is '0.0.0.0:PORT' or '127.0.0.1:PORT'; the port is on the
+                # host, reached from the eval container via host.docker.internal.
+                return f"host.docker.internal:{out.split(':')[-1]}"
     except Exception as exc:
         log.debug("docker-compose port fallback failed: %s", exc)
 
@@ -1030,6 +1050,9 @@ async def main() -> None:
             "attempted without a container environment (expect failures).\n"
             "  To fix: sudo apt install docker-compose   (or docker-compose-plugin)"
         )
+
+    # ── Ensure the shared challenge network exists ───────────────────────────
+    ensure_ctfnet_network()
 
     # ── Start Hexstrike ──────────────────────────────────────────────────────
     global _hexstrike_proc
