@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import os
+import time
 import uuid
 from typing import Any
 
@@ -13,6 +15,47 @@ from .base import BaseLLMClient
 logger = logging.getLogger("filthy_clanker")
 
 _DEFAULT_HOST = "http://host.docker.internal:11434"
+
+# Hardening knobs (env-overridable).
+#   OLLAMA_MAX_RETRIES  — attempts per call before giving up (transient + one 4xx retry)
+#   OLLAMA_NUM_CTX      — if set, passed as options.num_ctx so long conversations
+#                         don't overflow the model's default window. NOT set by
+#                         default (a large num_ctx grows KV-cache VRAM and can OOM).
+_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
+
+
+def _num_ctx_option() -> dict:
+    raw = os.getenv("OLLAMA_NUM_CTX", "").strip()
+    if not raw:
+        return {}
+    try:
+        return {"num_ctx": int(raw)}
+    except ValueError:
+        return {}
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Exponential backoff capped at 8s: 0.5, 1, 2, 4, 8…"""
+    return min(8.0, 0.5 * (2 ** (attempt - 1)))
+
+
+def _sanitize_messages(messages: list[dict]) -> list[dict]:
+    """Keep the conversation well-formed for Ollama's /api/chat.
+
+    Ollama (and the underlying chat templates) reject two or more assistant
+    messages in a row — "Cannot have 2 or more assistant messages at the end of
+    the list" (HTTP 400). This happens in the multi-agent graph whenever agents
+    return back-to-back tool-less "report" turns (the shared message history then
+    holds consecutive assistant messages). Insert a minimal user turn between any
+    two adjacent assistant messages so the history stays valid without losing
+    either agent's output.
+    """
+    out: list[dict] = []
+    for m in messages:
+        if out and out[-1].get("role") == "assistant" and m.get("role") == "assistant":
+            out.append({"role": "user", "content": "Continue."})
+        out.append(m)
+    return out
 
 
 class OllamaClient(BaseLLMClient):
@@ -50,7 +93,6 @@ class OllamaClient(BaseLLMClient):
             rt.name = f"Ollama / {self.model}"
 
         ollama_tools = self.format_tools(tools)
-        ollama_messages = [{"role": "system", "content": system_prompt}] + list(messages)
 
         last_content = ""
         if messages:
@@ -62,32 +104,80 @@ class OllamaClient(BaseLLMClient):
                     system_prompt.replace("\n", " "))
         logger.info("[Ollama] LAST_MSG %.300s", last_content.replace("\n", " "))
 
-        payload = {
-            "model": self.model,
-            "messages": ollama_messages,
-            "tools": ollama_tools,
-            "stream": False,
-        }
+        options = _num_ctx_option()
+        system_msg = {"role": "system", "content": system_prompt}
+
+        def _payload(msgs: list[dict]) -> dict:
+            p = {
+                "model": self.model,
+                # Sanitize so trimming/accumulation never yields consecutive
+                # assistant messages (Ollama 400s on those).
+                "messages": _sanitize_messages([system_msg] + list(msgs)),
+                "tools": ollama_tools,
+                "stream": False,
+            }
+            if options:
+                p["options"] = options
+            return p
 
         def _call():
-            try:
-                resp = requests.post(
-                    f"{self.host}/api/chat",
-                    json=payload,
-                    timeout=(10, None),  # 10s connect, no read timeout
-                )
-                resp.raise_for_status()
-                return resp.json()
-            except requests.Timeout:
-                logger.error("[Ollama] CONNECT TIMEOUT (>10s)  model=%s  host=%s",
-                             self.model, self.host)
-                raise
-            except requests.HTTPError as exc:
-                logger.error("[Ollama] HTTP ERROR %s  model=%s", exc, self.model)
-                raise
-            except requests.RequestException as exc:
-                logger.error("[Ollama] REQUEST ERROR %s: %s", type(exc).__name__, exc)
-                raise
+            """POST /api/chat with retries.
+
+            - Transient failures (connect timeout, connection error, HTTP 5xx) are
+              retried with exponential backoff.
+            - HTTP 4xx (e.g. Ollama's 400 on an over-long or malformed context) is
+              logged WITH the response body, then retried once against a trimmed
+              conversation (oldest non-system turns dropped) in case the window
+              overflowed. Persistent failure re-raises for the caller to handle.
+            """
+            msgs = list(messages)
+            last_exc: Exception | None = None
+            for attempt in range(1, _MAX_RETRIES + 1):
+                try:
+                    resp = requests.post(
+                        f"{self.host}/api/chat",
+                        json=_payload(msgs),
+                        timeout=(10, None),  # 10s connect, no read timeout
+                    )
+                    if resp.status_code >= 400:
+                        body = resp.text[:600].replace("\n", " ")
+                        logger.error(
+                            "[Ollama] HTTP %d (attempt %d/%d) model=%s body=%.600s",
+                            resp.status_code, attempt, _MAX_RETRIES, self.model, body,
+                        )
+                        # 4xx is usually deterministic; the one thing worth retrying
+                        # is an over-long context, so trim and try again.
+                        if 400 <= resp.status_code < 500 and len(msgs) > 2 and attempt < _MAX_RETRIES:
+                            keep = max(2, len(msgs) // 2)
+                            logger.warning("[Ollama] Trimming history %d→%d and retrying after 4xx",
+                                           len(msgs), keep)
+                            msgs = msgs[-keep:]
+                            last_exc = requests.HTTPError(f"{resp.status_code} for /api/chat")
+                            time.sleep(_backoff_seconds(attempt))
+                            continue
+                        resp.raise_for_status()
+                    return resp.json()
+                except (requests.Timeout, requests.ConnectionError) as exc:
+                    last_exc = exc
+                    logger.error("[Ollama] %s (attempt %d/%d) model=%s host=%s",
+                                 type(exc).__name__, attempt, _MAX_RETRIES, self.model, self.host)
+                    if attempt < _MAX_RETRIES:
+                        time.sleep(_backoff_seconds(attempt))
+                        continue
+                    raise
+                except requests.HTTPError as exc:
+                    # 5xx (raised above) — retry; final attempt re-raises.
+                    last_exc = exc
+                    logger.error("[Ollama] HTTP ERROR %s (attempt %d/%d) model=%s",
+                                 exc, attempt, _MAX_RETRIES, self.model)
+                    if attempt < _MAX_RETRIES:
+                        time.sleep(_backoff_seconds(attempt))
+                        continue
+                    raise
+            # Exhausted retries without returning.
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("Ollama call failed with no captured exception")
 
         data = await asyncio.get_event_loop().run_in_executor(None, _call)
 

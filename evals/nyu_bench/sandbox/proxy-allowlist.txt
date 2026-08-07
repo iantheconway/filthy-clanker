@@ -1,0 +1,12 @@
+# Domain allowlist for the eval sandbox proxy (POSIX extended regex, one per
+# line, matched case-insensitively against the destination host).
+# Keep this TIGHT — every domain here is reachable by the agent's tools.
+#
+# LangSmith tracing API (add eu./ other regions if you use them)
+^api\.smith\.langchain\.com$
+^.*\.smith\.langchain\.com$
+# Brave Search API (used by the Brave MCP server when BRAVE_API_KEY is set)
+^api\.search\.brave\.com$
+# npm registry — the Brave MCP server is launched via `npx -y …`, which fetches
+# the package at runtime. Remove this once the server is pre-baked into the image.
+^registry\.npmjs\.org$

@@ -677,12 +677,15 @@ agents:
       your refusal to a specialist that can handle it.
 
   refusal_specialist:
-    # DELIBERATE EXCEPTION: this agent handles responses another model refused,
-    # so it runs an abliterated model by default. Swap to a standard small model
-    # to compare refusal rates on the NYU bench (SPEC-03). It is the ONLY agent
-    # that may use an abliterated model.
+    # Reuses the WORKERS' model (same 30B-A3B abliterated MoE) rather than the
+    # small 9B summariser — the refusal specialist has to actually re-drive a
+    # tool call another model balked at, so it should be no weaker than the
+    # agents it corrects. Because it's the same tag the workers already keep
+    # resident, this costs no extra VRAM and causes no model reload/thrash.
+    # For the SPEC-03 refusal-rate study, swap THIS to a standard (non-abliterated)
+    # small model and compare refusal_rate against the all-abliterated baseline.
     provider: ollama
-    model: huihui_ai/qwen3.5-abliterated:9b   # abliterated (see note); placeholder tag
+    model: huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M   # match workers (abliterated, tools)
     host: "${OLLAMA_HOST}"
     # No tool filter — inherits the refusing agent's allowlist at runtime
 
@@ -714,6 +717,12 @@ agents:
         A missed flag is far worse than a longer summary.
 
 settings:
+  # Max characters kept per MCP tool description in the per-turn prompt.
+  # Hexstrike ships ~150 verbose descriptions that bloat the context and degrade
+  # smaller local models; trimming keeps tool NAMES + schema intact and only
+  # shortens prose. Set to 0 to pass full descriptions through (A/B baseline).
+  max_tool_description_chars: 240
+
   # Characters in a tool result that trigger auto-summarization
   tool_output_threshold: 4000
 
@@ -732,8 +741,11 @@ settings:
   # Consecutive exploit failures before HITL interrupt
   max_exploit_attempts: 5
 
-  # Run fully autonomously — never pause for human input (no HITL interrupts)
-  autonomous: false
+  # Run fully autonomously — never pause for human input (no HITL interrupts).
+  # true for headless eval: on "FINISH without a flag" the supervisor resets
+  # completed_agents and retries from recon (a fresh angle) instead of stalling
+  # on an auto-answered HITL interrupt, so a challenge uses its full timeout.
+  autonomous: true
 
   # SQLite checkpoint database path (relative to project root)
   checkpoint_db: "sessions/checkpoint.db"
