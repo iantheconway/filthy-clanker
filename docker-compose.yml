@@ -65,6 +65,7 @@ services:
       # Docker-in-Docker.
       - /var/run/docker.sock:/var/run/docker.sock
       - clanker-eval-results:/results
+      - clanker-nyuctf-data:/root/.nyuctf   # cache the ~1GB dataset across runs
     restart: "no"
 
 volumes:
@@ -72,3 +73,4 @@ volumes:
   clanker-logs:
   clanker-training:
   clanker-eval-results:
+  clanker-nyuctf-data:
