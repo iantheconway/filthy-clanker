@@ -507,6 +507,11 @@ async def _run_agent_loop(
     _exploit_found_at: Optional[int] = None
     # Counts consecutive iterations where every tool call was an unknown-tool error.
     _consecutive_unknown_iters: int = 0
+    # Whether this turn executed at least one REAL (non-unknown) tool call. A turn
+    # with none is "idle" — it feeds the unproductive-streak circuit breaker and
+    # marks the agent complete so the supervisor stops re-routing to it (kills the
+    # observed exploit spin: 44 routes, 0 tool calls, never completing).
+    _made_tool_call: bool = False
     # Duplicate-output detection: tool_name → set of MD5 hashes of raw results.
     # If a tool returns the exact same bytes twice, we inject a strategy-change hint.
     _seen_output_hashes: dict[str, set] = {}
@@ -566,6 +571,7 @@ async def _run_agent_loop(
                                agent_name, tool_name)
             else:
                 _all_unknown_this_iter = False
+                _made_tool_call = True  # a real tool ran → this turn is productive
 
                 # ---- Raw flag extraction (BEFORE summarization) ----
                 # Run on the un-summarised output so a lossy summary can never
@@ -820,9 +826,22 @@ async def _run_agent_loop(
             agent_name,
         )
 
+    # An idle turn (no real tool call) means the agent has nothing to act on right
+    # now — mark it complete so the supervisor stops re-routing to it. This also
+    # overrides the exploit special-case above: exploit is kept uncompleted only
+    # when it actually TRIED (made tool calls) but found no flag; an idle exploit
+    # turn is marked complete like any other, breaking the spin. New leads from
+    # other agents still clear completed_agents elsewhere, allowing a real retry.
+    _mark_complete = _is_substantive_completion or not _made_tool_call
     existing_completed = list(state.get("completed_agents") or [])
-    if _is_substantive_completion and agent_name not in existing_completed:
+    if _mark_complete and agent_name not in existing_completed:
         existing_completed = existing_completed + [agent_name]
+
+    # Unproductive-streak circuit breaker: reset on any real tool call, else grow.
+    _prev_streak = state.get("unproductive_streak", 0)
+    _new_streak = 0 if _made_tool_call else _prev_streak + 1
+    if not _made_tool_call:
+        logger.info("[%s] Idle turn (no tool calls) — unproductive_streak=%d", agent_name, _new_streak)
 
     return {
         "messages": new_messages,
@@ -830,6 +849,7 @@ async def _run_agent_loop(
         "current_agent": agent_name,
         "context_token_estimate": new_estimate,
         "exploit_attempts": state.get("exploit_attempts", 0) + exploit_delta,
+        "unproductive_streak": _new_streak,
         "completed_agents": existing_completed,
     }
 

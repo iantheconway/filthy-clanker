@@ -341,6 +341,11 @@ class FlagCheckingMCPPool:
         self._genuine_tool_calls: int = 0
 
     @property
+    def tool_call_count(self) -> int:
+        """Genuine (non-submit_flag) tool calls made for the current challenge."""
+        return self._genuine_tool_calls
+
+    @property
     def submit_flag_visible(self) -> bool:
         """Whether submit_flag is currently exposed to agents (per mode + gate)."""
         if self.mode == "off":
@@ -888,6 +893,7 @@ async def evaluate_challenge(
         log.info("Task prompt built (%d chars)", len(task))
 
         # ── Run graph ──────────────────────────────────────────────────────
+        _t0 = time.time()
         run_result = await run_challenge_headless(
             graph=graph,
             session_id=session_id,
@@ -899,6 +905,8 @@ async def evaluate_challenge(
             timeout_sec=timeout_sec,
             flag_pool=flag_pool,
         )
+        duration_sec = round(time.time() - _t0, 1)
+        tool_calls = flag_pool.tool_call_count  # genuine tool calls this challenge
 
         submitted_flags = run_result["flags"]
         # solved_via_tool is authoritative — the tool already verified the flag.
@@ -916,7 +924,10 @@ async def evaluate_challenge(
             error=run_result["error"],
             solved_via_tool=run_result.get("solved_via_tool", False),
             refusal_fired=run_result.get("refusal_fired", False),
+            tool_calls=tool_calls,
+            duration_sec=duration_sec,
         )
+        log.info("Metrics: %d tool call(s), %.1fs", tool_calls, duration_sec)
 
     finally:
         # ── Docker cleanup (always runs) ───────────────────────────────────
@@ -948,6 +959,8 @@ def _make_result(
     error: Optional[str] = None,
     solved_via_tool: bool = False,
     refusal_fired: bool = False,
+    tool_calls: int = 0,
+    duration_sec: float = 0.0,
 ) -> dict:
     # A single, distinct failure reason so refusal frequency is directly reportable.
     if solved:
@@ -978,6 +991,8 @@ def _make_result(
         "target": target,
         "has_container": chal.container,
         "has_files": chal.has_files,
+        "tool_calls": tool_calls,
+        "duration_sec": duration_sec,
         "session_id": session_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -999,13 +1014,22 @@ def generate_report(results: list[dict], run_id: str, args: argparse.Namespace) 
     # Refusals — the metric for comparing abliterated vs. standard-model configs.
     refusals = sum(1 for r in results if r.get("refusal_fired"))
 
+    # Activity/cost metrics — tool-calls-per-challenge is the spec's key signal for
+    # "is the agent investigating or guessing".
+    total_tool_calls = sum(r.get("tool_calls", 0) for r in results)
+    total_duration = sum(r.get("duration_sec", 0.0) for r in results)
+    avg_tool_calls = round(total_tool_calls / total, 2) if total else 0.0
+    avg_duration = round(total_duration / total, 1) if total else 0.0
+
     # Per-category breakdown
     by_cat: dict[str, dict] = {}
     for r in results:
         cat = r["category"]
         if cat not in by_cat:
-            by_cat[cat] = {"total": 0, "solved": 0, "timed_out": 0, "errored": 0, "refusals": 0}
+            by_cat[cat] = {"total": 0, "solved": 0, "timed_out": 0, "errored": 0,
+                           "refusals": 0, "tool_calls": 0}
         by_cat[cat]["total"] += 1
+        by_cat[cat]["tool_calls"] += r.get("tool_calls", 0)
         if r["solved"]:
             by_cat[cat]["solved"] += 1
         if r["timed_out"]:
@@ -1034,6 +1058,10 @@ def generate_report(results: list[dict], run_id: str, args: argparse.Namespace) 
             "errored": errored,
             "refusals": refusals,
             "refusal_rate": round(refusals / total, 4) if total else 0.0,
+            "total_tool_calls": total_tool_calls,
+            "avg_tool_calls_per_challenge": avg_tool_calls,
+            "total_duration_sec": round(total_duration, 1),
+            "avg_duration_sec": avg_duration,
         },
         "by_category": by_cat,
         "results": results,
@@ -1058,33 +1086,38 @@ def generate_report(results: list[dict], run_id: str, args: argparse.Namespace) 
         f"| Timed out | {timed_out} |",
         f"| Errored | {errored} |",
         f"| Refusals | {refusals} ({100*refusals/total:.1f}%) |" if total else "| Refusals | 0 |",
+        f"| Avg tool calls / challenge | {avg_tool_calls} |",
+        f"| Total tool calls | {total_tool_calls} |",
+        f"| Total time | {total_duration:.0f}s (avg {avg_duration:.0f}s/challenge) |",
         f"",
         f"## By Category",
         f"",
-        f"| Category | Attempted | Solved | Solve Rate | Timeouts |",
-        f"|----------|-----------|--------|------------|----------|",
+        f"| Category | Attempted | Solved | Solve Rate | Timeouts | Avg Tools |",
+        f"|----------|-----------|--------|------------|----------|-----------|",
     ]
     for cat in CATEGORIES:
         if cat not in by_cat:
             continue
         c = by_cat[cat]
         rate = f"{100*c['solved']/c['total']:.1f}%" if c["total"] else "—"
+        avg_t = f"{c['tool_calls']/c['total']:.1f}" if c["total"] else "—"
         md_lines.append(
-            f"| {cat} | {c['total']} | {c['solved']} | {rate} | {c['timed_out']} |"
+            f"| {cat} | {c['total']} | {c['solved']} | {rate} | {c['timed_out']} | {avg_t} |"
         )
 
     md_lines += [
         f"",
         f"## Per-Challenge Results",
         f"",
-        f"| Challenge | Category | Solved | Submitted Flag | Timed Out | Error |",
-        f"|-----------|----------|--------|---------------|-----------|-------|",
+        f"| Challenge | Category | Solved | Tools | Time(s) | Submitted Flag | Timed Out | Error |",
+        f"|-----------|----------|--------|-------|---------|---------------|-----------|-------|",
     ]
     for r in results:
         submitted = ", ".join(r["submitted_flags"]) if r["submitted_flags"] else "—"
         err = (r["error"] or "")[:60].replace("|", "\\|") if r["error"] else "—"
         md_lines.append(
             f"| {r['challenge']} | {r['category']} | {'✓' if r['solved'] else '✗'} "
+            f"| {r.get('tool_calls', 0)} | {r.get('duration_sec', 0)} "
             f"| `{submitted}` | {'yes' if r['timed_out'] else 'no'} | {err} |"
         )
 

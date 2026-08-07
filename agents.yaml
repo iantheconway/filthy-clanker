@@ -741,6 +741,11 @@ settings:
   # Consecutive exploit failures before HITL interrupt
   max_exploit_attempts: 5
 
+  # Consecutive agent turns with ZERO real tool calls before the supervisor ends
+  # the challenge (autonomous) or asks for help. Stops the "emit text, never act"
+  # spin from wasting the whole per-challenge timeout. Any tool call resets it.
+  max_unproductive_turns: 4
+
   # Run fully autonomously — never pause for human input (no HITL interrupts).
   # true for headless eval: on "FINISH without a flag" the supervisor resets
   # completed_agents and retries from recon (a fresh angle) instead of stalling

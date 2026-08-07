@@ -114,6 +114,7 @@ async def supervisor_node(state: TeamState) -> dict:
     settings = config.get("settings", {})
     max_attempts: int = settings.get("max_exploit_attempts", 5)
     context_limit: int = settings.get("context_limit_threshold", 80000)
+    max_unproductive: int = settings.get("max_unproductive_turns", 4)
     autonomous: bool = bool(settings.get("autonomous", False))
 
     kb = state.get("knowledge_base", {})
@@ -132,6 +133,36 @@ async def supervisor_node(state: TeamState) -> dict:
     if flags:
         logger.info("[Supervisor] Flag captured: %s. Mission complete!", flags)
         return {"next": "__end__"}
+
+    # -----------------------------------------------------------------------
+    # 1a. Unproductive-streak circuit breaker. If agents have taken several turns
+    #     in a row without executing a single tool (emitting text but never
+    #     acting — the exploit-spin failure mode), the team is stuck and more
+    #     time won't help. End the challenge instead of burning the full timeout.
+    # -----------------------------------------------------------------------
+    unproductive = state.get("unproductive_streak", 0)
+    if unproductive >= max_unproductive and not flags:
+        if autonomous:
+            logger.warning(
+                "[Supervisor] %d consecutive unproductive turns (no tool calls) — "
+                "team is stuck; ending challenge.", unproductive,
+            )
+            return {"next": "__end__"}
+        human_response = interrupt({
+            "reason": "stuck_no_tool_calls",
+            "message": (
+                f"The team has taken {unproductive} turns without running any tool.\n"
+                f"Knowledge Base:\n{json.dumps(kb, indent=2)}\n\n"
+                "Provide a concrete next command, tool, or hint to act on."
+            ),
+        })
+        return {
+            "messages": [{"role": "user", "content": f"[Human Operator]: {human_response}"}],
+            "unproductive_streak": 0,
+            "completed_agents": [],
+            "hitl_reason": None,
+            "next": "recon",
+        }
 
     # -----------------------------------------------------------------------
     # 1e. Autonomous win scan — scan recent message text for flag patterns that

@@ -48,6 +48,11 @@ class TeamState(TypedDict):
     task                  — Current high-level objective.
     next                  — Routing decision set by the supervisor.
     exploit_attempts      — Counter for consecutive failed exploit attempts.
+    unproductive_streak   — Consecutive agent turns that executed ZERO real tool
+                            calls. Reset to 0 the moment any agent runs a tool.
+                            The supervisor ends a challenge once it exceeds
+                            settings.max_unproductive_turns (the team is stuck —
+                            emitting text without acting — so more time won't help).
     completed_agents      — Set of agent names that have signalled TASK COMPLETE
                             with substantive findings. Reset when KB changes significantly.
     provider              — Global provider override ("anthropic", "gemini", "ollama"),
@@ -63,6 +68,7 @@ class TeamState(TypedDict):
     task: str
     next: str
     exploit_attempts: int
+    unproductive_streak: int
     completed_agents: List[str]
     provider: Optional[str]
     context_token_estimate: int
