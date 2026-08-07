@@ -1,0 +1,19 @@
+# profiles/cheap.yaml — "cheapest viable" overlay.
+#
+# Overlaid on agents.yaml at load time (deep-merged): every agent runs on Claude
+# Haiku 4.5 — the cheapest current Claude — to benchmark how far a low-cost model
+# gets on the same prompts and tool allowlists. Only provider/model are set here.
+#
+# refusal_specialist is intentionally NOT overridden (see profiles/opus.yaml).
+#
+# Run with:  python src/main.py --profile cheap   (then pick "per-agent config")
+# Ideas for a mixed cheap profile: keep supervisor on sonnet for better routing
+# while the specialists stay on haiku — just change the lines below.
+agents:
+  supervisor:  {provider: anthropic, model: claude-haiku-4-5-20251001}
+  recon:       {provider: anthropic, model: claude-haiku-4-5-20251001}
+  exploit:     {provider: anthropic, model: claude-haiku-4-5-20251001}
+  privesc:     {provider: anthropic, model: claude-haiku-4-5-20251001}
+  webexplorer: {provider: anthropic, model: claude-haiku-4-5-20251001}
+  vulnsearch:  {provider: anthropic, model: claude-haiku-4-5-20251001}
+  summarizer:  {provider: anthropic, model: claude-haiku-4-5-20251001}

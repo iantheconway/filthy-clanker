@@ -77,7 +77,7 @@ def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
     if override:
         provider = override
         if provider == "ollama":
-            host = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+            host = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
             # OLLAMA_MODEL set at startup by the interactive model picker
             model = os.getenv("OLLAMA_MODEL") or agent_cfg.get("model", "llama3.2")
             llm = OllamaClient(host=host, model=model)
@@ -101,7 +101,7 @@ def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
         elif provider == "gemini":
             llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
         elif provider == "ollama":
-            host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+            host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
             llm = OllamaClient(host=host, model=model)
         else:
             raise ValueError(f"Unknown provider in agents.yaml for this agent: {provider}")
@@ -911,7 +911,7 @@ def make_refusal_specialist_node(mcp_client: Any):
     async def refusal_specialist_node(state: TeamState) -> dict:
         config = state.get("config", {})
         rs_cfg = config.get("agents", {}).get("refusal_specialist", {})
-        host = rs_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+        host = rs_cfg.get("host", os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
         model = rs_cfg.get("model", "llama3-abliterated")
 
         # Which agent just refused, and what was its job?

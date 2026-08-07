@@ -47,16 +47,24 @@ WORKDIR /home/kali/filthy-clanker
 # breaks the whole resolve. Install everything else first, then pyhackthebox with
 # --no-deps so the optional HTB commands still work without dragging in the bad
 # pin. (Robust whether or not requirements.txt still lists pyhackthebox.)
-#
-# NOTE: Hexstrike's own requirements (angr, pwntools, mitmproxy, selenium, …) are
-# deliberately NOT installed here. Hexstrike is designed to run in its own venv
-# (see its requirements.txt header and MCP_COMMAND in .env.example), and that
-# stack needs a C/Rust build toolchain and is ~1GB+. Standing up the Hexstrike
-# env is a separate step, tracked outside SPEC-01; this image only clones it.
 COPY requirements.txt ./
 RUN grep -viE '^[[:space:]]*pyhackthebox([[:space:]<>=!~;#].*)?$' requirements.txt > /tmp/requirements.core.txt \
     && pip install --break-system-packages --no-cache-dir -r /tmp/requirements.core.txt \
     && pip install --break-system-packages --no-cache-dir --no-deps pyhackthebox
+
+# --- Hexstrike environment (its own venv) -------------------------------------
+# Hexstrike runs as a SEPARATE MCP server from its own venv — main.py launches
+# $HEXSTRIKE_DIR/hexstrike-env/bin/python3 (see MCP_COMMAND in .env.example). Its
+# deps (angr, pwntools, mitmproxy, selenium, …) include C extensions, so a build
+# toolchain is required. This is the heavy part of the image (adds ~1–2 GB).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential python3-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv "$HEXSTRIKE_DIR/hexstrike-env" \
+    && "$HEXSTRIKE_DIR/hexstrike-env/bin/pip" install --no-cache-dir --upgrade pip \
+    && if [ -f "$HEXSTRIKE_DIR/requirements.txt" ]; then \
+         "$HEXSTRIKE_DIR/hexstrike-env/bin/pip" install --no-cache-dir -r "$HEXSTRIKE_DIR/requirements.txt"; \
+       fi
 
 # --- Harness source -----------------------------------------------------------
 COPY . .
