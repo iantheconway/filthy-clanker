@@ -57,6 +57,7 @@ services:
     image: filthy-clanker-nyu-bench:latest
     environment:
       OLLAMA_HOST: "${CLANKER_OLLAMA_HOST:-http://host.docker.internal:11434}"
+      EVAL_RESULTS_DIR: /results        # run_eval.py writes JSONL/report here (mounted volume)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
