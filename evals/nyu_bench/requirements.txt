@@ -1,0 +1,9 @@
+# Extra dependencies for the NYU CTF eval runner, layered on top of the harness
+# image (which already has anthropic/langgraph/mcp + the Hexstrike venv).
+#
+# The benchmark DATASET is fetched by the nyuctf package on first run (~1GB git
+# clone, cached) — there is no git submodule. Pin nyuctf once you've confirmed a
+# working version against your dataset revision (run_eval.py defaults to the
+# v20250206 dataset split).
+nyuctf          # NYU CTF Bench: CTFDataset / CTFChallenge loaders + dataset fetch
+docker          # Docker SDK for Python — resolve challenge container host ports
