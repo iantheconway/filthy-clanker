@@ -108,6 +108,34 @@ _FLAG_RE = re.compile(
 # Raw 32-char hex (MD5-sized) strings — common HTB user/root flag format.
 _HEX_FLAG_RE = re.compile(r'\b([0-9a-f]{32})\b', re.IGNORECASE)
 
+# Placeholder / template flags that must NOT be treated as a captured flag.
+# The failure this guards: an agent wrote `flag{STFUj...}` (a literal ellipsis
+# placeholder) in its reasoning, the greedy extractor captured it, and the
+# supervisor ended the challenge as "solved" — with a wrong, made-up flag,
+# after 90s, instead of continuing to investigate. See spec
+# filthy-clanker-agent-solve-quality (premature flag termination).
+_PLACEHOLDER_FLAG_RE = re.compile(
+    r'\.\.\.'                       # literal ellipsis  flag{STFUj...}
+    r'|…'                            # unicode ellipsis
+    r'|<[^>]*>'                      # template angle brackets  flag{<value>}
+    r'|\bxxx+\b'                     # xxx / xxxx redaction
+    r'|\bexample\b|\byour[_ ]?flag\b|\bredacted\b|\bplaceholder\b'
+    r'|\babc123\b|\bflag_?here\b',
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder_flag(flag: str) -> bool:
+    """True if ``flag`` looks like a template/placeholder rather than a real flag.
+
+    Used at every flag-capture site so hedging text like ``flag{STFUj...}`` never
+    ends a challenge. Errs toward rejection: real CTF flags almost never contain
+    ellipses, angle brackets, or the word "example".
+    """
+    if not flag or not flag.strip():
+        return True
+    return bool(_PLACEHOLDER_FLAG_RE.search(flag))
+
 
 def _detect_flag_content(text: str) -> bool:
     """

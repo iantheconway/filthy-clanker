@@ -19,3 +19,7 @@ venv/
 sessions/*.db
 sessions/*.db-*
 data/training/*.jsonl
+# Eval checkpoint DBs (created by run_eval.py, incl. under a bind-mounted repo)
+evals/nyu_bench/*.db
+evals/nyu_bench/*.db-*
+evals/nyu_bench/results/

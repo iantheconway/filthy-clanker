@@ -20,7 +20,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from .state import TeamState, KnowledgeBase
-from .summarizer import maybe_summarize, _FLAG_RE, _HEX_FLAG_RE
+from .summarizer import maybe_summarize, _FLAG_RE, _HEX_FLAG_RE, _is_placeholder_flag
 
 # Import existing LLM clients
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -48,6 +48,8 @@ def _extract_flags_from_raw(raw: str, tool_args: dict | None = None) -> list[str
     _args_str = json.dumps(tool_args) if tool_args else ""
     if re.search(r'(?:user|root|flag)\.txt', raw + _args_str, re.IGNORECASE):
         flags += _HEX_FLAG_RE.findall(raw)
+    # Drop placeholder/template flags (e.g. "flag{...}") so a hedge never counts.
+    flags = [f for f in flags if not _is_placeholder_flag(f)]
     return list(dict.fromkeys(flags))  # deduplicate preserving order
 
 
@@ -112,6 +114,54 @@ def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
 def _estimate_tokens(messages: list) -> int:
     """Rough token estimate: total chars / 4."""
     return sum(len(str(m)) for m in messages) // 4
+
+
+def _trim_tool_descriptions(tools: list, max_chars: int) -> list:
+    """
+    Return a copy of ``tools`` with each ``description`` capped at ``max_chars``.
+
+    Hexstrike exposes ~150 tools with verbose descriptions; the full schema is
+    resent on every turn and bloats the prompt, which degrades smaller local
+    models (SPEC: filthy-clanker-agent-solve-quality, exp. 3). A ``max_chars`` of
+    0 disables trimming (full descriptions passed through unchanged).
+
+    Trimming keeps the first sentence when it fits, otherwise cuts on a word
+    boundary and appends an ellipsis. Tool names and inputSchema are untouched —
+    only prose is shortened, so the model still knows exactly what to call.
+    """
+    if not max_chars or max_chars <= 0:
+        return tools
+    trimmed: list = []
+    for t in tools:
+        desc = t.get("description") or ""
+        if len(desc) <= max_chars:
+            trimmed.append(t)
+            continue
+        # Prefer cutting at the end of the first sentence if it lands within budget.
+        dot = desc.find(". ")
+        if 0 < dot + 1 <= max_chars:
+            new_desc = desc[: dot + 1]
+        else:
+            cut = desc.rfind(" ", 0, max_chars)
+            new_desc = (desc[:cut] if cut > 0 else desc[:max_chars]).rstrip() + " …"
+        nt = dict(t)
+        nt["description"] = new_desc
+        trimmed.append(nt)
+    return trimmed
+
+
+def _log_prompt_size(agent_name: str, system_prompt: str, tools: list) -> None:
+    """Log a rough per-turn prompt-size breakdown (SPEC exp. 3 measurement).
+
+    Reports the token estimate of the system prompt and of the tool schema
+    separately so the tool-description contribution is directly visible.
+    """
+    sys_tok = len(system_prompt) // 4
+    tools_tok = len(json.dumps(tools)) // 4
+    logger.info(
+        "[%s] Prompt size (est. tokens): system=%d, tool_schema=%d (%d tools), total=%d",
+        agent_name, sys_tok, tools_tok, len(tools), sys_tok + tools_tok,
+    )
 
 
 def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase,
@@ -181,6 +231,7 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase,
     _flag_file_ctx = re.search(r'(?:user|root|flag)\.txt', tool_result + _args_str, re.IGNORECASE)
     if _flag_file_ctx:
         flags_found += hex_flag_pattern.findall(tool_result)
+    flags_found = [f for f in flags_found if not _is_placeholder_flag(f)]
     if flags_found:
         existing_flags = set(kb.get("flags", []))
         kb["flags"] = list(existing_flags | set(flags_found))
@@ -435,6 +486,14 @@ async def _run_agent_loop(
         f"{_submit_flag_note}"
     )
 
+    # Trim verbose tool descriptions to keep the per-turn prompt small on local
+    # models (SPEC exp. 3). 0 / missing => no trimming. Measure and log the
+    # resulting prompt size so the tool-schema contribution is observable.
+    _settings_pre = config.get("settings", {})
+    _max_desc = _settings_pre.get("max_tool_description_chars", 0)
+    raw_tools = _trim_tool_descriptions(raw_tools, _max_desc)
+    _log_prompt_size(agent_name, full_system, raw_tools)
+
     # Start from current conversation history
     messages = list(state.get("messages", []))
     new_messages: list = []
@@ -453,11 +512,21 @@ async def _run_agent_loop(
     _seen_output_hashes: dict[str, set] = {}
 
     for iteration in range(max_iterations):
-        response = await llm.generate_response(
-            messages=messages + new_messages,
-            tools=raw_tools,
-            system_prompt=full_system,
-        )
+        try:
+            response = await llm.generate_response(
+                messages=messages + new_messages,
+                tools=raw_tools,
+                system_prompt=full_system,
+            )
+        except Exception as exc:
+            # LLM call failed even after the client's own retries (e.g. a hard
+            # Ollama 400/5xx or the server being down). End this agent's turn
+            # gracefully so the supervisor can reroute — never crash the whole
+            # challenge on one bad call. Keep the note < 80 chars so the
+            # lightweight evaluator routes it to the supervisor, not refusal.
+            logger.error("[%s] LLM call failed after retries: %s — ending turn", agent_name, exc)
+            new_messages.append({"role": "assistant", "content": "[LLM error — ending turn.]"})
+            break
 
         tool_calls = llm.parse_tool_calls(response)
         assistant_msg = llm.make_assistant_message(response)
@@ -727,6 +796,9 @@ async def _run_agent_loop(
         # Hex flags in text: only if flagfile context nearby
         if re.search(r'(?:user|root|flag)\.txt', _final_text, re.IGNORECASE):
             _text_flags += re.findall(r'\b([0-9a-f]{32})\b', _final_text, re.IGNORECASE)
+        # A flag mentioned in the agent's own prose is the least trustworthy source
+        # (often a hedge/example like "flag{STFUj...}"); drop placeholders.
+        _text_flags = [f for f in _text_flags if not _is_placeholder_flag(f)]
         if _text_flags:
             _existing = set(updated_kb.get("flags", []))
             updated_kb = dict(updated_kb)

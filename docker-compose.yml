@@ -55,9 +55,26 @@ services:
     build:
       context: ./evals/nyu_bench
     image: filthy-clanker-nyu-bench:latest
+    env_file:
+      - path: .env
+        required: false        # LANGSMITH_*/BRAVE_API_KEY can live in .env (optional)
     environment:
       OLLAMA_HOST: "${CLANKER_OLLAMA_HOST:-http://host.docker.internal:11434}"
       EVAL_RESULTS_DIR: /results        # run_eval.py writes JSONL/report here (mounted volume)
+      # LangSmith tracing — set these in .env (or the shell) to trace LLM + tool
+      # calls (works for the local Ollama calls too). Off unless LANGSMITH_TRACING=true.
+      LANGSMITH_TRACING: "${LANGSMITH_TRACING:-}"
+      LANGSMITH_API_KEY: "${LANGSMITH_API_KEY:-}"
+      LANGSMITH_PROJECT: "${LANGSMITH_PROJECT:-filthy-clanker}"
+      BRAVE_API_KEY: "${BRAVE_API_KEY:-}"
+      # Egress sandbox: unset/0 = agent blocked from public internet (default,
+      # via sandbox/entrypoint.sh); 1 = full internet (explicit opt-in).
+      CLANKER_ALLOW_INTERNET: "${CLANKER_ALLOW_INTERNET:-0}"
+    # NET_ADMIN: install the egress firewall. NET_RAW: nmap SYN scans of the
+    # (host-local) challenge targets.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

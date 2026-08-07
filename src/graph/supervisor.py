@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from llms import AnthropicClient, GeminiClient, OllamaClient
 
 from .state import TeamState
+from .summarizer import _is_placeholder_flag
 
 logger = logging.getLogger("filthy_clanker")
 
@@ -123,8 +124,11 @@ async def supervisor_node(state: TeamState) -> dict:
 
     # -----------------------------------------------------------------------
     # 1. Check if flag was already captured
+    #    Ignore placeholder/template strings (e.g. "flag{STFUj...}") that a greedy
+    #    extractor may have picked up from an agent's reasoning — ending the run on
+    #    one of those hands back a wrong flag and cuts investigation short.
     # -----------------------------------------------------------------------
-    flags = kb.get("flags", [])
+    flags = [f for f in kb.get("flags", []) if not _is_placeholder_flag(f)]
     if flags:
         logger.info("[Supervisor] Flag captured: %s. Mission complete!", flags)
         return {"next": "__end__"}
@@ -159,6 +163,7 @@ async def supervisor_node(state: TeamState) -> dict:
             if _re.search(r'(?:user|root|flag)\.txt', _content, _re.IGNORECASE):
                 _found_flags += _HEX_SCAN.findall(_content)
 
+        _found_flags = [f for f in _found_flags if not _is_placeholder_flag(f)]
         if _found_flags:
             _existing = set(kb.get("flags", []))
             _new = [f for f in _found_flags if f not in _existing]
@@ -442,11 +447,18 @@ async def supervisor_node(state: TeamState) -> dict:
     )
 
     routing_messages = [{"role": "user", "content": routing_prompt}]
-    response = await llm.generate_response(
-        messages=routing_messages,
-        tools=[],
-        system_prompt=system_prompt,
-    )
+    try:
+        response = await llm.generate_response(
+            messages=routing_messages,
+            tools=[],
+            system_prompt=system_prompt,
+        )
+    except Exception as exc:
+        # Routing LLM failed even after client retries — don't crash the challenge.
+        # Fall back to a knowledge-base heuristic so the graph keeps moving.
+        fallback = "exploit" if (kb.get("attack_surface") or kb.get("open_ports")) else "recon"
+        logger.error("[Supervisor] routing LLM failed: %s — falling back to %s", exc, fallback)
+        return {"next": fallback, "hitl_reason": None}
 
     # Parse the routing decision
     tool_calls = llm.parse_tool_calls(response)
@@ -499,7 +511,8 @@ async def supervisor_node(state: TeamState) -> dict:
 
     # No-flag guard: the LLM must not end the session without a captured flag.
     # If it tries, solicit human feedback instead — the team may have stalled.
-    if next_agent == "__end__" and not kb.get("flags"):
+    # Use the placeholder-filtered `flags`, not raw kb — a template flag is not a win.
+    if next_agent == "__end__" and not flags:
         logger.warning(
             "[Supervisor] LLM requested FINISH but no flag captured — %s",
             "continuing autonomously" if autonomous else "triggering HITL",
@@ -556,7 +569,7 @@ async def supervisor_node(state: TeamState) -> dict:
     # most appropriate work agent from the knowledge base instead.
     if next_agent == "refusal_specialist" and state.get("current_agent") == "refusal_specialist":
         kb_now = state.get("knowledge_base", {})
-        if kb_now.get("flags"):
+        if [f for f in kb_now.get("flags", []) if not _is_placeholder_flag(f)]:
             next_agent = "__end__"
         elif kb_now.get("open_ports") or kb_now.get("attack_surface"):
             next_agent = "exploit"
