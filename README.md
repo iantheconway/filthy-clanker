@@ -156,7 +156,7 @@ agents:
   refusal_specialist:
     provider: ollama
     model: huihui_ai/qwen3.5-abliterated:9b
-    host: "http://10.0.2.2:11434"
+    host: "http://host.docker.internal:11434"
 
 settings:
   tool_output_threshold: 4000    # chars before auto-summarisation
@@ -165,6 +165,31 @@ settings:
   checkpoint_db: "sessions/checkpoint.db"
   training_data_dir: "data/training"
 ```
+
+### Config profiles (`profiles/`)
+
+`agents.yaml` is the balanced default (a mix of models sized to each task). To run
+the whole team on a different model set without editing it, use a **profile** — a
+thin overlay in `profiles/` that changes only each agent's `provider`/`model`/`host`
+and is deep-merged onto `agents.yaml` at load (prompts, tool allowlists, and other
+settings are inherited):
+
+| Profile  | What it does |
+|----------|--------------|
+| `opus`   | Every worker agent on Claude Opus — maximum capability. |
+| `cheap`  | Every worker agent on Claude Haiku 4.5 — benchmark how far a low-cost model gets. |
+| `ollama` | Fully local via Ollama (no API calls); also lowers the context thresholds for small models. |
+
+```bash
+python src/main.py --profile opus     # or: cheap, ollama
+AGENTS_PROFILE=cheap python src/main.py   # equivalently, via env var
+python src/main.py --config agents.yaml   # no profile → default balanced config
+```
+
+Pick **"per-agent config"** at the provider prompt so each agent uses its profile
+model. `refusal_specialist` always stays on the local abliterated model regardless
+of profile — its job is to answer where a safety-tuned model refused. Add your own
+profile by dropping a `profiles/<name>.yaml` overlay in place.
 
 ## Usage
 

@@ -50,7 +50,7 @@ def _resolve_llm(state: TeamState, agent_cfg: dict):
     if override:
         provider = override
         if provider == "ollama":
-            host = os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434")
+            host = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
             model = os.getenv("OLLAMA_MODEL") or agent_cfg.get("model", "llama3.2")
             llm = OllamaClient(host=host, model=model)
         elif provider == "anthropic":
@@ -71,7 +71,7 @@ def _resolve_llm(state: TeamState, agent_cfg: dict):
         elif provider == "gemini":
             llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
         elif provider == "ollama":
-            host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+            host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
             llm = OllamaClient(host=host, model=model)
         else:
             raise ValueError(f"Unknown provider in agents.yaml for supervisor: {provider}")

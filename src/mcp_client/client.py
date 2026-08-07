@@ -10,6 +10,24 @@ import langsmith
 
 logger = logging.getLogger("filthy_clanker")
 
+_EMPTY_SCHEMA = {"type": "object", "properties": {}}
+
+
+def _tool_input_schema(tool: Any) -> dict:
+    """Extract a tool's JSON-Schema robustly across mcp library versions.
+
+    Different `mcp` releases expose the field as ``inputSchema`` (camelCase attr)
+    or ``input_schema``, and sometimes only via the Pydantic alias in
+    ``model_dump``. Accessing ``tool.inputSchema`` directly raised
+    ``AttributeError`` on the installed version, which silently zeroed out the
+    entire tool list (agents ended up with no tools and just guessed flags).
+    """
+    schema = getattr(tool, "inputSchema", None) or getattr(tool, "input_schema", None)
+    if schema is None and hasattr(tool, "model_dump"):
+        dumped = tool.model_dump(by_alias=True)
+        schema = dumped.get("inputSchema") or dumped.get("input_schema")
+    return schema or dict(_EMPTY_SCHEMA)
+
 
 class HexstrikeMCPClient:
     """Single-server MCP client — connects to one stdio MCP server."""
@@ -48,11 +66,8 @@ class HexstrikeMCPClient:
         self._tools_cache = [
             {
                 "name": tool.name,
-                "description": tool.description or "",
-                "inputSchema": tool.inputSchema if tool.inputSchema else {
-                    "type": "object",
-                    "properties": {},
-                },
+                "description": getattr(tool, "description", "") or "",
+                "inputSchema": _tool_input_schema(tool),
             }
             for tool in result.tools
         ]

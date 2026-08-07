@@ -14,7 +14,7 @@ Supported values: 'anthropic', 'gemini', 'ollama'.
     summarizer config is IGNORED — Anthropic always uses the official API endpoint.
   - gemini:    uses the Google Generative AI SDK (sync client).  `host` is ignored.
   - ollama:    uses the local Ollama /api/generate HTTP endpoint.  `host` is required
-    (defaults to OLLAMA_HOST env var or http://10.0.2.2:11434).
+    (defaults to OLLAMA_HOST env var or http://host.docker.internal:11434).
 
 If `provider` is not 'ollama' and something would cause a fall-through to the Ollama
 path, a ValueError is raised immediately rather than silently calling the wrong backend.
@@ -221,7 +221,7 @@ def _build_generate_fn(agent_cfg: dict) -> Callable[[str, str], str]:
 
     elif provider == "ollama":
         model = agent_cfg.get("model", "llama3.2")
-        host: str = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://10.0.2.2:11434"))
+        host: str = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
         logger.info("[Summarizer] provider=ollama model=%s host=%s", model, host)
         # _ollama_generate now raises RuntimeError on failure; callers must handle it.
         return lambda prompt, system="": _ollama_generate(prompt, model, host, system)
