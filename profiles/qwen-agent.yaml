@@ -1,0 +1,22 @@
+# profiles/qwen-agent.yaml — swap the WORKER models to the agent-tuned
+# qwen3-30b-agent, to test whether agent-tuning improves tool-use / persistence
+# vs the abliterated Qwen3 baseline.
+#
+# Layer AFTER nyu-ctf so you keep the CTF prompts + recon's execute_command:
+#   python evals/nyu_bench/run_eval.py --profile nyu-ctf,qwen-agent
+#
+# Only `model` is overridden per agent — provider/host/tools/prompt are inherited
+# (from the nyu-ctf overlay for supervisor/recon/exploit, from base for the rest).
+#
+# refusal_specialist and summarizer are deliberately NOT swapped: qwen3-30b-agent
+# is not abliterated and may refuse offensive tasks, so the refusal specialist (and
+# the summariser, which must faithfully transcribe flags) stay on the abliterated
+# models. The refusal_rate metric will show how often the agent-tuned workers balk.
+
+agents:
+  supervisor:  {model: qwen3-30b-agent:latest}
+  recon:       {model: qwen3-30b-agent:latest}
+  exploit:     {model: qwen3-30b-agent:latest}
+  privesc:     {model: qwen3-30b-agent:latest}
+  webexplorer: {model: qwen3-30b-agent:latest}
+  vulnsearch:  {model: qwen3-30b-agent:latest}
