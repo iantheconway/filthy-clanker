@@ -128,22 +128,40 @@ agents:
 
       FILE-BASED CHALLENGES (crypto / rev / misc / forensics):
         The flag is produced by correctly analysing or transforming the files.
-          • crypto: identify the scheme, then decrypt/decode — write and run a
-            Python script (pycryptodome, sympy, base64, etc.) via execute_command.
-          • rev: disassemble/decompile and reason about the logic
-            (`strings`, `objdump -d`, `ltrace`, `python3` with a solver).
-          • forensics/misc: carve, extract, or decode embedded data (binwalk,
-            zsteg, exiftool, unzip, `strings`).
-        Iterate: run analysis → read output → refine. Do not stop at a partial
-        result — keep going until the actual flag string appears in tool output.
+        `strings` alone almost never yields the real flag — it is a starting
+        point, not the answer. You MUST escalate. Tools are installed and driven
+        via execute_command with the SYSTEM python3 (the crypto/pwn libs below are
+        importable there):
+          • crypto: identify the scheme, then decrypt/decode by writing and RUNNING
+            a Python script — `from Crypto...` (pycryptodome), `sympy`, `gmpy2`,
+            `z3` are available; `openssl` and `RsaCtfTool` for RSA. Actually run the
+            math; do not eyeball a decode.
+          • rev: DISASSEMBLE and reason — `objdump -d <bin>`, `radare2 -A`, `nm`,
+            `readelf`. Trace/execute: `gdb`, `ltrace`, `strace`, or just RUN the
+            binary and observe. For input-dependent flags use `angr` (symbolic
+            execution) or a `z3` model — import angr in a python3 script.
+          • pwn: `checksec <bin>` for protections, `objdump`/`radare2` to find the
+            bug, then build the exploit with `pwntools` (`from pwn import *`);
+            `ROPgadget`/`one_gadget`/`ropper` for ROP. Run it against the target.
+          • forensics/misc: `binwalk`, `foremost`, `steghide`, `zsteg`, `exiftool`,
+            `tshark`, `7z`, `unzip` to carve/extract/decode embedded data.
+
+      NO HALF-SOLVES — this is the #1 mistake to avoid:
+        Reaching a partial artifact is NOT solving. If `strings` shows a `flag{`
+        fragment, or the binary prints a hex/base64/encoded blob, that is a LEAD,
+        not the flag. You MUST complete the transformation with a real tool run
+        (decode/decrypt/reverse it in a script) and see the FULL, final flag in
+        tool output before proposing it. Never hand-decode, never guess the last
+        step, never submit a reconstructed-from-context flag.
 
       SERVICE-BASED CHALLENGES (web / pwn):
         Interact with the target to trigger the flag: injection, logic abuse,
         auth bypass, a crafted request, or a pwn payload. Read the flag from the
         service's response.
 
-      DERIVE, DO NOT GUESS: only treat a string as the flag once you have seen it
-      in real tool output. A flag invented from the challenge name is wrong.
+      DERIVE, DO NOT GUESS: only treat a string as the flag once you have seen the
+      COMPLETE flag in real tool output. A flag invented from the challenge name,
+      or reconstructed around a fragment, is wrong.
 
       Document every attempt, successful or not. If an approach repeatedly fails,
       report back to the supervisor rather than looping.

@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from llms import AnthropicClient, GeminiClient, OllamaClient
 
 from .state import TeamState
-from .summarizer import _is_placeholder_flag
+from .summarizer import _is_placeholder_flag, _flag_matches_format
 
 logger = logging.getLogger("filthy_clanker")
 
@@ -125,11 +125,14 @@ async def supervisor_node(state: TeamState) -> dict:
 
     # -----------------------------------------------------------------------
     # 1. Check if flag was already captured
-    #    Ignore placeholder/template strings (e.g. "flag{STFUj...}") that a greedy
-    #    extractor may have picked up from an agent's reasoning — ending the run on
-    #    one of those hands back a wrong flag and cuts investigation short.
+    #    Ignore placeholder/template strings (e.g. "flag{STFUj...}") AND strings
+    #    of the wrong shape for this challenge's flag_format (e.g. a `key{...}`
+    #    decoy or a bare hex blob when the flag is `flag{...}`). Ending on either
+    #    hands back a wrong flag and cuts investigation short.
     # -----------------------------------------------------------------------
-    flags = [f for f in kb.get("flags", []) if not _is_placeholder_flag(f)]
+    _flag_format = state.get("flag_format", "")
+    flags = [f for f in kb.get("flags", [])
+             if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]
     if flags:
         logger.info("[Supervisor] Flag captured: %s. Mission complete!", flags)
         return {"next": "__end__"}
@@ -194,7 +197,8 @@ async def supervisor_node(state: TeamState) -> dict:
             if _re.search(r'(?:user|root|flag)\.txt', _content, _re.IGNORECASE):
                 _found_flags += _HEX_SCAN.findall(_content)
 
-        _found_flags = [f for f in _found_flags if not _is_placeholder_flag(f)]
+        _found_flags = [f for f in _found_flags
+                        if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]
         if _found_flags:
             _existing = set(kb.get("flags", []))
             _new = [f for f in _found_flags if f not in _existing]
@@ -600,7 +604,8 @@ async def supervisor_node(state: TeamState) -> dict:
     # most appropriate work agent from the knowledge base instead.
     if next_agent == "refusal_specialist" and state.get("current_agent") == "refusal_specialist":
         kb_now = state.get("knowledge_base", {})
-        if [f for f in kb_now.get("flags", []) if not _is_placeholder_flag(f)]:
+        if [f for f in kb_now.get("flags", [])
+                if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]:
             next_agent = "__end__"
         elif kb_now.get("open_ports") or kb_now.get("attack_surface"):
             next_agent = "exploit"

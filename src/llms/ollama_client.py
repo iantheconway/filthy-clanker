@@ -21,7 +21,13 @@ _DEFAULT_HOST = "http://host.docker.internal:11434"
 #   OLLAMA_NUM_CTX      — if set, passed as options.num_ctx so long conversations
 #                         don't overflow the model's default window. NOT set by
 #                         default (a large num_ctx grows KV-cache VRAM and can OOM).
+#   OLLAMA_READ_TIMEOUT — seconds to wait for a generation before treating the
+#                         call as hung. Without this a stalled /api/chat blocks
+#                         forever (observed: a single hung call ate a whole 1800s
+#                         challenge). Generous by default so slow-but-real
+#                         generations aren't killed; a true hang is retried.
 _MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
+_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "300"))
 
 
 def _num_ctx_option() -> dict:
@@ -137,7 +143,7 @@ class OllamaClient(BaseLLMClient):
                     resp = requests.post(
                         f"{self.host}/api/chat",
                         json=_payload(msgs),
-                        timeout=(10, None),  # 10s connect, no read timeout
+                        timeout=(10, _READ_TIMEOUT),  # 10s connect, bounded read
                     )
                     if resp.status_code >= 400:
                         body = resp.text[:600].replace("\n", " ")

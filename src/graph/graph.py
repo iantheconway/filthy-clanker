@@ -127,6 +127,7 @@ def initial_state(
     config: Dict[str, Any],
     target_ip: str = "",
     machine_name: str = "",
+    flag_format: str = "",
 ) -> TeamState:
     """
     Build the initial TeamState for a new hacking session.
@@ -161,6 +162,7 @@ def initial_state(
         next="recon",
         exploit_attempts=0,
         unproductive_streak=0,
+        flag_format=flag_format,
         completed_agents=[],
         provider=provider,
         context_token_estimate=len(task) // 4,

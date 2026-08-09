@@ -137,6 +137,29 @@ def _is_placeholder_flag(flag: str) -> bool:
     return bool(_PLACEHOLDER_FLAG_RE.search(flag))
 
 
+def _flag_matches_format(flag: str, flag_format: str) -> bool:
+    """True if ``flag`` plausibly matches the challenge's stated ``flag_format``.
+
+    Guards premature session-end on a wrong-but-plausible flag of the WRONG shape
+    — e.g. the agent extracts ``key{decoy}`` or a bare hex string from a binary
+    when the challenge wants ``flag{...}``. We only check the wrapper prefix
+    (``flag{`` vs ``key{``), which is all a format string reliably tells us; the
+    value is verified elsewhere (submit_flag / final scoring).
+
+    Conservative: when the format is unknown, "not provided", or has no ``{``
+    wrapper (so nothing to validate), returns True — never over-rejects.
+    """
+    if not flag_format:
+        return True
+    fmt = flag_format.strip().lower()
+    if "not provided" in fmt or "{" not in fmt:
+        return True
+    prefix = fmt.split("{", 1)[0].strip()
+    if not re.fullmatch(r'[\w.-]{1,20}', prefix):
+        return True  # unparseable prefix — don't risk a false rejection
+    return flag.strip().lower().startswith(prefix + "{")
+
+
 def _detect_flag_content(text: str) -> bool:
     """
     Return True if the text contains a flag-like pattern or dense ASCII art.

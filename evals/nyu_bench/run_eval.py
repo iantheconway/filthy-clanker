@@ -663,6 +663,7 @@ async def run_challenge_headless(
     target_ip: str = "",
     timeout_sec: int = 600,
     flag_pool: Optional[FlagCheckingMCPPool] = None,
+    flag_format: str = "",
 ) -> dict:
     """
     Drive the graph to completion without any interactive prompts.
@@ -681,7 +682,7 @@ async def run_challenge_headless(
         except Exception as exc:
             log.warning("LangSmith tracer init failed: %s", exc)
 
-    state = initial_state(task, provider, session_id, config, target_ip)
+    state = initial_state(task, provider, session_id, config, target_ip, flag_format=flag_format)
     input_payload: Any = state
     trajectory_logger.set_session(session_id)
 
@@ -904,6 +905,7 @@ async def evaluate_challenge(
             target_ip=target.split(":")[0] if target else "",
             timeout_sec=timeout_sec,
             flag_pool=flag_pool,
+            flag_format=chal.flag_format,
         )
         duration_sec = round(time.time() - _t0, 1)
         tool_calls = flag_pool.tool_call_count  # genuine tool calls this challenge

@@ -69,6 +69,7 @@ class TeamState(TypedDict):
     next: str
     exploit_attempts: int
     unproductive_streak: int
+    flag_format: str
     completed_agents: List[str]
     provider: Optional[str]
     context_token_estimate: int

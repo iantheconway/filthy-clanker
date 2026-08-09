@@ -66,6 +66,27 @@ RUN python3 -m venv "$HEXSTRIKE_DIR/hexstrike-env" \
          "$HEXSTRIKE_DIR/hexstrike-env/bin/pip" install --no-cache-dir -r "$HEXSTRIKE_DIR/requirements.txt"; \
        fi
 
+# --- CTF binary-analysis / crypto / forensics tooling (agent-facing) ----------
+# The agent runs these via execute_command using the SYSTEM python3, so the
+# Python libs must be installed into SYSTEM python — NOT the Hexstrike venv the
+# agent never invokes. (An eval analysis found rev/pwn/crypto scoring 0–1 for
+# lack of a debugger, symbolic execution, and the crypto/exploitation libraries;
+# see spec filthy-clanker-agent-solve-quality.)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gdb ltrace strace checksec rizin steghide foremost ruby ruby-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Crypto + pwn + symbolic-execution libs, importable from the agent's `python3`.
+# --ignore-installed: angr's dep tree pins mpmath<1.4 but Debian ships mpmath
+# 1.4.1 without a RECORD file, so pip cannot uninstall it ("uninstall-no-record-
+# file"). Ignoring installed packages makes pip lay down fresh copies instead of
+# trying to remove the apt-managed one.
+RUN pip install --break-system-packages --no-cache-dir --ignore-installed \
+        pycryptodome pwntools gmpy2 z3-solver ROPgadget ropper angr
+# one_gadget + zsteg are Ruby gems (native ext build uses the toolchain above);
+# tolerate failure so a gem hiccup can't break the whole image build.
+RUN gem install --no-document one_gadget zsteg || true
+
 # --- Harness source -----------------------------------------------------------
 COPY . .
 RUN chown -R kali:kali /home/kali
