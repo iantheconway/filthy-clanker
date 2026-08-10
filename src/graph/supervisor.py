@@ -130,12 +130,20 @@ async def supervisor_node(state: TeamState) -> dict:
     #    decoy or a bare hex blob when the flag is `flag{...}`). Ending on either
     #    hands back a wrong flag and cuts investigation short.
     # -----------------------------------------------------------------------
+    _trust_kb_flags = settings.get("trust_kb_flags_to_end", True)
     _flag_format = state.get("flag_format", "")
-    flags = [f for f in kb.get("flags", [])
-             if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]
-    if flags:
-        logger.info("[Supervisor] Flag captured: %s. Mission complete!", flags)
+    _kb_flags = [f for f in kb.get("flags", [])
+                 if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]
+    if _kb_flags and _trust_kb_flags:
+        logger.info("[Supervisor] Flag captured: %s. Mission complete!", _kb_flags)
         return {"next": "__end__"}
+    # `flags` drives the "do we actually have a flag?" guards below. When we don't
+    # trust KB-extracted flags to END a session (eval mode), treat the run as
+    # flagless: a plausible-but-unverified flag{...} the agent typed must NOT end
+    # the challenge (that caused ~15/20 premature wrong-exits). Only a verified
+    # submit_flag (handled by the eval harness's solved_event) or the final KB
+    # scoring counts as a real solve.
+    flags = _kb_flags if _trust_kb_flags else []
 
     # -----------------------------------------------------------------------
     # 1a. Unproductive-streak circuit breaker. If agents have taken several turns
@@ -172,7 +180,7 @@ async def supervisor_node(state: TeamState) -> dict:
     #     the KB extractor may have missed (e.g. inside a summarized block).
     #     Only in autonomous mode to avoid unnecessary parsing overhead in HITL.
     # -----------------------------------------------------------------------
-    if autonomous:
+    if autonomous and _trust_kb_flags:
         import re as _re
         _FLAG_SCAN = _re.compile(
             r'(?:flag|key|ctf|htb|thm|picoctf|csaw|crypto|web|pwn|misc|rev|forensics'

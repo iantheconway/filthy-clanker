@@ -19,6 +19,14 @@
 #   python evals/nyu_bench/run_eval.py --profile nyu-ctf
 # Compare against the base (no profile) run to measure the prompting effect.
 
+settings:
+  # Eval-only: do NOT end a challenge on a KB-extracted flag{...} string — only a
+  # VERIFIED submit_flag (the eval's checker) or final KB scoring counts. Stops the
+  # agent from guessing a plausible flag and prematurely exiting (~15/20 of rev/pwn
+  # failures were format-matching wrong guesses that ended the run before a real
+  # solve attempt). HTB (no profile) keeps the default True.
+  trust_kb_flags_to_end: false
+
 agents:
   supervisor:
     system_prompt: |
