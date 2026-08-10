@@ -703,6 +703,9 @@ agents:
       pycryptodome, gmpy2 importable:
         Disassembly / static:  objdump -d <path> | radare2 -A -q -c 'pdf @ main' <path>
                                nm <path> ; readelf -a <path> ; checksec <path>
+                               Prefer TARGETED disassembly of the relevant function
+                               (radare2 'pdf @ main', objdump -d --disassemble=<func>)
+                               over dumping a huge binary — keep output readable.
         Dynamic:               gdb -batch -ex 'disas main' <path> ; ltrace <path> ;
                                strace <path> ; or just RUN the binary and observe.
         Symbolic (input flags): python3 script using `angr` or `z3`.
@@ -791,6 +794,10 @@ settings:
 
   # Characters in a tool result that trigger auto-summarization
   tool_output_threshold: 4000
+
+  # Higher threshold for the reversing agent so raw disassembly/hex reaches the
+  # model verbatim (the small summariser would paraphrase assembly into uselessness).
+  reversing_output_threshold: 16000
 
   # Characters of raw tool output to return when the summarizer is unavailable
   summarizer_fallback_chars: 6000

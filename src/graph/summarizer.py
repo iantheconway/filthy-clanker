@@ -288,10 +288,16 @@ def _build_generate_fn(agent_cfg: dict) -> Callable[[str, str], str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def maybe_summarize(text: str, config: Dict[str, Any]) -> str:
+def maybe_summarize(text: str, config: Dict[str, Any],
+                    threshold_override: Optional[int] = None) -> str:
     """
     If `text` exceeds the configured character threshold, pass it through the
     summarizer and return a condensed version.  Otherwise return as-is.
+
+    ``threshold_override`` raises the char threshold for a specific caller — the
+    reversing agent uses a high value so raw disassembly/hex reaches the model
+    instead of being paraphrased into uselessness by the small summariser (RE
+    needs the actual instructions, not a "findings" summary).
 
     Flag protection:
       If the raw text contains a recognisable flag pattern or dense ASCII art,
@@ -308,7 +314,8 @@ def maybe_summarize(text: str, config: Dict[str, Any]) -> str:
         config: Full agents.yaml config dict (settings + agents sections).
     """
     settings = config.get("settings", {})
-    threshold: int = settings.get("tool_output_threshold", 4000)
+    threshold: int = threshold_override if threshold_override is not None \
+        else settings.get("tool_output_threshold", 4000)
     fallback_chars: int = settings.get("summarizer_fallback_chars", 6000)
 
     if len(text) <= threshold:

@@ -667,8 +667,14 @@ async def _run_agent_loop(
                 else:
                     _tool_hashes.add(_out_hash)
 
-            # Auto-summarize large outputs
-            result = maybe_summarize(raw_result, config)
+            # Auto-summarize large outputs. The reversing agent gets a much higher
+            # threshold so raw disassembly/hex reaches it verbatim (the small
+            # summariser would paraphrase assembly into uselessness).
+            _sum_threshold = (
+                config.get("settings", {}).get("reversing_output_threshold", 16000)
+                if agent_name == "reversing" else None
+            )
+            result = maybe_summarize(raw_result, config, threshold_override=_sum_threshold)
 
             if result != raw_result:
                 logger.info("[Summarizer] Condensed %s → %s chars", f"{len(raw_result):,}", f"{len(result):,}")
