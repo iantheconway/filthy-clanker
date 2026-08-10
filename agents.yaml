@@ -795,9 +795,12 @@ settings:
   # Characters in a tool result that trigger auto-summarization
   tool_output_threshold: 4000
 
-  # Higher threshold for the reversing agent so raw disassembly/hex reaches the
-  # model verbatim (the small summariser would paraphrase assembly into uselessness).
-  reversing_output_threshold: 16000
+  # Reversing agent sees raw disassembly/hex up to this many chars (then truncated,
+  # not summarised — paraphrasing assembly is useless). 16k made 30B generation
+  # crawl (~130s/turn from the large context); 8k keeps a full target function
+  # readable while roughly halving worst-case context. Pair with targeted-disasm
+  # prompting (pdf @ main) so output stays focused.
+  reversing_output_threshold: 8000
 
   # Characters of raw tool output to return when the summarizer is unavailable
   summarizer_fallback_chars: 6000
