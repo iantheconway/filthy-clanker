@@ -893,6 +893,12 @@ async def _run_agent_loop(
     # turn is marked complete like any other, breaking the spin. New leads from
     # other agents still clear completed_agents elsewhere, allowing a real retry.
     _mark_complete = _is_substantive_completion or not _made_tool_call
+    # The reversing agent is a ONE-SHOT deep pass: after it runs (its internal loop
+    # + disassembly gate already gave it up to 20 iterations), mark it complete so
+    # the supervisor hands off instead of re-invoking it (which caused a ping-pong
+    # with idle network agents). New leads still clear completed_agents elsewhere.
+    if agent_name == "reversing":
+        _mark_complete = True
     existing_completed = list(state.get("completed_agents") or [])
     if _mark_complete and agent_name not in existing_completed:
         existing_completed = existing_completed + [agent_name]

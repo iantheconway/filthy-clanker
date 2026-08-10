@@ -222,20 +222,24 @@ async def supervisor_node(state: TeamState) -> dict:
         return {"next": "privesc"}
 
     # -----------------------------------------------------------------------
-    # 1b'. Binary reverse-engineering: a file-based rev/pwn challenge goes to the
-    #      reversing specialist FIRST (it disassembles under a completion-gate).
-    #      Fires once — after it has run (current_agent == "reversing") or been
-    #      marked complete, control falls through to normal routing (e.g. exploit
-    #      for the service side of a pwn task).
+    # 1b'. Binary challenges (file-based rev/pwn) get a fixed two-stage lane that
+    #      skips the network agents (recon/webexplorer/vulnsearch/privesc are
+    #      useless on a local binary and just burn idle turns):
+    #        (1) reversing  — one deep disassembly pass (under its completion-gate)
+    #        (2) exploit    — script/exploit the finding (crypto solve, pwn payload)
+    #      Reversing is marked complete after its pass, so this doesn't loop.
     # -----------------------------------------------------------------------
     _cat = (state.get("challenge_category") or "").lower()
-    if (state.get("has_files")
-            and _cat in ("rev", "pwn")
-            and current_agent not in ("reversing", "refusal_specialist")
-            and "reversing" not in completed_agents_now
-            and not shells and not flags):
-        logger.info("[Supervisor] File-based %s challenge → reversing specialist", _cat)
-        return {"next": "reversing"}
+    if state.get("has_files") and _cat in ("rev", "pwn") and not shells and not flags:
+        if ("reversing" not in completed_agents_now
+                and current_agent not in ("reversing", "refusal_specialist")):
+            logger.info("[Supervisor] File-based %s challenge → reversing specialist", _cat)
+            return {"next": "reversing"}
+        if ("reversing" in completed_agents_now
+                and "exploit" not in completed_agents_now
+                and current_agent not in ("exploit", "refusal_specialist")):
+            logger.info("[Supervisor] Binary challenge: reversing done → exploit (script/exploit the finding)")
+            return {"next": "exploit"}
 
     # -----------------------------------------------------------------------
     # 1c. Confirmed exploit path in attack_surface → route to exploit immediately.
