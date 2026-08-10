@@ -666,6 +666,7 @@ async def run_challenge_headless(
     flag_format: str = "",
     challenge_category: str = "",
     has_files: bool = False,
+    tool_call_budget: int = 0,
 ) -> dict:
     """
     Drive the graph to completion without any interactive prompts.
@@ -701,6 +702,7 @@ async def run_challenge_headless(
 
         while True:
             interrupted = False
+            budget_hit = False
             async for event in graph.astream(input_payload, thread_config, stream_mode="updates"):
                 for node_name, output in event.items():
                     if node_name == "__interrupt__":
@@ -725,6 +727,19 @@ async def run_challenge_headless(
                             _log_trajectories(node_name, output, trajectory_logger)
                 if interrupted:
                     break
+                # Tool-call budget: end a challenge that keeps acting without solving.
+                # With trust_kb_flags_to_end=False a productive-but-stuck challenge
+                # never trips the idle breaker, so bound total genuine tool calls
+                # (more principled than the wall-clock timeout) — checked per node
+                # event so it fires mid-graph, not only between astream runs.
+                if (tool_call_budget and flag_pool
+                        and flag_pool.tool_call_count >= tool_call_budget):
+                    log.info("[%s] Tool-call budget reached (%d calls) — ending challenge.",
+                             session_id, flag_pool.tool_call_count)
+                    budget_hit = True
+                    break
+            if budget_hit:
+                break
 
             # Early exit: agent submitted the correct flag via submit_flag tool.
             if flag_pool and flag_pool.solved_event.is_set():
@@ -832,6 +847,7 @@ async def evaluate_challenge(
     log_dir: Path,
     no_docker: bool,
     flag_pool: FlagCheckingMCPPool,
+    tool_call_budget: int = 0,
 ) -> dict:
     """
     Set up the environment for one challenge, run the graph, tear down, return result.
@@ -913,6 +929,7 @@ async def evaluate_challenge(
             flag_format=chal.flag_format,
             challenge_category=chal.category,
             has_files=chal.has_files,
+            tool_call_budget=tool_call_budget,
         )
         duration_sec = round(time.time() - _t0, 1)
         tool_calls = flag_pool.tool_call_count  # genuine tool calls this challenge
@@ -1178,6 +1195,10 @@ async def main() -> None:
     parser.add_argument("--gate-after", type=int, default=3,
                         help="For --submit-flag-mode gated: number of genuine (non-"
                              "submit_flag) tool calls required before submit_flag appears.")
+    parser.add_argument("--tool-call-budget", type=int, default=0,
+                        help="End a challenge after this many genuine tool calls without a "
+                             "solve (0 = unlimited). Bounds productive-but-stuck challenges "
+                             "when trust_kb_flags_to_end is off, more principled than --timeout.")
     parser.add_argument("--profile", default=None,
                         help="Config profile overlay from profiles/ (e.g. 'nyu-ctf' for "
                              "CTF-appropriate agent prompts). Deep-merged onto agents.yaml.")
@@ -1279,6 +1300,7 @@ async def main() -> None:
                     log_dir=log_dir,
                     no_docker=args.no_docker,
                     flag_pool=flag_pool,
+                    tool_call_budget=args.tool_call_budget,
                 )
                 results.append(result)
 
