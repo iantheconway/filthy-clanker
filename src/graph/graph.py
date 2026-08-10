@@ -33,7 +33,8 @@ from .supervisor import supervisor_node, route_from_supervisor
 from .summarizer import compaction_node
 from .agents import (
     make_recon_node, make_exploit_node, make_privesc_node, make_webexplorer_node,
-    make_vulnsearch_node, make_refusal_specialist_node, lightweight_evaluator,
+    make_vulnsearch_node, make_reversing_node, make_refusal_specialist_node,
+    lightweight_evaluator,
 )
 
 
@@ -69,6 +70,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     privesc_node = make_privesc_node(mcp_client, tools)
     webexplorer_node = make_webexplorer_node(mcp_client, tools)
     vulnsearch_node = make_vulnsearch_node(mcp_client, tools)
+    reversing_node = make_reversing_node(mcp_client, tools)
     refusal_specialist_node = make_refusal_specialist_node(mcp_client)
 
     # -----------------------------------------------------------------------
@@ -83,6 +85,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     graph.add_node("privesc", privesc_node)
     graph.add_node("webexplorer", webexplorer_node)
     graph.add_node("vulnsearch", vulnsearch_node)
+    graph.add_node("reversing", reversing_node)
     graph.add_node("refusal_specialist", refusal_specialist_node)
     graph.add_node("compaction", compaction_node)
 
@@ -99,6 +102,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
             "privesc": "privesc",
             "webexplorer": "webexplorer",
             "vulnsearch": "vulnsearch",
+            "reversing": "reversing",
             "refusal_specialist": "refusal_specialist",
             "compaction": "compaction",
             "__end__": END,
@@ -108,7 +112,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     # Each agent node passes through the lightweight evaluator before returning
     # to the supervisor — the evaluator redirects to refusal_specialist if needed.
     _evaluator_map = {"supervisor": "supervisor", "refusal_specialist": "refusal_specialist"}
-    for _agent in ("recon", "exploit", "privesc", "webexplorer", "vulnsearch"):
+    for _agent in ("recon", "exploit", "privesc", "webexplorer", "vulnsearch", "reversing"):
         graph.add_conditional_edges(_agent, lightweight_evaluator, _evaluator_map)
 
     # refusal_specialist always hands back to supervisor after fixing a response
@@ -128,6 +132,8 @@ def initial_state(
     target_ip: str = "",
     machine_name: str = "",
     flag_format: str = "",
+    challenge_category: str = "",
+    has_files: bool = False,
 ) -> TeamState:
     """
     Build the initial TeamState for a new hacking session.
@@ -163,6 +169,8 @@ def initial_state(
         exploit_attempts=0,
         unproductive_streak=0,
         flag_format=flag_format,
+        challenge_category=challenge_category,
+        has_files=has_files,
         completed_agents=[],
         provider=provider,
         context_token_estimate=len(task) // 4,

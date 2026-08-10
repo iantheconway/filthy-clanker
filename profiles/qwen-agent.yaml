@@ -20,3 +20,4 @@ agents:
   privesc:     {model: qwen3-30b-agent:latest}
   webexplorer: {model: qwen3-30b-agent:latest}
   vulnsearch:  {model: qwen3-30b-agent:latest}
+  reversing:   {model: qwen3-30b-agent:latest}

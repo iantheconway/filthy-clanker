@@ -664,6 +664,8 @@ async def run_challenge_headless(
     timeout_sec: int = 600,
     flag_pool: Optional[FlagCheckingMCPPool] = None,
     flag_format: str = "",
+    challenge_category: str = "",
+    has_files: bool = False,
 ) -> dict:
     """
     Drive the graph to completion without any interactive prompts.
@@ -682,7 +684,10 @@ async def run_challenge_headless(
         except Exception as exc:
             log.warning("LangSmith tracer init failed: %s", exc)
 
-    state = initial_state(task, provider, session_id, config, target_ip, flag_format=flag_format)
+    state = initial_state(
+        task, provider, session_id, config, target_ip,
+        flag_format=flag_format, challenge_category=challenge_category, has_files=has_files,
+    )
     input_payload: Any = state
     trajectory_logger.set_session(session_id)
 
@@ -716,7 +721,7 @@ async def run_challenge_headless(
                             final_kb.update(kb_update)
                         # Log trajectories for agent nodes
                         if node_name in ("recon", "exploit", "privesc", "webexplorer",
-                                         "vulnsearch", "refusal_specialist"):
+                                         "vulnsearch", "reversing", "refusal_specialist"):
                             _log_trajectories(node_name, output, trajectory_logger)
                 if interrupted:
                     break
@@ -906,6 +911,8 @@ async def evaluate_challenge(
             timeout_sec=timeout_sec,
             flag_pool=flag_pool,
             flag_format=chal.flag_format,
+            challenge_category=chal.category,
+            has_files=chal.has_files,
         )
         duration_sec = round(time.time() - _t0, 1)
         tool_calls = flag_pool.tool_call_count  # genuine tool calls this challenge

@@ -31,7 +31,7 @@ logger = logging.getLogger("filthy_clanker")
 
 
 # Possible routing destinations
-NEXT_OPTIONS = Literal["recon", "exploit", "privesc", "vulnsearch", "compaction", "__end__"]
+NEXT_OPTIONS = Literal["recon", "exploit", "privesc", "vulnsearch", "reversing", "compaction", "__end__"]
 
 
 _PROVIDER_DEFAULT_MODELS = {
@@ -220,6 +220,22 @@ async def supervisor_node(state: TeamState) -> dict:
     if shells and current_agent not in ("privesc", "refusal_specialist"):
         logger.info("[Supervisor] Foothold detected (%s) → privesc", shells)
         return {"next": "privesc"}
+
+    # -----------------------------------------------------------------------
+    # 1b'. Binary reverse-engineering: a file-based rev/pwn challenge goes to the
+    #      reversing specialist FIRST (it disassembles under a completion-gate).
+    #      Fires once — after it has run (current_agent == "reversing") or been
+    #      marked complete, control falls through to normal routing (e.g. exploit
+    #      for the service side of a pwn task).
+    # -----------------------------------------------------------------------
+    _cat = (state.get("challenge_category") or "").lower()
+    if (state.get("has_files")
+            and _cat in ("rev", "pwn")
+            and current_agent not in ("reversing", "refusal_specialist")
+            and "reversing" not in completed_agents_now
+            and not shells and not flags):
+        logger.info("[Supervisor] File-based %s challenge → reversing specialist", _cat)
+        return {"next": "reversing"}
 
     # -----------------------------------------------------------------------
     # 1c. Confirmed exploit path in attack_surface → route to exploit immediately.

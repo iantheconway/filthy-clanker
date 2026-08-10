@@ -116,6 +116,27 @@ def _estimate_tokens(messages: list) -> int:
     return sum(len(str(m)) for m in messages) // 4
 
 
+# Commands/tools that count as genuine disassembly / dynamic / symbolic analysis.
+# The reversing agent's completion-gate requires at least one of these to have run
+# before it may report — matched against the tool name AND the command arguments
+# (execute_command carries the real work in its `command`).
+_DEEP_RE_RE = re.compile(
+    r'\b(objdump|radare2|rizin|r2\b|gdb|ltrace|strace|angr|ROPgadget|ropper'
+    r'|one_gadget|checksec|readelf|\bnm\b|ghidra|decompil)', re.IGNORECASE,
+)
+
+
+def _is_deep_re_call(tool_name: str, raw_args: dict) -> bool:
+    """True if a tool call is real binary analysis (disassembly/debug/symbolic)."""
+    if _DEEP_RE_RE.search(tool_name or ""):
+        return True
+    try:
+        blob = json.dumps(raw_args)
+    except (TypeError, ValueError):
+        blob = str(raw_args)
+    return bool(_DEEP_RE_RE.search(blob))
+
+
 def _trim_tool_descriptions(tools: list, max_chars: int) -> list:
     """
     Return a copy of ``tools`` with each ``description`` capped at ``max_chars``.
@@ -512,6 +533,12 @@ async def _run_agent_loop(
     # marks the agent complete so the supervisor stops re-routing to it (kills the
     # observed exploit spin: 44 routes, 0 tool calls, never completing).
     _made_tool_call: bool = False
+    # Reversing completion-gate: the reversing agent may not finish until it has
+    # actually disassembled/traced the binary. _did_deep_re flips on the first real
+    # RE tool run; _re_gate_used caps the forcing so a stubborn model can't loop.
+    _did_deep_re: bool = False
+    _re_gate_used: int = 0
+    _RE_GATE_MAX: int = 2
     # Duplicate-output detection: tool_name → set of MD5 hashes of raw results.
     # If a tool returns the exact same bytes twice, we inject a strategy-change hint.
     _seen_output_hashes: dict[str, set] = {}
@@ -538,6 +565,31 @@ async def _run_agent_loop(
         new_messages.append(assistant_msg)
 
         if not tool_calls:
+            # Reversing completion-gate: refuse to finish until the binary has
+            # actually been disassembled/traced. Inject a hard corrective and loop
+            # again, up to _RE_GATE_MAX times (then let it out to avoid an infinite
+            # loop if the model simply won't comply).
+            if (agent_name == "reversing" and not _did_deep_re
+                    and _re_gate_used < _RE_GATE_MAX):
+                _re_gate_used += 1
+                logger.info("[reversing] Completion blocked — no disassembly yet "
+                            "(gate %d/%d), forcing RE step", _re_gate_used, _RE_GATE_MAX)
+                new_messages.append({
+                    "role": "user",
+                    "content": (
+                        "STOP — you have not disassembled the binary yet, so you "
+                        "cannot possibly know the answer. Before reporting anything, "
+                        "call execute_command to run REAL analysis on the provided "
+                        "file now, e.g.:\n"
+                        "  objdump -d <path>            (disassembly)\n"
+                        "  radare2 -A -q -c 'pdf @ main' <path>\n"
+                        "  gdb -batch -ex 'disas main' <path>   or ltrace/strace <path>\n"
+                        "For an input-derived flag, write a python3 script using angr "
+                        "(symbolic execution) or z3. Read the output and reason about "
+                        "the logic. Do NOT report until you have done this."
+                    ),
+                })
+                continue
             # No more tool calls — agent is done with its sub-task
             break
 
@@ -572,6 +624,8 @@ async def _run_agent_loop(
             else:
                 _all_unknown_this_iter = False
                 _made_tool_call = True  # a real tool ran → this turn is productive
+                if not _did_deep_re and _is_deep_re_call(tool_name, raw_args):
+                    _did_deep_re = True
 
                 # ---- Raw flag extraction (BEFORE summarization) ----
                 # Run on the un-summarised output so a lossy summary can never
@@ -1194,3 +1248,17 @@ def make_vulnsearch_node(mcp_client: Any, tools: list):
         logger.info("[VulnSearch Agent] Researching vulnerabilities in tech stack...")
         return await _run_agent_loop("vulnsearch", state, tools, mcp_client)
     return vulnsearch_node
+
+
+def make_reversing_node(mcp_client: Any, tools: list):
+    """Return an async node function for the Reversing / binary-analysis agent.
+
+    Specialised for file-based rev/pwn challenges. Its power comes from the
+    disassembly completion-gate in _run_agent_loop (agent_name == "reversing"):
+    it may not finish until it has actually run a disassembler/debugger, which
+    breaks the observed "file/strings then quit" pattern.
+    """
+    async def reversing_node(state: TeamState) -> dict:
+        logger.info("[Reversing Agent] Disassembling and analysing the binary...")
+        return await _run_agent_loop("reversing", state, tools, mcp_client)
+    return reversing_node

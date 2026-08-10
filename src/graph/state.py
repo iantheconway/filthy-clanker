@@ -70,6 +70,8 @@ class TeamState(TypedDict):
     exploit_attempts: int
     unproductive_streak: int
     flag_format: str
+    challenge_category: str   # CTF category (rev, pwn, crypto, …) — drives RE routing
+    has_files: bool           # challenge ships local files (vs. only a live service)
     completed_agents: List[str]
     provider: Optional[str]
     context_token_estimate: int
