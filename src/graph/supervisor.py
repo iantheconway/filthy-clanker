@@ -240,6 +240,14 @@ async def supervisor_node(state: TeamState) -> dict:
                 and current_agent not in ("exploit", "refusal_specialist")):
             logger.info("[Supervisor] Binary challenge: reversing done → exploit (script/exploit the finding)")
             return {"next": "exploit"}
+    # File-based crypto goes straight to exploit (no disassembly stage) — the
+    # exploit agent's solve-script gate then forces a real decrypt/compute attempt.
+    if (state.get("has_files") and _cat == "crypto"
+            and "exploit" not in completed_agents_now
+            and current_agent not in ("exploit", "refusal_specialist")
+            and not shells and not flags):
+        logger.info("[Supervisor] File-based crypto challenge → exploit (crypto scripting)")
+        return {"next": "exploit"}
 
     # -----------------------------------------------------------------------
     # 1c. Confirmed exploit path in attack_surface → route to exploit immediately.

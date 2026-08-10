@@ -137,6 +137,32 @@ def _is_deep_re_call(tool_name: str, raw_args: dict) -> bool:
     return bool(_DEEP_RE_RE.search(blob))
 
 
+# A genuine SOLVE attempt (compute/decrypt/exploit), as opposed to mere inspection
+# (file/strings/cat). Used by the exploit agent's follow-through gate on file-based
+# crypto/rev/pwn: it may not conclude until it has actually RUN a solve script or
+# executed the target — forcing "attempt" over "guess".
+_SOLVE_ATTEMPT_RE = re.compile(
+    r'python3?\s+(?:-c|-m\s|\S*\.py)'   # run a python script/one-liner
+    r'|openssl\s+[a-z]'                  # openssl crypto operation
+    r'|RsaCtfTool|\bsage\b|factordb'     # crypto solvers
+    r'|from\s+pwn|import\s+pwn'          # pwntools exploitation
+    r'|import\s+angr|import\s+z3|claripy',  # symbolic execution
+    re.IGNORECASE,
+)
+# Executing a local binary/exploit: `./x` at the START of the command (or after a
+# shell separator) — NOT `./x` as an argument to an inspection tool (objdump -d ./x).
+_EXEC_LOCAL_RE = re.compile(r'(?:^|;|&&|\|\|?|\n)\s*\./\S+')
+
+
+def _is_solve_attempt(tool_name: str, raw_args: dict) -> bool:
+    """True if a tool call is a real solve attempt (script/crypto/exploit/run)."""
+    cmd = ""
+    if isinstance(raw_args, dict):
+        cmd = str(raw_args.get("command") or raw_args.get("cmd") or "")
+    blob = cmd or (json.dumps(raw_args) if raw_args else "")
+    return bool(_SOLVE_ATTEMPT_RE.search(blob)) or bool(_EXEC_LOCAL_RE.search(cmd))
+
+
 def _trim_tool_descriptions(tools: list, max_chars: int) -> list:
     """
     Return a copy of ``tools`` with each ``description`` capped at ``max_chars``.
@@ -539,6 +565,11 @@ async def _run_agent_loop(
     _did_deep_re: bool = False
     _re_gate_used: int = 0
     _RE_GATE_MAX: int = 2
+    # Exploit follow-through gate: on a file-based crypto/rev/pwn challenge the
+    # exploit agent may not conclude until it has actually RUN a solve script /
+    # executed the target (forces "attempt" over "guess").
+    _did_solve_attempt: bool = False
+    _solve_gate_used: int = 0
     # Duplicate-output detection: tool_name → set of MD5 hashes of raw results.
     # If a tool returns the exact same bytes twice, we inject a strategy-change hint.
     _seen_output_hashes: dict[str, set] = {}
@@ -590,6 +621,28 @@ async def _run_agent_loop(
                     ),
                 })
                 continue
+            # Exploit follow-through gate on file-based crypto/rev/pwn: force at least
+            # one real solve attempt (script/crypto/exploit run) before concluding.
+            _fb_cat = (state.get("challenge_category") or "").lower()
+            if (agent_name == "exploit" and state.get("has_files")
+                    and _fb_cat in ("crypto", "rev", "pwn")
+                    and not _did_solve_attempt and _solve_gate_used < _RE_GATE_MAX):
+                _solve_gate_used += 1
+                logger.info("[exploit] Completion blocked — no solve attempt yet "
+                            "(gate %d/%d), forcing a solve script", _solve_gate_used, _RE_GATE_MAX)
+                new_messages.append({
+                    "role": "user",
+                    "content": (
+                        "STOP — you have only inspected the file, not attempted a "
+                        "solution. Write and RUN a real solve now via execute_command, "
+                        "and read its output before concluding:\n"
+                        "  crypto: python3 -c \"from Crypto... ; ...\"  (or sympy/gmpy2/"
+                        "z3, openssl, RsaCtfTool) — actually compute/decrypt.\n"
+                        "  rev/pwn: run the binary with crafted input, or a pwntools/"
+                        "angr/z3 python3 script. Do NOT guess or hand-derive the flag."
+                    ),
+                })
+                continue
             # No more tool calls — agent is done with its sub-task
             break
 
@@ -626,6 +679,8 @@ async def _run_agent_loop(
                 _made_tool_call = True  # a real tool ran → this turn is productive
                 if not _did_deep_re and _is_deep_re_call(tool_name, raw_args):
                     _did_deep_re = True
+                if not _did_solve_attempt and _is_solve_attempt(tool_name, raw_args):
+                    _did_solve_attempt = True
 
                 # ---- Raw flag extraction (BEFORE summarization) ----
                 # Run on the un-summarised output so a lossy summary can never
