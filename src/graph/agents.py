@@ -667,14 +667,25 @@ async def _run_agent_loop(
                 else:
                     _tool_hashes.add(_out_hash)
 
-            # Auto-summarize large outputs. The reversing agent gets a much higher
-            # threshold so raw disassembly/hex reaches it verbatim (the small
-            # summariser would paraphrase assembly into uselessness).
-            _sum_threshold = (
-                config.get("settings", {}).get("reversing_output_threshold", 16000)
-                if agent_name == "reversing" else None
-            )
-            result = maybe_summarize(raw_result, config, threshold_override=_sum_threshold)
+            # Tool-output handling. The reversing agent must see RAW disassembly
+            # (paraphrasing assembly is useless), so instead of summarising we pass
+            # it verbatim up to a cap, then hard-TRUNCATE with a note steering it to
+            # targeted disassembly — never hand a full 150k objdump to the model.
+            # All other agents summarise as before.
+            if agent_name == "reversing":
+                _rev_thr = config.get("settings", {}).get("reversing_output_threshold", 16000)
+                if len(raw_result) > _rev_thr:
+                    result = (
+                        raw_result[:_rev_thr]
+                        + f"\n\n[... disassembly truncated at {_rev_thr:,} of "
+                        f"{len(raw_result):,} chars. Do NOT dump the whole binary — run "
+                        f"TARGETED disassembly of the function you care about, e.g. "
+                        f"radare2 -q -c 'pdf @ main' <bin>  or  objdump -d --disassemble=<func> <bin>. ...]"
+                    )
+                else:
+                    result = raw_result
+            else:
+                result = maybe_summarize(raw_result, config)
 
             if result != raw_result:
                 logger.info("[Summarizer] Condensed %s → %s chars", f"{len(raw_result):,}", f"{len(result):,}")

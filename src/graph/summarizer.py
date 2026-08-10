@@ -346,10 +346,23 @@ def maybe_summarize(text: str, config: Dict[str, Any],
         logger.error("[Summarizer] Configuration error — returning truncated raw text: %s", exc)
         return _raw_fallback(text, fallback_chars)
 
+    # Cap the text fed to the (small) summariser LLM so it can't stall/time out on
+    # a huge dump — a full `objdump -d` can be 150k+ chars, on which the 9B model
+    # hangs for 90s+ then read-times-out. It only needs a representative slice;
+    # sample head+tail. (This is the LLM-input cap, distinct from the char
+    # threshold that decides WHETHER to summarise.)
+    _llm_cap = 40000
+    llm_text = text
+    if len(text) > _llm_cap:
+        _head = int(_llm_cap * 0.75)
+        _tail = _llm_cap - _head
+        llm_text = (text[:_head]
+                    + f"\n\n[... {len(text) - _llm_cap:,} chars omitted from the middle ...]\n\n"
+                    + text[-_tail:])
     prompt = (
         "The following is raw output from a security tool. "
         "Produce a concise Condensed Report highlighting only security-relevant findings.\n\n"
-        f"--- RAW OUTPUT ---\n{text}\n--- END ---"
+        f"--- RAW OUTPUT ---\n{llm_text}\n--- END ---"
     )
 
     try:
