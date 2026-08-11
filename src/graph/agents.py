@@ -177,6 +177,32 @@ def _is_solve_attempt(tool_name: str, raw_args: dict) -> bool:
     return bool(_SOLVE_ATTEMPT_RE.search(blob)) or bool(_EXEC_LOCAL_RE.search(cmd))
 
 
+# A genuine SERVICE interaction (hit the running HTTP endpoint or raw port), as
+# opposed to only reading local source. Used by the web/service exploitation gate:
+# on a web challenge the exploit/webexplorer agent may not conclude until it has
+# actually sent a request to the service — the flag is served there, not on disk.
+# The observed failure: recon reads the source fine, then the exploit-phase agents
+# emit an analysis paragraph with NO tool call and the unproductive breaker ends
+# the challenge in 4 bounced turns (all 10 web challenges died this way).
+_SERVICE_ATTEMPT_RE = re.compile(
+    r'\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bncat\b|\bhttpie?\b|\bwhatweb\b'
+    r'|\bnikto\b|\bgobuster\b|\bffuf\b|\bsqlmap\b|\bwfuzz\b|\bdirb\b'
+    r'|requests\.(?:get|post|put|Session)|urllib|http\.client|socket\.',
+    re.IGNORECASE,
+)
+
+
+def _is_service_attempt(tool_name: str, raw_args: dict) -> bool:
+    """True if a tool call actually interacts with the running service."""
+    if _SERVICE_ATTEMPT_RE.search(tool_name or ""):
+        return True
+    cmd = ""
+    if isinstance(raw_args, dict):
+        cmd = str(raw_args.get("command") or raw_args.get("cmd") or "")
+    blob = cmd or (json.dumps(raw_args) if raw_args else "")
+    return bool(_SERVICE_ATTEMPT_RE.search(blob))
+
+
 def _trim_tool_descriptions(tools: list, max_chars: int) -> list:
     """
     Return a copy of ``tools`` with each ``description`` capped at ``max_chars``.
@@ -584,6 +610,11 @@ async def _run_agent_loop(
     # executed the target (forces "attempt" over "guess").
     _did_solve_attempt: bool = False
     _solve_gate_used: int = 0
+    # Web/service exploitation gate: on a web challenge the exploit/webexplorer
+    # agent may not conclude until it has actually hit the running service (the
+    # flag is served there, not on disk). Forces "act" over "analyse-and-idle".
+    _did_service_attempt: bool = False
+    _web_gate_used: int = 0
     # Duplicate-output detection: tool_name → set of MD5 hashes of raw results.
     # If a tool returns the exact same bytes twice, we inject a strategy-change hint.
     _seen_output_hashes: dict[str, set] = {}
@@ -657,6 +688,39 @@ async def _run_agent_loop(
                     ),
                 })
                 continue
+            # Web/service exploitation gate: on a web challenge the flag is served
+            # by the LIVE service, never on disk. The exploit/webexplorer agent may
+            # not conclude until it has actually sent a request to the service.
+            # Without this, the agent reads the source then emits an analysis
+            # paragraph with no tool call — every web challenge died on the
+            # unproductive breaker after 4 bounced idle turns.
+            if (agent_name in ("exploit", "webexplorer") and _fb_cat == "web"
+                    and not _did_service_attempt and _web_gate_used < _RE_GATE_MAX):
+                _web_gate_used += 1
+                logger.info("[%s] Completion blocked — web challenge, no service "
+                            "interaction yet (gate %d/%d), forcing a request",
+                            agent_name, _web_gate_used, _RE_GATE_MAX)
+                new_messages.append({
+                    "role": "user",
+                    "content": (
+                        "STOP — you analysed the app but have NOT interacted with the "
+                        "running service, so you cannot have the flag. The flag is "
+                        "served by the live service, not on disk. Act now via "
+                        "execute_command against the target:\n"
+                        "  • curl the endpoints you found (-i for headers, -L to follow "
+                        "redirects, -s to quiet the progress meter).\n"
+                        "  • Send the exploit for the vulnerability you identified in "
+                        "the source — the injection / LFI / SSTI / auth-bypass / "
+                        "deserialization payload — as a real curl request with the "
+                        "crafted parameter or body, and read the RESPONSE for the flag.\n"
+                        "  • If you have not found the vuln yet, curl the index page and "
+                        "probe likely paths (/admin, /flag, /source, /.git, robots.txt) "
+                        "to map the app first.\n"
+                        "Do NOT summarise or conclude until a response actually contains "
+                        "the flag."
+                    ),
+                })
+                continue
             # No more tool calls — agent is done with its sub-task
             break
 
@@ -695,6 +759,8 @@ async def _run_agent_loop(
                     _did_deep_re = True
                 if not _did_solve_attempt and _is_solve_attempt(tool_name, raw_args):
                     _did_solve_attempt = True
+                if not _did_service_attempt and _is_service_attempt(tool_name, raw_args):
+                    _did_service_attempt = True
 
                 # ---- Raw flag extraction (BEFORE summarization) ----
                 # Run on the un-summarised output so a lossy summary can never
