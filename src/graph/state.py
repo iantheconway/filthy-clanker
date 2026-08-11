@@ -72,6 +72,7 @@ class TeamState(TypedDict):
     flag_format: str
     challenge_category: str   # CTF category (rev, pwn, crypto, …) — drives RE routing
     has_files: bool           # challenge ships local files (vs. only a live service)
+    provided_files: List[str] # absolute paths of the challenge's handout files, if any
     completed_agents: List[str]
     provider: Optional[str]
     context_token_estimate: int

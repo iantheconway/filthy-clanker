@@ -1,0 +1,26 @@
+# profiles/qwen32b.yaml — swap the WORKER models to the bigger dense
+# huihui_ai/qwen3-abliterated:32b, to test whether more reasoning capacity moves
+# the ceiling on the categories that need it (crypto / rev / pwn). The abliterated
+# 30B-A3B baseline disassembles and correctly DIAGNOSES rev/pwn challenges but
+# can't reason through to the answer — the wall is model reasoning, so a materially
+# stronger model is the only lever with real headroom.
+#
+# Layer AFTER nyu-ctf so you keep the CTF prompts + recon's execute_command:
+#   python evals/nyu_bench/run_eval.py --profile nyu-ctf,qwen32b
+#
+# Only `model` is overridden per agent. The 32B is dense (~20GB) and slower than
+# the 30B-A3B MoE (~3B active); expect longer runs — start with a targeted subset:
+#   ... --profile nyu-ctf,qwen32b --category crypto      # or: --only -rev-,-pwn-
+#
+# summarizer + refusal_specialist stay on the abliterated 9B: the 32B dense won't
+# comfortably co-reside with a second large model, and the 9B faithfully transcribes
+# flags / handles refusals well enough. Both are abliterated so no refusals leak in.
+
+agents:
+  supervisor:  {model: huihui_ai/qwen3-abliterated:32b}
+  recon:       {model: huihui_ai/qwen3-abliterated:32b}
+  exploit:     {model: huihui_ai/qwen3-abliterated:32b}
+  privesc:     {model: huihui_ai/qwen3-abliterated:32b}
+  webexplorer: {model: huihui_ai/qwen3-abliterated:32b}
+  vulnsearch:  {model: huihui_ai/qwen3-abliterated:32b}
+  reversing:   {model: huihui_ai/qwen3-abliterated:32b}

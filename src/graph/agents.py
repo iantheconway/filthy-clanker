@@ -20,7 +20,9 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from .state import TeamState, KnowledgeBase
-from .summarizer import maybe_summarize, _FLAG_RE, _HEX_FLAG_RE, _is_placeholder_flag
+from .summarizer import (
+    maybe_summarize, _FLAG_RE, _HEX_FLAG_RE, _is_placeholder_flag, _is_printable_flag,
+)
 
 # Import existing LLM clients
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -33,23 +35,35 @@ logger = logging.getLogger("filthy_clanker")
 # Raw-output flag extraction (runs BEFORE summarisation)
 # ---------------------------------------------------------------------------
 
-def _extract_flags_from_raw(raw: str, tool_args: dict | None = None) -> list[str]:
+def _extract_flags_from_raw(raw: str, tool_args: dict | None = None,
+                            flag_format: str = "") -> list[str]:
     """
     Scan the RAW (un-summarised) tool output for flag strings and return them.
     Called before maybe_summarize() so a lossy summary can never hide a flag.
+
+    Extraction is anchored to what a flag actually looks like: the known CTF
+    prefixes (``_FLAG_RE`` — flag{}, key{}, HTB{}, …) plus, when the challenge
+    states one, its own wrapper prefix. It deliberately does NOT use an unbounded
+    ``\\w{2,20}\\{…\\}`` pass — that firehose scooped ``word{…}`` fragments out of
+    crypto / xor output (``Bx{A]\\n+L*^lSKH\\n…}``) by the dozen, polluting
+    submitted_flags and risking a wrong end on a braceless-format challenge.
     """
     flags: list[str] = []
-    # Bracket-format flags: flag{...}, key{...}, HTB{...}, etc.
+    # Known CTF-prefix flags: flag{...}, key{...}, HTB{...}, etc.
     flags += _FLAG_RE.findall(raw)
-    # Broader single-word bracket flags that _FLAG_RE might miss
-    _broad = re.findall(r'\b\w{2,20}\{[^}]{1,200}\}', raw)
-    flags += [f for f in _broad if f not in flags]
+    # The challenge's own stated wrapper, if it names a prefix _FLAG_RE lacks.
+    fmt = (flag_format or "").strip().lower()
+    if "{" in fmt and "not provided" not in fmt:
+        prefix = fmt.split("{", 1)[0].strip()
+        if re.fullmatch(r'[\w.-]{1,20}', prefix):
+            flags += re.findall(re.escape(prefix) + r'\{[^}]{1,200}\}', raw, re.IGNORECASE)
     # 32-char hex strings when a flag-file context is present
     _args_str = json.dumps(tool_args) if tool_args else ""
     if re.search(r'(?:user|root|flag)\.txt', raw + _args_str, re.IGNORECASE):
         flags += _HEX_FLAG_RE.findall(raw)
-    # Drop placeholder/template flags (e.g. "flag{...}") so a hedge never counts.
-    flags = [f for f in flags if not _is_placeholder_flag(f)]
+    # Drop placeholder/template flags and any non-printable garbage that slipped
+    # through (real flags are printable ASCII with no control bytes).
+    flags = [f for f in flags if not _is_placeholder_flag(f) and _is_printable_flag(f)]
     return list(dict.fromkeys(flags))  # deduplicate preserving order
 
 
@@ -685,7 +699,8 @@ async def _run_agent_loop(
                 # ---- Raw flag extraction (BEFORE summarization) ----
                 # Run on the un-summarised output so a lossy summary can never
                 # hide a flag.  Captured flags go directly into the KB.
-                _raw_flags = _extract_flags_from_raw(raw_result, raw_args)
+                _raw_flags = _extract_flags_from_raw(
+                    raw_result, raw_args, flag_format=state.get("flag_format", ""))
                 if _raw_flags:
                     _existing_flags = set(updated_kb.get("flags", []))
                     _new_flags = [f for f in _raw_flags if f not in _existing_flags]
@@ -929,8 +944,10 @@ async def _run_agent_loop(
         if re.search(r'(?:user|root|flag)\.txt', _final_text, re.IGNORECASE):
             _text_flags += re.findall(r'\b([0-9a-f]{32})\b', _final_text, re.IGNORECASE)
         # A flag mentioned in the agent's own prose is the least trustworthy source
-        # (often a hedge/example like "flag{STFUj...}"); drop placeholders.
-        _text_flags = [f for f in _text_flags if not _is_placeholder_flag(f)]
+        # (often a hedge/example like "flag{STFUj...}"); drop placeholders and
+        # non-printable garbage.
+        _text_flags = [f for f in _text_flags
+                       if not _is_placeholder_flag(f) and _is_printable_flag(f)]
         if _text_flags:
             _existing = set(updated_kb.get("flags", []))
             updated_kb = dict(updated_kb)

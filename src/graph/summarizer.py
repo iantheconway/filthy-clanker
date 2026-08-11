@@ -137,6 +137,21 @@ def _is_placeholder_flag(flag: str) -> bool:
     return bool(_PLACEHOLDER_FLAG_RE.search(flag))
 
 
+def _is_printable_flag(flag: str) -> bool:
+    """True if ``flag`` is printable ASCII (no control characters or high bytes).
+
+    This is what separates a genuine ``flag{...}`` from the ``word{...}`` noise the
+    broad bracket regex scoops out of binary / crypto output — that garbage is
+    riddled with newlines, tabs, and 0x00–0x1f / non-ASCII bytes (e.g.
+    ``Si{\\nB+=i…}`` out of an xor blob). Internal spaces are allowed (a few CTF
+    flags contain them); only control and non-ASCII bytes are rejected. Apply
+    alongside ``_is_placeholder_flag`` so this junk never enters the KB and so a
+    braceless / "not provided" format challenge cannot end on it.
+    """
+    f = flag.strip()
+    return bool(f) and all(0x20 <= ord(c) <= 0x7e for c in f)
+
+
 def _flag_matches_format(flag: str, flag_format: str) -> bool:
     """True if ``flag`` plausibly matches the challenge's stated ``flag_format``.
 

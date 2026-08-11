@@ -46,9 +46,11 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import time
 import uuid
 import yaml
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -502,13 +504,20 @@ def _get_exposed_port(compose_file: Path, internal_port: int) -> Optional[str]:
 # Task prompt builder
 # ---------------------------------------------------------------------------
 
-def build_task(chal: CTFChallenge, target: Optional[str], submit_flag_mode: str = "gated") -> str:
+def build_task(chal: CTFChallenge, target: Optional[str], submit_flag_mode: str = "gated",
+               file_dir: Optional[Path] = None) -> str:
     """
     Construct the high-level task description to pass to the agent graph.
     Includes the category, flag format, description, target, and file listing.
 
     ``submit_flag_mode`` ("always"|"gated"|"off") shapes the flag-submission
     instructions so we never tell the agent to call a tool that is hidden.
+
+    ``file_dir`` overrides the directory the provided-file paths are built from —
+    used to hand the agent a space-free symlink so its unquoted shell commands
+    don't break on challenge dirs like ``Networking 1`` (a systematic failure: the
+    weak model often fails to quote a path with a space, so `strings <path>` sees
+    two bad args and returns nothing).
     """
     lines = [
         f"You are solving a Capture the Flag (CTF) challenge.",
@@ -537,7 +546,8 @@ def build_task(chal: CTFChallenge, target: Optional[str], submit_flag_mode: str 
     # The eval already knows Has files vs Has container; pass that structural
     # signal in so the agent reads local files vs attacks a service.
     if chal.has_files:
-        file_paths = [str(chal.challenge_dir / f) for f in chal.files]
+        _base = Path(file_dir) if file_dir else chal.challenge_dir
+        file_paths = [str(_base / f) for f in chal.files]
         lines += ["", "Provided files (full paths on disk):"]
         lines += [f"  {p}" for p in file_paths]
         lines += [
@@ -666,6 +676,7 @@ async def run_challenge_headless(
     flag_format: str = "",
     challenge_category: str = "",
     has_files: bool = False,
+    provided_files: Optional[list[str]] = None,
     tool_call_budget: int = 0,
 ) -> dict:
     """
@@ -688,6 +699,7 @@ async def run_challenge_headless(
     state = initial_state(
         task, provider, session_id, config, target_ip,
         flag_format=flag_format, challenge_category=challenge_category, has_files=has_files,
+        provided_files=provided_files,
     )
     input_payload: Any = state
     trajectory_logger.set_session(session_id)
@@ -832,6 +844,106 @@ def _log_trajectories(node_name: str, output: dict, tlogger: TrajectoryLogger) -
 
 
 # ---------------------------------------------------------------------------
+# Answer-key leak guard
+# ---------------------------------------------------------------------------
+
+# Files larger than this aren't scanned for the flag — real flags live in small
+# text/config/artifacts, and reading a multi-hundred-MB disk image per challenge
+# is pure cost (the artifact is preserved for file-based challenges anyway).
+_REDACT_MAX_BYTES = 64 * 1024 * 1024
+
+# Space-free symlink handed to the agent for challenge dirs whose name has a space
+# (see build_task / evaluate_challenge). Fixed path is safe — challenges run
+# sequentially — and recreated per challenge.
+_AGENT_CHAL_LINK = Path("/tmp/clanker_chal")
+
+
+def _handout_basenames(chal: CTFChallenge, cdir: Path) -> set:
+    """Basenames the player legitimately receives: the handout files themselves
+    plus every member inside any handout archive (so an extracted artifact like
+    flash's disk image, which is the sole member of its .zip, counts as handout)."""
+    names: set = set()
+    for f in (chal.files or []):
+        names.add(Path(f).name)
+        p = cdir / f
+        low = p.name.lower()
+        try:
+            if low.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar")):
+                with tarfile.open(p) as t:
+                    names.update(Path(m).name for m in t.getnames())
+            elif low.endswith(".zip"):
+                with zipfile.ZipFile(p) as z:
+                    names.update(Path(m).name for m in z.namelist())
+        except Exception:
+            pass
+    return names
+
+
+def _redact_answer_key(chal: CTFChallenge) -> dict:
+    """Scrub the ground-truth flag from every disk copy the agent could read as a
+    shortcut, while preserving the legitimate solve path.
+
+    The NYU dataset ships the flag literally in the challenge dir — challenge.json,
+    README.md, a writeup, the deploy Dockerfile, a bare `flag` file, sometimes the
+    source — and the agent runs shell commands in that dir, so it can `cat`/`grep`
+    the answer key instead of solving. (Confirmed: 52/65 dev challenge.json files
+    carry the flag, absent from the player handout.) The rule keys on how the flag
+    is legitimately obtained:
+
+      • **Service challenge** (``chal.container``): the flag is injected into the
+        running container at deploy, so NO disk file is a legitimate source —
+        redact every occurrence under the challenge dir. (Enumerating metadata
+        filenames is whack-a-mole; a `writeup` slipped past one such list.)
+      • **File challenge** (no container): the flag legitimately lives inside the
+        handout artifact the player analyses (a disk image, pcap, ciphertext,
+        binary). Redact everything EXCEPT the handout (``chal.files`` + archive
+        members), so the artifact solve stays possible but metadata/writeups don't
+        leak the answer.
+
+    Run this AFTER the container is up (the live service keeps the real flag).
+    Returns {path: original_bytes}; always pair with ``_restore_files`` in a
+    ``finally`` so the dataset is intact for the next run.
+    """
+    flag = (chal.flag or "").strip()
+    backup: dict = {}
+    if not flag:
+        return backup
+    flag_b = flag.encode()
+    cdir = Path(chal.challenge_dir)
+    preserve: set = set() if chal.container else _handout_basenames(chal, cdir)
+    for path in cdir.rglob("*"):
+        try:
+            if not path.is_file() or path.name in preserve:
+                continue
+            if path.stat().st_size > _REDACT_MAX_BYTES:
+                continue
+            data = path.read_bytes()
+        except Exception:
+            continue
+        if flag_b not in data:
+            continue
+        try:
+            path.write_bytes(data.replace(flag_b, b"[REDACTED]"))
+            backup[path] = data
+        except Exception as exc:
+            log.warning("Could not redact answer-key flag from %s: %s", path, exc)
+    if backup:
+        log.info("Answer-key guard: redacted flag from %d file(s) [%s]: %s",
+                 len(backup), "service" if chal.container else "file-based",
+                 [p.name for p in backup])
+    return backup
+
+
+def _restore_files(backup: dict) -> None:
+    """Restore files scrubbed by :func:`_redact_answer_key`."""
+    for path, data in backup.items():
+        try:
+            path.write_bytes(data)
+        except Exception as exc:
+            log.warning("Could not restore %s after redaction: %s", path, exc)
+
+
+# ---------------------------------------------------------------------------
 # Per-challenge orchestrator
 # ---------------------------------------------------------------------------
 
@@ -868,6 +980,7 @@ async def evaluate_challenge(
 
     target: Optional[str] = None
     result: dict = {}
+    answer_key_backup: dict = {}
 
     try:
         # ── Docker environment ─────────────────────────────────────────────
@@ -910,8 +1023,33 @@ async def evaluate_challenge(
         elif chal.container and no_docker:
             log.warning("--no-docker set; skipping container for %s", chal.name)
 
+        # ── Close the answer-key leak ──────────────────────────────────────
+        # Now that the container (if any) is running with the real flag baked in,
+        # scrub the flag from the on-disk metadata so the agent must earn it from
+        # the live service / by computation, not by cat-ing challenge.json.
+        answer_key_backup = _redact_answer_key(chal)
+
+        # ── Space-free path for the agent ──────────────────────────────────
+        # Many challenge dirs have spaces ("Networking 1", "the road less
+        # traveled"). The weak model often runs `strings <path>` unquoted, so the
+        # space splits the path into bad args and the tool returns nothing — a
+        # systematic loss of legitimately-solvable challenges. Hand the agent a
+        # space-free symlink so its commands can't break on spaces.
+        agent_file_dir: Optional[Path] = None
+        if chal.has_files and " " in str(chal.challenge_dir):
+            try:
+                if _AGENT_CHAL_LINK.is_symlink() or _AGENT_CHAL_LINK.exists():
+                    _AGENT_CHAL_LINK.unlink()
+                _AGENT_CHAL_LINK.symlink_to(chal.challenge_dir)
+                agent_file_dir = _AGENT_CHAL_LINK
+                log.info("Space-free symlink for agent: %s -> %s",
+                         _AGENT_CHAL_LINK, chal.challenge_dir)
+            except Exception as exc:
+                log.warning("Could not create space-free symlink: %s", exc)
+
         # ── Build task prompt ───────────────────────────────────────────────
-        task = build_task(chal, target, submit_flag_mode=flag_pool.mode)
+        task = build_task(chal, target, submit_flag_mode=flag_pool.mode,
+                          file_dir=agent_file_dir)
         log.info("Task prompt built (%d chars)", len(task))
 
         # ── Run graph ──────────────────────────────────────────────────────
@@ -929,6 +1067,8 @@ async def evaluate_challenge(
             flag_format=chal.flag_format,
             challenge_category=chal.category,
             has_files=chal.has_files,
+            provided_files=([str(chal.challenge_dir / f) for f in chal.files]
+                            if chal.has_files else None),
             tool_call_budget=tool_call_budget,
         )
         duration_sec = round(time.time() - _t0, 1)
@@ -956,6 +1096,16 @@ async def evaluate_challenge(
         log.info("Metrics: %d tool call(s), %.1fs", tool_calls, duration_sec)
 
     finally:
+        # Restore the redacted metadata so the dataset is intact for the next run.
+        _restore_files(answer_key_backup)
+
+        # Remove the space-free symlink (if we made one this challenge).
+        try:
+            if _AGENT_CHAL_LINK.is_symlink():
+                _AGENT_CHAL_LINK.unlink()
+        except Exception:
+            pass
+
         # ── Docker cleanup (always runs) ───────────────────────────────────
         if chal.container and not no_docker and _COMPOSE_CMD is not None:
             compose_file = chal.challenge_dir / "docker-compose.yml"
@@ -1170,6 +1320,10 @@ async def main() -> None:
                         help="Restrict to a single category")
     parser.add_argument("--max-chals", type=int, default=None,
                         help="Stop after N challenges")
+    parser.add_argument("--only", default=None,
+                        help="Comma-separated substrings; keep only challenges whose "
+                             "canonical name matches ANY of them (e.g. '-web-,cry-eps'). "
+                             "Applied after --category, before --max-chals.")
     parser.add_argument("--timeout", type=int, default=600,
                         help="Per-challenge timeout in seconds")
     parser.add_argument("--provider", default=None,
@@ -1226,6 +1380,15 @@ async def main() -> None:
         challenges = list(dataset.filter(category=args.category))
     else:
         challenges = [v for _, v in dataset.all()]
+
+    if args.only:
+        subs = [s.strip().lower() for s in args.only.split(",") if s.strip()]
+        challenges = [
+            c for c in challenges
+            if any(s in CTFChallenge(c, dataset.basedir).canonical_name.lower()
+                   for s in subs)
+        ]
+        log.info("--only %s → %d challenge(s) selected", args.only, len(challenges))
 
     if args.max_chals:
         challenges = challenges[: args.max_chals]
