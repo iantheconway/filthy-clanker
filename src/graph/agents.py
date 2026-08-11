@@ -615,6 +615,12 @@ async def _run_agent_loop(
     # flag is served there, not on disk). Forces "act" over "analyse-and-idle".
     _did_service_attempt: bool = False
     _web_gate_used: int = 0
+    # General "act, don't just analyse" nudge — the category-agnostic fallback that
+    # replaces the old 4-turn unproductive breaker (a HITL-era rule that terminated
+    # ~33% of challenges, solvable ones included). If an agent makes ZERO tool calls
+    # in an invocation it analysed without acting; nudge it to run a tool instead of
+    # ending the turn idle, bounded so a stubborn model can't loop forever.
+    _general_gate_used: int = 0
     # Duplicate-output detection: tool_name → set of MD5 hashes of raw results.
     # If a tool returns the exact same bytes twice, we inject a strategy-change hint.
     _seen_output_hashes: dict[str, set] = {}
@@ -718,6 +724,31 @@ async def _run_agent_loop(
                         "to map the app first.\n"
                         "Do NOT summarise or conclude until a response actually contains "
                         "the flag."
+                    ),
+                })
+                continue
+            # General "act, don't just analyse" nudge (fallback for any category the
+            # specific gates above don't cover — forensics, misc, etc.). If the agent
+            # made ZERO tool calls this invocation it produced analysis without action;
+            # nudge it to run a tool rather than ending idle. This replaces the old
+            # unproductive breaker's blunt termination with the gate pattern.
+            if not _made_tool_call and _general_gate_used < _RE_GATE_MAX:
+                _general_gate_used += 1
+                if state.get("has_files"):
+                    _how = ("analyse the provided files with a real tool NOW — "
+                            "file / strings / xxd / binwalk, or write and RUN a python3 "
+                            "script to decode / carve / compute.")
+                else:
+                    _how = ("interact with the target service NOW — curl / nc it and "
+                            "read the response.")
+                logger.info("[%s] Idle (no tool call this turn) — nudging to act "
+                            "(gate %d/%d)", agent_name, _general_gate_used, _RE_GATE_MAX)
+                new_messages.append({
+                    "role": "user",
+                    "content": (
+                        "You produced analysis but called NO tool, so you made no "
+                        "progress. Do not stop or summarise — " + _how + " Report only "
+                        "after a tool has actually run and you have read its output."
                     ),
                 })
                 continue

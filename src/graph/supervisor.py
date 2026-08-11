@@ -146,19 +146,19 @@ async def supervisor_node(state: TeamState) -> dict:
     flags = _kb_flags if _trust_kb_flags else []
 
     # -----------------------------------------------------------------------
-    # 1a. Unproductive-streak circuit breaker. If agents have taken several turns
-    #     in a row without executing a single tool (emitting text but never
-    #     acting — the exploit-spin failure mode), the team is stuck and more
-    #     time won't help. End the challenge instead of burning the full timeout.
+    # 1a. Unproductive streak — INTERACTIVE (HITL) mode only. A long idle streak
+    #     (agents emitting text but never running a tool) is worth pausing for a
+    #     human hint when a human is in the loop.
+    #
+    #     In AUTONOMOUS mode we do NOT terminate here. The old "team is stuck →
+    #     end challenge" breaker was a HITL-era heuristic that cut ~33% of eval
+    #     challenges — solvable ones included — after just a few idle turns. It is
+    #     now redundant: the completion gates (agents.py) nudge idling agents to
+    #     ACT rather than idle, and the wall-clock timeout bounds runtime. Let the
+    #     team keep trying until it solves or the timeout ends it.
     # -----------------------------------------------------------------------
     unproductive = state.get("unproductive_streak", 0)
-    if unproductive >= max_unproductive and not flags:
-        if autonomous:
-            logger.warning(
-                "[Supervisor] %d consecutive unproductive turns (no tool calls) — "
-                "team is stuck; ending challenge.", unproductive,
-            )
-            return {"next": "__end__"}
+    if unproductive >= max_unproductive and not flags and not autonomous:
         human_response = interrupt({
             "reason": "stuck_no_tool_calls",
             "message": (
