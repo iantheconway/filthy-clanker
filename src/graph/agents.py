@@ -28,6 +28,11 @@ from .summarizer import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from llms import AnthropicClient, GeminiClient, OllamaClient
 
+# Opt-in SFT trajectory capture (no-op unless CLANKER_CAPTURE_SFT is set). Captures
+# the exact (system, messages, tools) → assistant turns for fine-tuning — the data
+# the legacy analytics logger throws away. See src/sft_capture.py.
+from sft_capture import capture_enabled as _sft_enabled, record_turn as _sft_record_turn
+
 logger = logging.getLogger("filthy_clanker")
 
 
@@ -1094,6 +1099,25 @@ async def _run_agent_loop(
     _new_streak = 0 if _made_tool_call else _prev_streak + 1
     if not _made_tool_call:
         logger.info("[%s] Idle turn (no tool calls) — unproductive_streak=%d", agent_name, _new_streak)
+
+    # ---- SFT capture (opt-in) ----
+    # Record the full trajectory of THIS agent invocation for fine-tuning: the exact
+    # system prompt + tool schema shown to the model, and the complete message list
+    # (every assistant turn with tool_calls + the tool results it saw). One record per
+    # invocation avoids the O(n^2) blow-up of dumping the growing history each iteration.
+    # No-op unless CLANKER_CAPTURE_SFT is set; never raises into the loop.
+    if _sft_enabled():
+        _sft_record_turn(
+            session_id=state.get("session_id", ""),
+            agent=agent_name,
+            provider=provider,
+            model=model,
+            system_prompt=full_system,
+            tools=raw_tools,
+            messages=list(messages) + new_messages,
+            task=state.get("task", ""),
+            knowledge_base=updated_kb,
+        )
 
     return {
         "messages": new_messages,

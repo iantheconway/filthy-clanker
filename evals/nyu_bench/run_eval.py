@@ -802,7 +802,8 @@ async def run_challenge_headless(
                         # Log trajectories for agent nodes
                         if node_name in ("recon", "exploit", "privesc", "webexplorer",
                                          "vulnsearch", "reversing", "refusal_specialist"):
-                            _log_trajectories(node_name, output, trajectory_logger)
+                            _log_trajectories(node_name, output, trajectory_logger,
+                                              session_id=session_id, task=task)
                 if interrupted:
                     break
                 # Tool-call budget: end a challenge that keeps acting without solving.
@@ -873,8 +874,17 @@ async def run_challenge_headless(
     }
 
 
-def _log_trajectories(node_name: str, output: dict, tlogger: TrajectoryLogger) -> None:
-    """Best-effort extraction of (tool_call, result) pairs from node output."""
+def _log_trajectories(node_name: str, output: dict, tlogger: TrajectoryLogger,
+                      session_id: str = "", task: str = "") -> None:
+    """Best-effort extraction of (tool_call, result) pairs from node output.
+
+    ANALYTICS ONLY. Records a *derived* view (parsed tool_name/args + result snippet +
+    KB-after) for the success-score heuristic. It does NOT capture the literal
+    prompt/completion, and passes an empty knowledge_base_before — so its success_score
+    is unreliable in eval mode. For fine-tuning data use the opt-in full-fidelity capture
+    in src/sft_capture.py (run with --capture-sft). session_id/task are threaded through
+    only so these records are attributable to a challenge.
+    """
     messages = output.get("messages", [])
     kb_after = output.get("knowledge_base", {})
     for i, msg in enumerate(messages):
@@ -900,7 +910,7 @@ def _log_trajectories(node_name: str, output: dict, tlogger: TrajectoryLogger) -
                         tool_args = b.get("input", {})
             if tool_name and result_text:
                 tlogger.record(
-                    state_before={"knowledge_base": {}, "task": "", "session_id": ""},
+                    state_before={"knowledge_base": {}, "task": task, "session_id": session_id},
                     action={"tool_name": tool_name, "arguments": tool_args},
                     result=result_text,
                     state_after={"knowledge_base": kb_after,
@@ -1325,11 +1335,15 @@ def generate_report(results: list[dict], run_id: str, args: argparse.Namespace) 
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "config": {
             "split": args.split,
+            "subset": getattr(args, "subset", None),
+            "challenge_list": getattr(args, "challenge_list", None),
             "category_filter": args.category,
             "max_challenges": args.max_chals,
             "timeout_sec": args.timeout,
             "provider": args.provider,
             "dataset_version": args.version,
+            "worker_model": getattr(args, "worker_model", None),
+            "models": getattr(args, "_effective_models", None),
         },
         "summary": {
             "total": total,
@@ -1406,6 +1420,133 @@ def generate_report(results: list[dict], run_id: str, args: argparse.Namespace) 
 
 
 # ---------------------------------------------------------------------------
+# Model overrides (for A/B model-comparison runs)
+# ---------------------------------------------------------------------------
+
+def _apply_model_overrides(config: dict, args: argparse.Namespace) -> None:
+    """Rewrite agent model tags per --worker-model / --summarizer-model / --model-override.
+
+    --worker-model sets the tag for every agent EXCEPT 'summarizer' (the small helper
+    model), so one flag swaps the whole team between e.g. the abliterated Qwen3 30B-A3B
+    baseline and gemma-4-abliterated:26b for a clean comparison. --model-override
+    AGENT=TAG (repeatable) sets one agent and wins over --worker-model. The effective
+    per-agent models are stashed on args for the run report.
+    """
+    agents = config.get("agents", {})
+    changed: dict = {}
+    if getattr(args, "worker_model", None):
+        for name, cfg in agents.items():
+            if name == "summarizer":
+                continue
+            cfg["model"] = args.worker_model
+            changed[name] = args.worker_model
+    if getattr(args, "summarizer_model", None) and "summarizer" in agents:
+        agents["summarizer"]["model"] = args.summarizer_model
+        changed["summarizer"] = args.summarizer_model
+    for spec in (getattr(args, "model_override", None) or []):
+        if "=" not in spec:
+            log.warning("Ignoring --model-override %r (expected AGENT=TAG)", spec)
+            continue
+        name, tag = (s.strip() for s in spec.split("=", 1))
+        if name in agents:
+            agents[name]["model"] = tag
+            changed[name] = tag
+        else:
+            log.warning("--model-override: unknown agent '%s' (known: %s)",
+                        name, ", ".join(sorted(agents)))
+    args._effective_models = {name: cfg.get("model") for name, cfg in agents.items()}
+    if changed:
+        log.info("Model overrides applied: %s", changed)
+
+
+# ---------------------------------------------------------------------------
+# Challenge-subset selection (CTFTiny + custom canonical-name lists)
+# ---------------------------------------------------------------------------
+
+_CTFTINY_JSON = EVAL_DIR / "ctftiny.json"
+
+# Fold short (dataset canonical uses cry/for/msc) and long (CTFTiny 'category' field
+# uses crypto/forensics/misc) category spellings onto one token so they compare equal.
+_CAT_CANON = {
+    "cry": "cry", "crypto": "cry", "cryptography": "cry",
+    "for": "for", "forensics": "for",
+    "msc": "msc", "misc": "msc", "miscellaneous": "msc",
+    "pwn": "pwn", "rev": "rev", "web": "web",
+}
+
+
+def _cat_canon(cat: str) -> str:
+    c = (cat or "").strip().lower()
+    return _CAT_CANON.get(c, c)
+
+
+def _norm_name(s: str) -> str:
+    """Normalise a challenge name for matching: lowercase, spaces/hyphens→_, drop punct."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"[\s\-]+", "_", s)
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    return re.sub(r"_+", "_", s).strip("_")
+
+
+def _match_key(year: str, split_letter: str, category: str, name: str) -> str:
+    return f"{year}{split_letter}-{_cat_canon(category)}-{_norm_name(name)}"
+
+
+def _key_from_canonical(canonical_name: str) -> str:
+    """Fold a dataset canonical_name (e.g. '2016q-pwn-warmup', '2021f-cry-Collision-Course')
+    into the same normalised key used for subset matching."""
+    m = re.match(r"(\d{4})([qf])-([A-Za-z]+)-(.+)", canonical_name or "")
+    if not m:
+        return _norm_name(canonical_name)
+    return _match_key(m.group(1), m.group(2).lower(), m.group(3), m.group(4))
+
+
+def _load_ctftiny_keys() -> dict:
+    """{normalised_key: ctftiny_id} for the 50 CTFTiny challenges (evals/nyu_bench/ctftiny.json)."""
+    with open(_CTFTINY_JSON, encoding="utf-8") as fh:
+        data = json.load(fh)
+    keys: dict = {}
+    for cid, meta in data.items():
+        letter = "q" if "quals" in str(meta.get("event", "")).lower() else "f"
+        keys[_match_key(str(meta.get("year", "")), letter,
+                        str(meta.get("category", "")), str(meta.get("challenge", "")))] = cid
+    return keys
+
+
+def _select_subset_pairs(target_keys: dict, version: str,
+                         splits: tuple = ("development", "test")) -> list:
+    """Load ``splits`` and return [(chal_info, dataset)] matching a target key.
+
+    CTFTiny spans CSAW 2017-2023 across BOTH the development and test splits, so we load
+    each and union. Any target not found in any loaded split is logged loudly (so a
+    missing 'test' download, or a canonical-name mismatch, is visible not silent).
+    """
+    pairs: list = []
+    matched: set = set()
+    for sp in splits:
+        try:
+            ds = CTFDataset(split=sp, version=version)
+        except Exception as exc:
+            log.warning("Subset: could not load split '%s' (%s) — skipping.", sp, exc)
+            continue
+        for _, cinfo in ds.all():
+            try:
+                key = _key_from_canonical(CTFChallenge(cinfo, ds.basedir).canonical_name)
+            except Exception:
+                continue
+            if key in target_keys and key not in matched:
+                pairs.append((cinfo, ds))
+                matched.add(key)
+    missing = sorted(target_keys[k] for k in target_keys if k not in matched)
+    if missing:
+        log.warning("Subset: %d/%d target(s) NOT found in splits %s: %s",
+                    len(missing), len(target_keys), list(splits), ", ".join(missing))
+    log.info("Subset: matched %d/%d challenge(s) across splits %s.",
+             len(matched), len(target_keys), list(splits))
+    return pairs
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1464,7 +1605,33 @@ async def main() -> None:
     parser.add_argument("--version", default="v20250206",
                         choices=["v20250206", "v20241008"],
                         help="NYU CTF dataset version")
+    parser.add_argument("--subset", default=None, choices=["ctftiny"],
+                        help="Run a named challenge subset instead of a whole split. "
+                             "'ctftiny' = the 50-challenge NYU-CTF subset (loads dev+test "
+                             "and filters by canonical name; see evals/nyu_bench/ctftiny.json).")
+    parser.add_argument("--challenge-list", default=None,
+                        help="Path to a file of canonical challenge names (one per line, "
+                             "'#' comments ok) to run; loads dev+test and filters.")
+    parser.add_argument("--worker-model", default=None,
+                        help="Ollama model tag for ALL worker agents (every agent except "
+                             "'summarizer'), overriding agents.yaml — for model A/B runs, "
+                             "e.g. huihui_ai/gemma-4-abliterated:26b.")
+    parser.add_argument("--summarizer-model", default=None,
+                        help="Override just the summarizer agent's model tag.")
+    parser.add_argument("--model-override", action="append", default=[], metavar="AGENT=TAG",
+                        help="Override one agent's model (repeatable), e.g. "
+                             "--model-override reversing=huihui_ai/qwen3-abliterated:32b. "
+                             "Wins over --worker-model.")
+    parser.add_argument("--capture-sft", action="store_true",
+                        help="Capture full (system,messages,tools)->assistant trajectories to "
+                             "data/sft/ for fine-tuning (sets CLANKER_CAPTURE_SFT=1).")
     args = parser.parse_args()
+
+    if args.subset and args.challenge_list:
+        parser.error("--subset and --challenge-list are mutually exclusive.")
+    if args.capture_sft:
+        os.environ["CLANKER_CAPTURE_SFT"] = "1"
+        log.info("SFT capture ENABLED — trajectories → data/sft/ (CLANKER_CAPTURE_SFT=1).")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1476,34 +1643,55 @@ async def main() -> None:
     log.info("Split: %s | Category filter: %s | Timeout: %ds",
              args.split, args.category or "all", args.timeout)
 
-    # ── Load dataset ─────────────────────────────────────────────────────────
-    log.info("Loading NYU CTF dataset (split=%s, version=%s)…", args.split, args.version)
-    dataset = CTFDataset(split=args.split, version=args.version)
-    log.info("Dataset loaded: %d total challenges", len(dataset))
-
-    if args.category:
-        challenges = list(dataset.filter(category=args.category))
+    # ── Select challenges (whole split, or a subset / custom list) ───────────
+    if args.subset or args.challenge_list:
+        if args.challenge_list:
+            target_keys = {}
+            for line in Path(args.challenge_list).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    target_keys[_key_from_canonical(line)] = line
+            log.info("Loaded %d challenge id(s) from %s", len(target_keys), args.challenge_list)
+        else:  # args.subset == "ctftiny"
+            target_keys = _load_ctftiny_keys()
+            log.info("CTFTiny subset: %d target challenge(s).", len(target_keys))
+        challenge_pairs = _select_subset_pairs(target_keys, args.version)
     else:
-        challenges = [v for _, v in dataset.all()]
+        log.info("Loading NYU CTF dataset (split=%s, version=%s)…", args.split, args.version)
+        dataset = CTFDataset(split=args.split, version=args.version)
+        log.info("Dataset loaded: %d total challenges", len(dataset))
+        if args.category:
+            challenges = list(dataset.filter(category=args.category))
+        else:
+            challenges = [v for _, v in dataset.all()]
+        challenge_pairs = [(c, dataset) for c in challenges]
+
+    # Category filter for subset/list mode (normal mode already filtered via the dataset).
+    if args.category and (args.subset or args.challenge_list):
+        _tc = _cat_canon(args.category)
+        challenge_pairs = [
+            (c, ds) for (c, ds) in challenge_pairs
+            if _cat_canon(CTFChallenge(c, ds.basedir).category) == _tc
+        ]
 
     if args.only:
         subs = [s.strip().lower() for s in args.only.split(",") if s.strip()]
-        challenges = [
-            c for c in challenges
-            if any(s in CTFChallenge(c, dataset.basedir).canonical_name.lower()
-                   for s in subs)
+        challenge_pairs = [
+            (c, ds) for (c, ds) in challenge_pairs
+            if any(s in CTFChallenge(c, ds.basedir).canonical_name.lower() for s in subs)
         ]
-        log.info("--only %s → %d challenge(s) selected", args.only, len(challenges))
+        log.info("--only %s → %d challenge(s) selected", args.only, len(challenge_pairs))
 
     if args.max_chals:
-        challenges = challenges[: args.max_chals]
+        challenge_pairs = challenge_pairs[: args.max_chals]
 
-    log.info("Running %d challenge(s).", len(challenges))
+    log.info("Running %d challenge(s).", len(challenge_pairs))
 
     # ── Load agents.yaml and validate prerequisites ─────────────────────────
     config = load_config(PROJECT_ROOT / "agents.yaml", profile=args.profile)
     if args.profile:
         log.info("Config profile overlay applied: %s", args.profile)
+    _apply_model_overrides(config, args)  # --worker-model / --model-override for A/B runs
     validate_api_keys(config)  # exits with clear message if any key is missing
 
     training_dir = PROJECT_ROOT / config.get("settings", {}).get(
@@ -1550,16 +1738,16 @@ async def main() -> None:
         async with create_checkpointer(args.db) as checkpointer:
             graph = build_graph(flag_pool, config, checkpointer)
 
-            for i, chal_info in enumerate(challenges, 1):
-                cname = CTFChallenge(chal_info, dataset.basedir).canonical_name
+            for i, (chal_info, chal_ds) in enumerate(challenge_pairs, 1):
+                cname = CTFChallenge(chal_info, chal_ds.basedir).canonical_name
                 if cname in already_scored:
                     log.info("Challenge %d/%d: skipping already-scored %s",
-                             i, len(challenges), cname)
+                             i, len(challenge_pairs), cname)
                     continue
-                log.info("Challenge %d/%d", i, len(challenges))
+                log.info("Challenge %d/%d", i, len(challenge_pairs))
                 result = await evaluate_challenge(
                     chal_info=chal_info,
-                    dataset=dataset,
+                    dataset=chal_ds,
                     graph=graph,
                     config=config,
                     trajectory_logger=trajectory_logger,
