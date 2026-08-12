@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -858,25 +859,50 @@ _REDACT_MAX_BYTES = 64 * 1024 * 1024
 _AGENT_CHAL_LINK = Path("/tmp/clanker_chal")
 
 
-def _handout_basenames(chal: CTFChallenge, cdir: Path) -> set:
-    """Basenames the player legitimately receives: the handout files themselves
-    plus every member inside any handout archive (so an extracted artifact like
-    flash's disk image, which is the sole member of its .zip, counts as handout)."""
-    names: set = set()
+def _handout_signature(chal: CTFChallenge, cdir: Path) -> tuple:
+    """What the player legitimately receives, for redaction preservation.
+
+    Returns (exact_paths, flag_content_hashes):
+      • exact_paths — resolved paths of the handout files themselves (``chal.files``).
+        Always preserved: a flag inside a handout the player downloads (slurp.py, a
+        provided binary `bo`/`release`) is a LEGIT read, not a leak.
+      • flag_content_hashes — sha256 of any handout file / archive-member whose
+        content CONTAINS the flag. Preserves an EXTRACTED handout artifact by content
+        (not basename) — so a metadata README.md that merely shares a name with a
+        benign handout member is NOT wrongly preserved (the basename collision that
+        would otherwise reopen the leak).
+    """
+    flag_b = (chal.flag or "").encode()
+    paths: set = set()
+    hashes: set = set()
+
+    def _note(content: bytes) -> None:
+        if flag_b and flag_b in content:
+            hashes.add(hashlib.sha256(content).hexdigest())
+
     for f in (chal.files or []):
-        names.add(Path(f).name)
         p = cdir / f
+        try:
+            paths.add(p.resolve())
+        except Exception:
+            pass
         low = p.name.lower()
         try:
             if low.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar")):
                 with tarfile.open(p) as t:
-                    names.update(Path(m).name for m in t.getnames())
+                    for m in t.getmembers():
+                        if m.isfile() and m.size <= _REDACT_MAX_BYTES:
+                            _note(t.extractfile(m).read())
             elif low.endswith(".zip"):
                 with zipfile.ZipFile(p) as z:
-                    names.update(Path(m).name for m in z.namelist())
+                    for info in z.infolist():
+                        if not info.is_dir() and info.file_size <= _REDACT_MAX_BYTES:
+                            _note(z.read(info.filename))
+            elif p.is_file() and p.stat().st_size <= _REDACT_MAX_BYTES:
+                _note(p.read_bytes())
         except Exception:
             pass
-    return names
+    return paths, hashes
 
 
 def _redact_answer_key(chal: CTFChallenge) -> dict:
@@ -887,18 +913,18 @@ def _redact_answer_key(chal: CTFChallenge) -> dict:
     README.md, a writeup, the deploy Dockerfile, a bare `flag` file, sometimes the
     source — and the agent runs shell commands in that dir, so it can `cat`/`grep`
     the answer key instead of solving. (Confirmed: 52/65 dev challenge.json files
-    carry the flag, absent from the player handout.) The rule keys on how the flag
-    is legitimately obtained:
+    carry the flag.) The rule is uniform for service AND file challenges: redact the
+    flag from every file EXCEPT the actual handout — ``chal.files`` themselves plus
+    any archive member whose content carries the flag (an extracted artifact like a
+    disk image or a provided source `slurp.py`). Reading the flag from a file the
+    player was given is legitimate; reading it from challenge.json / a writeup / the
+    deploy source the player never receives is the leak.
 
-      • **Service challenge** (``chal.container``): the flag is injected into the
-        running container at deploy, so NO disk file is a legitimate source —
-        redact every occurrence under the challenge dir. (Enumerating metadata
-        filenames is whack-a-mole; a `writeup` slipped past one such list.)
-      • **File challenge** (no container): the flag legitimately lives inside the
-        handout artifact the player analyses (a disk image, pcap, ciphertext,
-        binary). Redact everything EXCEPT the handout (``chal.files`` + archive
-        members), so the artifact solve stays possible but metadata/writeups don't
-        leak the answer.
+    (Earlier this special-cased service challenges to "redact everything", which
+    over-redacted handouts whose flag is in the provided file — slurp.py, `bo`,
+    `release` — breaking solvable challenges. Matching by content, not basename,
+    avoids both that and the reverse: a metadata README.md sharing a name with a
+    benign handout member must still be redacted.)
 
     Run this AFTER the container is up (the live service keeps the real flag).
     Returns {path: original_bytes}; always pair with ``_restore_files`` in a
@@ -910,10 +936,12 @@ def _redact_answer_key(chal: CTFChallenge) -> dict:
         return backup
     flag_b = flag.encode()
     cdir = Path(chal.challenge_dir)
-    preserve: set = set() if chal.container else _handout_basenames(chal, cdir)
+    handout_paths, handout_hashes = _handout_signature(chal, cdir)
     for path in cdir.rglob("*"):
         try:
-            if not path.is_file() or path.name in preserve:
+            if not path.is_file():
+                continue
+            if path.resolve() in handout_paths:          # a handout file itself
                 continue
             if path.stat().st_size > _REDACT_MAX_BYTES:
                 continue
@@ -922,15 +950,18 @@ def _redact_answer_key(chal: CTFChallenge) -> dict:
             continue
         if flag_b not in data:
             continue
+        # Preserve an extracted handout artifact (content matches a flag-carrying
+        # handout member) — that's a legit read, not a leak.
+        if hashlib.sha256(data).hexdigest() in handout_hashes:
+            continue
         try:
             path.write_bytes(data.replace(flag_b, b"[REDACTED]"))
             backup[path] = data
         except Exception as exc:
             log.warning("Could not redact answer-key flag from %s: %s", path, exc)
     if backup:
-        log.info("Answer-key guard: redacted flag from %d file(s) [%s]: %s",
-                 len(backup), "service" if chal.container else "file-based",
-                 [p.name for p in backup])
+        log.info("Answer-key guard: redacted flag from %d non-handout file(s): %s",
+                 len(backup), [p.name for p in backup])
     return backup
 
 
