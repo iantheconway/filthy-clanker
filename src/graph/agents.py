@@ -685,8 +685,14 @@ async def _run_agent_loop(
                     "role": "user",
                     "content": (
                         "STOP — you have only inspected the file, not attempted a "
-                        "solution. Write and RUN a real solve now via execute_command, "
-                        "and read its output before concluding:\n"
+                        "solution.\n"
+                        "FIRST: if the output ALREADY revealed the flag/secret — a "
+                        "plaintext string, a decoded message, a recovered password, or "
+                        "the success message a service prints on a correct solve (the "
+                        "flag may be plaintext with NO braces) — call submit_flag with "
+                        "that exact string NOW instead of computing further.\n"
+                        "OTHERWISE, write and RUN a real solve via execute_command and "
+                        "read its output before concluding:\n"
                         "  crypto: python3 -c \"from Crypto... ; ...\"  (or sympy/gmpy2/"
                         "z3, openssl, RsaCtfTool) — actually compute/decrypt.\n"
                         "  rev/pwn: run the binary with crafted input, or a pwntools/"
