@@ -1,0 +1,8 @@
+# Balanced CTFTiny slice — one challenge per category, for the model bake-off.
+# Canonical names (year + q/f + short-category + name). Matched via run_eval --challenge-list.
+2018q-cry-babycrypto
+2023q-for-1black0white
+2018q-msc-algebra
+2017q-pwn-pilot
+2017q-rev-tablez
+2021q-web-poem_collection

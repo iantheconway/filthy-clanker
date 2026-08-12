@@ -327,6 +327,8 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase,
     if flags_found:
         existing_flags = set(kb.get("flags", []))
         kb["flags"] = list(existing_flags | set(flags_found))
+        # Parsed from a tool RESULT → grounded (a real find, may end the challenge).
+        kb["grounded_flags"] = list(set(kb.get("grounded_flags", [])) | set(flags_found))
 
     # Interesting attack surface (directories, files from gobuster/ferox)
     dir_pattern = re.compile(r'(?:Status: 200|Found:)\s*(\/\S+)', re.IGNORECASE)
@@ -815,6 +817,11 @@ async def _run_agent_loop(
                     if _new_flags:
                         updated_kb = dict(updated_kb)
                         updated_kb["flags"] = list(_existing_flags | set(_raw_flags))
+                        # These came from RAW TOOL OUTPUT → GROUNDED. Only grounded flags may
+                        # end a challenge (see supervisor §1); a flag the model merely types is
+                        # a guess and must not.
+                        updated_kb["grounded_flags"] = list(
+                            set(updated_kb.get("grounded_flags", [])) | set(_raw_flags))
                         logger.info(
                             "[%s] Flags extracted from RAW output (pre-summarisation): %s",
                             agent_name, _new_flags,

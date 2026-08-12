@@ -28,7 +28,11 @@ class KnowledgeBase(TypedDict, total=False):
     tech_stack: Dict[str, List[str]]       # "ip:port" -> ["Software/version", ...]
     response_headers: Dict[str, Dict[str, str]]  # "ip:port" -> {header: value}
     credentials: List[Dict[str, str]]      # [{"user": ..., "pass": ..., "service": ...}]
-    flags: List[str]
+    flags: List[str]                       # All flag candidates (tool-grounded AND model-typed)
+    grounded_flags: List[str]              # Flags extracted from TOOL OUTPUT only (never model
+                                           # prose). Only these may END a challenge — a typed
+                                           # guess must not, or the run dies the moment the model
+                                           # guesses instead of continuing to solve.
     attack_surface: List[str]              # Discovered paths, endpoints, CVEs, vulns
     notes: List[str]                       # Freeform analyst notes
     # Work-history fields — survive compaction, prevent agents re-doing completed work

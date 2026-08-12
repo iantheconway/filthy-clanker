@@ -132,18 +132,22 @@ async def supervisor_node(state: TeamState) -> dict:
     # -----------------------------------------------------------------------
     _trust_kb_flags = settings.get("trust_kb_flags_to_end", True)
     _flag_format = state.get("flag_format", "")
-    _kb_flags = [f for f in kb.get("flags", [])
-                 if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]
-    if _kb_flags and _trust_kb_flags:
-        logger.info("[Supervisor] Flag captured: %s. Mission complete!", _kb_flags)
+    # Only flags extracted from TOOL OUTPUT (grounded) may end a challenge. A flag the model
+    # merely TYPED in its reasoning (e.g. a name-derived flag{maze_runner}) is a GUESS — it is
+    # still recorded in kb["flags"] for final scoring, but must NOT end the run, or the challenge
+    # dies the instant the model guesses instead of continuing to solve. (This supersedes the old
+    # trust_kb_flags True/False binary, which ended on any format-matching string incl. guesses.)
+    _grounded_flags = [f for f in kb.get("grounded_flags", [])
+                       if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]
+    if _grounded_flags and _trust_kb_flags:
+        logger.info("[Supervisor] Grounded flag captured from tool output: %s. Mission complete!",
+                    _grounded_flags)
         return {"next": "__end__"}
-    # `flags` drives the "do we actually have a flag?" guards below. When we don't
-    # trust KB-extracted flags to END a session (eval mode), treat the run as
-    # flagless: a plausible-but-unverified flag{...} the agent typed must NOT end
-    # the challenge (that caused ~15/20 premature wrong-exits). Only a verified
-    # submit_flag (handled by the eval harness's solved_event) or the final KB
-    # scoring counts as a real solve.
-    flags = _kb_flags if _trust_kb_flags else []
+    # `flags` drives the "do we actually have a flag?" guards below. A guessed (non-grounded) flag
+    # must NOT count as having a flag, or the guards would stop the team working. When trust is off
+    # (base profile) treat the run as flagless; when on, only grounded tool-output flags count. A
+    # verified submit_flag (solved_event) is handled separately by the eval harness.
+    flags = _grounded_flags if _trust_kb_flags else []
 
     # -----------------------------------------------------------------------
     # 1a. Unproductive streak — INTERACTIVE (HITL) mode only. A long idle streak
@@ -176,50 +180,15 @@ async def supervisor_node(state: TeamState) -> dict:
         }
 
     # -----------------------------------------------------------------------
-    # 1e. Autonomous win scan — scan recent message text for flag patterns that
-    #     the KB extractor may have missed (e.g. inside a summarized block).
-    #     Only in autonomous mode to avoid unnecessary parsing overhead in HITL.
+    # 1e. (REMOVED 2026-08-12) The old "autonomous win scan" ended the challenge on any
+    #     format-matching flag found in recent MESSAGE TEXT. That text includes the model's
+    #     own reasoning, so it ended runs on GUESSES (e.g. flag{maze_runner}) — the bug that
+    #     terminated challenges the instant the model typed a plausible flag. Grounding now
+    #     happens at the source: agents._extract_flags_from_raw marks tool-output flags as
+    #     grounded (§1 ends only on those), while agents' prose-flag extraction still records
+    #     typed flags into kb["flags"] for final scoring. Net: a typed flag is scored but never
+    #     ends the run early; only a tool-grounded flag (or a verified submit_flag) ends it.
     # -----------------------------------------------------------------------
-    if autonomous and _trust_kb_flags:
-        import re as _re
-        _FLAG_SCAN = _re.compile(
-            r'(?:flag|key|ctf|htb|thm|picoctf|csaw|crypto|web|pwn|misc|rev|forensics'
-            r'|rtcp|ductf|darkctf|bucket|nite|jctf|cyber)\{[^}]{1,200}\}',
-            _re.IGNORECASE,
-        )
-        _HEX_SCAN = _re.compile(r'\b([0-9a-f]{32})\b', _re.IGNORECASE)
-        messages = state.get("messages", [])
-        # Only scan the last few messages — earlier ones are already processed.
-        _scan_msgs = messages[-6:] if len(messages) > 6 else messages
-        _found_flags: list[str] = []
-        for _msg in _scan_msgs:
-            _content = _msg.get("content", "")
-            if isinstance(_content, list):
-                _content = " ".join(
-                    b.get("text", "") or b.get("content", "")
-                    for b in _content if isinstance(b, dict)
-                )
-            _content = str(_content)
-            _found_flags += _FLAG_SCAN.findall(_content)
-            # Hex flags only when a flag-file reference is nearby
-            if _re.search(r'(?:user|root|flag)\.txt', _content, _re.IGNORECASE):
-                _found_flags += _HEX_SCAN.findall(_content)
-
-        _found_flags = [f for f in _found_flags
-                        if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]
-        if _found_flags:
-            _existing = set(kb.get("flags", []))
-            _new = [f for f in _found_flags if f not in _existing]
-            if _new:
-                logger.info(
-                    "[Supervisor] Autonomous win scan found flags in message text: %s", _new
-                )
-                updated_kb = dict(kb)
-                updated_kb["flags"] = list(_existing | set(_new))
-                return {
-                    "knowledge_base": updated_kb,
-                    "next": "__end__",
-                }
 
     # -----------------------------------------------------------------------
     # 1b. Shell / foothold already obtained → skip straight to privesc

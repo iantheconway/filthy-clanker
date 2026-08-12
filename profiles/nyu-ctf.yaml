@@ -20,14 +20,15 @@
 # Compare against the base (no profile) run to measure the prompting effect.
 
 settings:
-  # trust_kb_flags_to_end: whether a KB-extracted flag{...} may END a challenge.
-  # EXPERIMENT RESULT (revpwn5, 30B abliterated): setting this False (only a verified
-  # submit_flag ends the run) removed premature wrong-guess exits BUT converted zero
-  # extra solves and caused 21/31 challenges to spin to the timeout (~3x slower) — the
-  # reasoning ceiling, not early exits, is the wall for this model. So keep True here:
-  # a format-matching guess fails FAST (it would fail anyway), and a correct KB flag
-  # still ends promptly; the reversing agent's deep-RE pass runs first regardless.
-  # Revisit False for a materially stronger model that can actually use the extra tries.
+  # trust_kb_flags_to_end: whether a GROUNDED flag (one extracted from TOOL OUTPUT) may END a
+  # challenge. As of 2026-08-12 this applies ONLY to grounded flags — a flag the model merely
+  # TYPES in its reasoning (a guess like flag{maze_runner}) NO LONGER ends the run; it is recorded
+  # for final scoring but the team keeps solving (with an anti-brute-force cap on submit_flag).
+  # See src/graph/supervisor.py §1 (ends on kb["grounded_flags"]) + agents._extract_flags_from_raw.
+  # So keeping True is safe + fast: a real tool-output find ends promptly, a wrong guess does not.
+  # HISTORY: this supersedes the old True/False binary. Flipping the binary to False once removed
+  # guess-exits but ran 3x slower with 0 extra solves on the 30B; the grounded-flag fix gives the
+  # correct "one wrong guess -> keep trying" behaviour WITHOUT that slowdown, for every model.
   trust_kb_flags_to_end: true
 
 agents:

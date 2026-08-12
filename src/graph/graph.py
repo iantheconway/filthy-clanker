@@ -179,6 +179,7 @@ def initial_state(
         # ambiguity (possible decoy), so surface them as leads instead of guessing.
         if len(swept["flags"]) == 1:
             kb["flags"] = swept["flags"]
+            kb["grounded_flags"] = list(swept["flags"])  # from a handout file → grounded (may end)
             logger.info("[file_sweep] Flag found in provided files: %s", swept["flags"])
         elif swept["flags"]:
             swept["leads"] = swept["flags"] + swept["leads"]
