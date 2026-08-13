@@ -68,7 +68,37 @@ models; fine-tuning a general open-weight LLM is in/near the prohibited zone. Cl
 HTB self-distill (local model), CTF-Dojo data (CC-BY-NC), or distilling a strong **open-weight**
 model. Full analysis in `../docs/SFT_PLAN.md`.
 
-## Not built yet (next, once a path is chosen)
-The trainer itself (QLoRA config), the GGUF/Ollama export, and the CTFTiny A/B eval loop — see
-`../docs/SFT_PLAN.md §4`. Target model to fine-tune is still open (dense abliterated-32B is the
-recommended default, pending the out-of-the-box model bake-off).
+## Training the model (QLoRA)
+
+Once you have a POSITIVE dataset, fine-tune a LoRA adapter and serve it in Ollama:
+
+```bash
+pip install -r training/requirements-train.txt
+# 1. train — assistant-only loss, tool-aware chat template (masking via the base's chat template)
+python training/train_qlora.py --config training/qlora_config.yaml --data training/data/sft.jsonl
+#    (--dry-run builds + tokenizes the dataset and reports lengths without training)
+# 2. merge adapter -> fp16 HF weights
+python training/merge_lora.py --base Qwen/Qwen3-32B --adapter training/out/clanker-qlora \
+    --out training/out/clanker-merged
+# 3. GGUF + quantize + register in Ollama (llama.cpp, external clone)
+python convert_hf_to_gguf.py training/out/clanker-merged --outfile clanker.gguf --outtype f16
+llama-quantize clanker.gguf clanker-q4_k_m.gguf Q4_K_M
+printf 'FROM ./clanker-q4_k_m.gguf\n' > Modelfile && ollama create clanker-sft -f Modelfile
+# 4. evaluate the fine-tune with the existing harness (same --worker-model swap as the bake-off)
+python evals/intercode/run_intercode.py --worker-model clanker-sft --max-tasks 20 ...
+```
+
+Check dataset readiness anytime: `python training/check_dataset.py`.
+
+### VRAM reality (read before picking a base)
+`base_model` must be **HF weights (fp16/bf16)**, NOT an Ollama GGUF. A **32B QLoRA @ 16k ctx needs
+~24GB+** — it will **not** fit the 16GB RTX 5070 Ti. Practical options on this box: a **14B base**
+(fits 16GB — best first target), a shorter `max_seq_len`, `device_map="auto"` CPU/disk offload
+(slow), or a rented GPU. The GTX 1080 Ti (Pascal) can't do bf16/modern bitsandbytes, so treat this
+as single-GPU training on the 5070 Ti. Captured trajectories are large (median ~12k tok), so
+context length is the dominant VRAM cost.
+
+### Current data status (from `check_dataset.py`)
+**106 trajectories, 2,770 assistant turns, but 0 solved sessions** — all failures. The capture
+format is correct and converts cleanly, but training needs POSITIVES (the three paths above)
+first, or it just learns the weak model's failure patterns.
