@@ -1069,13 +1069,13 @@ async def _run_agent_loop(
             updated_kb["flags"] = list(_existing | set(_text_flags))
             logger.info("[%s] Flags extracted from agent text: %s", agent_name, _text_flags)
 
-    # For the exploit agent: only mark complete if a flag was actually captured.
-    # If exploit ran and failed (no flag in KB), do NOT add it to completed_agents —
-    # the exploit_attempts counter + HITL handles the exhaustion case, and we want
-    # the supervisor to be able to re-route to exploit after human guidance or after
-    # other agents surface new information.
+    # For the exploit agent: only mark complete if a GROUNDED flag was captured (extracted
+    # from tool output). A flag the model merely TYPED is a guess — it must NOT mark exploit
+    # complete, or the guess ends the exploit lane and the team stops trying (the residual half
+    # of the guess-termination bug). If exploit ran without grounding a flag, do NOT add it to
+    # completed_agents so the supervisor can re-route to it.
     # For all other agents: the substantive-completion check is sufficient.
-    _flag_captured = bool(updated_kb.get("flags"))
+    _flag_captured = bool(updated_kb.get("grounded_flags"))
     if agent_name == "exploit" and _is_substantive_completion and not _flag_captured:
         _is_substantive_completion = False
         logger.info(
