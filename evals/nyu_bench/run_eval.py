@@ -1595,8 +1595,10 @@ async def main() -> None:
     parser.add_argument("--timeout", type=int, default=600,
                         help="Per-challenge timeout in seconds")
     parser.add_argument("--provider", default=None,
-                        choices=["anthropic", "gemini", "ollama"],
-                        help="Global LLM provider override (default: per-agent config)")
+                        choices=["anthropic", "gemini", "ollama", "openai"],
+                        help="Global LLM provider override (default: per-agent config). "
+                             "'openai' = any OpenAI-compatible endpoint (OPENAI_BASE_URL + "
+                             "OPENAI_API_KEY, e.g. Together).")
     parser.add_argument("--output-dir",
                         default=os.getenv("EVAL_RESULTS_DIR") or str(EVAL_DIR / "results"),
                         help="Directory for JSONL/JSON/Markdown reports. Defaults to "
@@ -1647,6 +1649,10 @@ async def main() -> None:
     parser.add_argument("--capture-sft", action="store_true",
                         help="Capture full (system,messages,tools)->assistant trajectories to "
                              "data/sft/ for fine-tuning (sets CLANKER_CAPTURE_SFT=1).")
+    parser.add_argument("--max-cost", type=float, default=0.0,
+                        help="Hard USD budget cap for PAID (API) runs. Cumulative API cost is "
+                             "checked BETWEEN challenges; the run stops once it exceeds this "
+                             "(0 = no cap). Pair with --max-chals for a belt-and-suspenders bound.")
     args = parser.parse_args()
 
     if args.subset and args.challenge_list:
@@ -1787,6 +1793,16 @@ async def main() -> None:
                 _append_jsonl(result, jsonl_path)
                 _flush_results(results, run_id, args, output_dir)
 
+                # ── Budget guard (paid API runs) ──────────────────────────────
+                if args.max_cost:
+                    from llms.cost import total_cost as _total_cost
+                    _spent = _total_cost()
+                    log.info("[budget] API cost so far: $%.4f / $%.2f cap", _spent, args.max_cost)
+                    if _spent >= args.max_cost:
+                        log.warning("[budget] cost cap $%.2f reached ($%.4f) after %d challenge(s) "
+                                    "— stopping the run.", args.max_cost, _spent, i)
+                        break
+
     finally:
         await mcp_pool.disconnect()
         log.info("MCP pool disconnected.")
@@ -1804,6 +1820,11 @@ async def main() -> None:
     log.info("=" * 70)
     log.info("EVAL COMPLETE: %d / %d solved (%.1f%%)", solved, total,
              100 * solved / total if total else 0)
+    from llms.cost import summary as _cost_summary
+    _cs = _cost_summary()
+    if _cs["calls"]:
+        log.info("[budget] FINAL API cost: $%.4f  (input=%d output=%d cache_read=%d calls=%d)",
+                 _cs["cost"], _cs["input"], _cs["output"], _cs["cache_read"], _cs["calls"])
     log.info("Results written to %s", output_dir)
 
 

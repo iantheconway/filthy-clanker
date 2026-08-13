@@ -1,0 +1,14 @@
+# Balanced 12-challenge NYU CTF slice (2 per category) for the frontier / cloud-open
+# comparison. Canonical names taken from real dev-split runs, so they resolve cleanly.
+2016q-cry-broken_box
+2015q-cry-eps
+2016q-rev-rock
+2014q-rev-aerosol_can
+2016q-pwn-warmup
+2016q-pwn-tutorial
+2016q-web-mfw
+2013q-web-guess_harder
+2016q-for-watchword
+2015q-for-sharpturn
+2016q-msc-regexpire
+2013q-msc-networking_1

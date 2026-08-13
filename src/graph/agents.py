@@ -26,7 +26,7 @@ from .summarizer import (
 
 # Import existing LLM clients
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from llms import AnthropicClient, GeminiClient, OllamaClient
+from llms import AnthropicClient, GeminiClient, OllamaClient, OpenAIClient
 
 # Opt-in SFT trajectory capture (no-op unless CLANKER_CAPTURE_SFT is set). Captures
 # the exact (system, messages, tools) → assistant turns for fine-tuning — the data
@@ -111,6 +111,14 @@ def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
             agent_model = agent_cfg.get("model", "")
             model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["gemini"]
             llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        elif provider == "openai":
+            # Any OpenAI-compatible endpoint (Together/DeepInfra/OpenRouter/vLLM). base_url +
+            # key from the agent config or env (OPENAI_BASE_URL / OPENAI_API_KEY, or an
+            # api_key_env pointer like TOGETHER_API_KEY). Model id has no ":" (e.g. Qwen/...).
+            _base = agent_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
+            _key = os.getenv(agent_cfg.get("api_key_env", "OPENAI_API_KEY"), "") or os.getenv("OPENAI_API_KEY", "")
+            model = agent_cfg.get("model", "") or os.getenv("OPENAI_MODEL", "")
+            llm = OpenAIClient(model=model, base_url=_base, api_key=_key)
         else:
             raise ValueError(f"Unknown provider override: {provider}")
     else:
@@ -124,6 +132,10 @@ def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
         elif provider == "ollama":
             host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
             llm = OllamaClient(host=host, model=model)
+        elif provider == "openai":
+            _base = agent_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
+            _key = os.getenv(agent_cfg.get("api_key_env", "OPENAI_API_KEY"), "") or os.getenv("OPENAI_API_KEY", "")
+            llm = OpenAIClient(model=model, base_url=_base, api_key=_key)
         else:
             raise ValueError(f"Unknown provider in agents.yaml for this agent: {provider}")
 
@@ -962,8 +974,12 @@ async def _run_agent_loop(
                 block = llm.make_tool_result_message(tc.get("id", ""), result)
                 combined["content"].append(block)
             new_messages.append(combined)
+        elif provider == "openai":
+            # OpenAI-compatible: one tool-role message per result, keyed by tool_call_id.
+            for tc, result in tool_results:
+                new_messages.append(llm.make_tool_result_message(tc.get("id", ""), result))
         else:
-            # Gemini and Ollama: one message per result
+            # Gemini and Ollama: one message per result (by tool name)
             for tc, result in tool_results:
                 new_messages.append(llm.make_tool_result_message(tc.get("name", ""), result))
 

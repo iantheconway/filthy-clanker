@@ -22,7 +22,7 @@ from typing import Any, Literal
 from langgraph.types import interrupt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from llms import AnthropicClient, GeminiClient, OllamaClient
+from llms import AnthropicClient, GeminiClient, OllamaClient, OpenAIClient
 
 from .state import TeamState
 from .summarizer import _is_placeholder_flag, _flag_matches_format
@@ -62,6 +62,11 @@ def _resolve_llm(state: TeamState, agent_cfg: dict):
             agent_model = agent_cfg.get("model", "")
             model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["gemini"]
             llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        elif provider == "openai":
+            _base = agent_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
+            _key = os.getenv(agent_cfg.get("api_key_env", "OPENAI_API_KEY"), "") or os.getenv("OPENAI_API_KEY", "")
+            model = agent_cfg.get("model", "") or os.getenv("OPENAI_MODEL", "")
+            llm = OpenAIClient(model=model, base_url=_base, api_key=_key)
         else:
             raise ValueError(f"Unknown provider override: {provider}")
     else:
@@ -74,6 +79,10 @@ def _resolve_llm(state: TeamState, agent_cfg: dict):
         elif provider == "ollama":
             host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
             llm = OllamaClient(host=host, model=model)
+        elif provider == "openai":
+            _base = agent_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
+            _key = os.getenv(agent_cfg.get("api_key_env", "OPENAI_API_KEY"), "") or os.getenv("OPENAI_API_KEY", "")
+            llm = OpenAIClient(model=model, base_url=_base, api_key=_key)
         else:
             raise ValueError(f"Unknown provider in agents.yaml for supervisor: {provider}")
 

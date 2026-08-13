@@ -133,17 +133,22 @@ class AnthropicClient(BaseLLMClient):
             _cache_read, _cache_write, (text or "").replace("\n", " "),
         )
 
+        _usage_dict = {
+            "input_tokens": getattr(usage, "input_tokens", 0),
+            "output_tokens": getattr(usage, "output_tokens", 0),
+            "cache_read_input_tokens": _cache_read,
+            "cache_creation_input_tokens": _cache_write,
+        } if usage else {}
+        # Feed the budget guard (no-op for free/local models; here it's a paid Anthropic call).
+        from .cost import add_usage as _add_cost
+        _add_cost(self.model, _usage_dict)
+
         return {
             "text": text,
             "tool_calls": tool_calls,
             "raw": response,
             "stop_reason": response.stop_reason,
-            "usage": {
-                "input_tokens": getattr(usage, "input_tokens", 0),
-                "output_tokens": getattr(usage, "output_tokens", 0),
-                "cache_read_input_tokens": _cache_read,
-                "cache_creation_input_tokens": _cache_write,
-            } if usage else {},
+            "usage": _usage_dict,
         }
 
     def parse_tool_calls(self, response: dict[str, Any]) -> list[dict[str, Any]]:
