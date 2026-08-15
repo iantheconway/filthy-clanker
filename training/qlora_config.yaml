@@ -30,7 +30,7 @@ target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 learning_rate: 2.0e-4
 num_train_epochs: 2
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 4   # small dataset (~80 ex): lower accum -> more optimizer steps
 warmup_ratio: 0.03
 weight_decay: 0.0
 lr_scheduler_type: cosine

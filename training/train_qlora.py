@@ -61,6 +61,42 @@ def load_config(path: str | None, overrides: dict) -> dict:
     return cfg
 
 
+def _chatml_assistant_mask(tokenizer, input_ids: list) -> list:
+    """Template-agnostic assistant-token mask for ChatML models (Qwen3, etc.) whose chat template
+    lacks the ``{% generation %}`` markers — so ``return_assistant_tokens_mask`` comes back all-zero
+    and every example would be dropped. Masks every token inside an ``<|im_start|>assistant …
+    <|im_end|>`` span (content + tool_calls + the end token); leaves system/user/tool turns 0.
+    """
+    try:
+        im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    except Exception:
+        return [0] * len(input_ids)
+    if im_start is None or im_end is None or im_start < 0 or im_end < 0:
+        return [0] * len(input_ids)
+    mask = [0] * len(input_ids)
+    i, n = 0, len(input_ids)
+    while i < n:
+        if input_ids[i] == im_start:
+            j, role_toks = i + 1, []
+            while j < n:
+                s = tokenizer.decode([input_ids[j]])
+                role_toks.append(input_ids[j]); j += 1
+                if "\n" in s:
+                    break
+            role = tokenizer.decode(role_toks).strip()
+            k = j
+            while k < n and input_ids[k] != im_end:
+                k += 1
+            if role == "assistant":
+                for t in range(j, min(k + 1, n)):
+                    mask[t] = 1
+            i = k + 1
+        else:
+            i += 1
+    return mask
+
+
 def build_dataset(data_path: str, tokenizer, max_seq_len: int):
     """Read the SFT JSONL and tokenize with assistant-only label masking.
 
@@ -89,7 +125,11 @@ def build_dataset(data_path: str, tokenizer, max_seq_len: int):
         input_ids = enc["input_ids"]
         amask = enc.get("assistant_masks") or enc.get("assistant_tokens_mask")
         if not amask or sum(amask) == 0:
-            dropped_mask += 1          # no assistant tokens found — nothing to train on
+            # Qwen3 & many ChatML templates lack {% generation %}, so the built-in mask is all-zero.
+            # Fall back to a template-agnostic <|im_start|>assistant span mask.
+            amask = _chatml_assistant_mask(tokenizer, input_ids)
+        if not amask or sum(amask) == 0:
+            dropped_mask += 1          # genuinely no assistant span — nothing to train on
             continue
         if len(input_ids) > max_seq_len:
             dropped_len += 1           # skip rather than truncate mid-trajectory

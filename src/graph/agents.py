@@ -31,7 +31,10 @@ from llms import AnthropicClient, GeminiClient, OllamaClient, OpenAIClient
 # Opt-in SFT trajectory capture (no-op unless CLANKER_CAPTURE_SFT is set). Captures
 # the exact (system, messages, tools) → assistant turns for fine-tuning — the data
 # the legacy analytics logger throws away. See src/sft_capture.py.
-from sft_capture import capture_enabled as _sft_enabled, record_turn as _sft_record_turn
+from sft_capture import (
+    capture_enabled as _sft_enabled, record_turn as _sft_record_turn,
+    stash_invocation as _sft_stash, clear_stash as _sft_clear_stash,
+)
 
 logger = logging.getLogger("filthy_clanker")
 
@@ -584,12 +587,25 @@ async def _run_agent_loop(
         if _has_submit_flag else ""
     )
 
+    # Force VISIBLE reasoning: models (esp. Anthropic) keep their reasoning in redacted
+    # "thinking" blocks we can't capture, and otherwise emit bare tool calls — so ~77% of
+    # captured tool-turns had no text. Requiring one plain-text sentence before each call
+    # puts the reasoning into the trajectory (trainable) and keeps train/inference consistent
+    # (the local model learns to reason-then-act, and is prompted to do so at inference too).
+    _reason_note = (
+        "\n\n=== EXPLAIN BEFORE ACTING ===\n"
+        "Before EVERY tool call, write ONE short sentence of plain-text reasoning: what you are "
+        "about to do and why (what you expect it to reveal). Then make the tool call. Never emit "
+        "a tool call with no preceding reasoning."
+    )
+
     full_system = (
         f"{system_prompt}\n\n"
         f"=== AVAILABLE TOOLS (exact names — use only these) ===\n{tool_names_list}\n\n"
         f"=== KNOWLEDGE BASE (shared with team) ===\n{kb_text}\n"
         f"=== CURRENT TASK ===\n{state.get('task', 'Hack the target machine.')}"
         f"{_submit_flag_note}"
+        f"{_reason_note}"
     )
 
     # Trim verbose tool descriptions to keep the per-turn prompt small on local
@@ -643,6 +659,17 @@ async def _run_agent_loop(
     # Duplicate-output detection: tool_name → set of MD5 hashes of raw results.
     # If a tool returns the exact same bytes twice, we inject a strategy-change hint.
     _seen_output_hashes: dict[str, set] = {}
+
+    # Register this invocation so a run cancelled mid-loop by the challenge timeout still
+    # captures its partial trajectory. References the live message lists (no per-iteration
+    # copy); flush_stash() reads them on cancellation. Cleared after the normal capture below.
+    if _sft_enabled():
+        _sft_stash(
+            session_id=state.get("session_id", ""), agent=agent_name, provider=provider,
+            model=model, system_prompt=full_system, tools=raw_tools,
+            messages=messages, new_messages=new_messages, task=state.get("task", ""),
+            knowledge_base=updated_kb,
+        )
 
     for iteration in range(max_iterations):
         try:
@@ -1141,6 +1168,7 @@ async def _run_agent_loop(
             task=state.get("task", ""),
             knowledge_base=updated_kb,
         )
+        _sft_clear_stash()
 
     return {
         "messages": new_messages,

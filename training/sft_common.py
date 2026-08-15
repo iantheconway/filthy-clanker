@@ -95,6 +95,14 @@ def normalize_conversation(system_prompt: str, messages: list) -> list[dict]:
                 bt = b.get("type")
                 if bt == "text":
                     text_parts.append(b.get("text", ""))
+                elif bt == "thinking":
+                    # Fold any plaintext reasoning into the turn's text so it becomes a training
+                    # target. Anthropic redacts thinking (empty → no-op here); the provider-specific
+                    # signature is dropped. Visible reasoning now comes from the "explain before
+                    # acting" prompt directive as normal text blocks (handled above).
+                    _tk = (b.get("thinking") or "").strip()
+                    if _tk:
+                        text_parts.append(_tk)
                 elif bt == "tool_use":
                     tid = b.get("id") or new_id()
                     tool_calls.append({"id": tid, "type": "function",

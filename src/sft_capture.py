@@ -142,3 +142,52 @@ def record_turn(
         if os.getenv("CLANKER_SFT_DEBUG", "").strip() in ("1", "true", "yes"):
             import traceback
             traceback.print_exc()
+
+
+# ── Timeout-safe capture ──────────────────────────────────────────────────────
+# record_turn() only fires when an agent invocation RETURNS normally. A run killed
+# by the challenge timeout is usually cancelled MID-ReAct-loop, so the (often most
+# valuable, longest) in-progress trajectory would be lost — this is why HTB runs that
+# time out captured nothing. The stash fixes that: the agent loop registers its
+# in-progress invocation once (by REFERENCE to the live ``messages``/``new_messages``
+# lists — no per-iteration copy, so no O(n^2)); on cancellation the run harness calls
+# flush_stash() to write whatever was accumulated. The graph runs one invocation at a
+# time, so a single global slot is safe.
+_STASH: Optional[dict] = None
+
+
+def stash_invocation(**kwargs) -> None:
+    """Register the in-progress invocation so a timeout can still capture it. No-op if disabled."""
+    global _STASH
+    if not capture_enabled():
+        return
+    _STASH = kwargs
+
+
+def clear_stash() -> None:
+    """Drop the stash (call after a normal record_turn so a later flush can't duplicate it)."""
+    global _STASH
+    _STASH = None
+
+
+def flush_stash() -> bool:
+    """Write the stashed in-progress invocation, if any (call from the timeout handler).
+
+    Reads the live message lists that were stashed by reference. Returns True if a
+    record was written. Never raises.
+    """
+    global _STASH
+    kw, _STASH = _STASH, None
+    if not kw:
+        return False
+    try:
+        msgs = list(kw.get("messages") or []) + list(kw.get("new_messages") or [])
+        record_turn(
+            session_id=kw.get("session_id", ""), agent=kw.get("agent", ""),
+            provider=kw.get("provider", ""), model=kw.get("model", ""),
+            system_prompt=kw.get("system_prompt", ""), tools=kw.get("tools") or [],
+            messages=msgs, task=kw.get("task", ""), knowledge_base=kw.get("knowledge_base") or {},
+        )
+        return True
+    except Exception:
+        return False

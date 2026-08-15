@@ -29,8 +29,9 @@ _PRICES: dict[str, tuple[float, float, float]] = {
     # OpenAI-compatible open models (Together/DeepInfra-ish, cheap; no prompt-cache pricing)
     "qwen3-235b":       (0.20, 0.60, 0.0),
     "qwen":             (0.20, 0.60, 0.0),
+    "gpt-oss":          (0.15, 0.60, 0.0),   # OpenAI OPEN-weight (Apache-2.0); serverless on Together
     "deepseek":         (0.60, 1.70, 0.0),
-    "llama":            (0.20, 0.60, 0.0),
+    "llama":            (1.05, 1.05, 0.0),   # e.g. Llama-3.3-70B-Turbo on Together ($1.04/$1.04)
 }
 
 _lock = threading.Lock()
