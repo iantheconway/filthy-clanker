@@ -96,13 +96,17 @@ def _resolve_profile_path(profile: str, root: str) -> str:
     )
 
 
-def load_config(path: str = "agents.yaml", profile: str | None = None) -> dict:
-    """Load the agents config, optionally overlaying a profile.
+def load_config(path: str = "agents.yaml", profile: "str | list[str] | None" = None) -> dict:
+    """Load the agents config, optionally overlaying one or more profiles.
 
     ``path`` is the base config (agents.yaml). ``profile`` names a thin overlay in
-    profiles/ (e.g. "opus", "cheap", "ollama") that only specifies the fields it
-    changes — typically each agent's provider/model/host — with everything else
-    inherited from the base. Paths are resolved relative to the project root.
+    profiles/ (e.g. "opus", "cheap", "nyu-ctf") that only specifies the fields it
+    changes — typically each agent's provider/model/host/prompt — with everything
+    else inherited from the base. Paths are resolved relative to the project root.
+
+    Multiple profiles may be given as a comma-separated string ("nyu-ctf,qwen-agent")
+    or a list; they are deep-merged in order, so a later overlay wins on conflicts
+    (e.g. nyu-ctf sets CTF prompts, then qwen-agent swaps just the model).
     """
     root = _project_root()
     base_path = path if os.path.isabs(path) else os.path.join(root, path)
@@ -114,10 +118,15 @@ def load_config(path: str = "agents.yaml", profile: str | None = None) -> dict:
         config = yaml.safe_load(fh) or {}
 
     if profile:
-        overlay_path = _resolve_profile_path(profile, root)
-        with open(overlay_path, "r", encoding="utf-8") as fh:
-            overlay = yaml.safe_load(fh) or {}
-        config = _deep_merge(config, overlay)
+        if isinstance(profile, str):
+            profile_names = [p.strip() for p in profile.split(",") if p.strip()]
+        else:
+            profile_names = [str(p).strip() for p in profile if str(p).strip()]
+        for pname in profile_names:
+            overlay_path = _resolve_profile_path(pname, root)
+            with open(overlay_path, "r", encoding="utf-8") as fh:
+                overlay = yaml.safe_load(fh) or {}
+            config = _deep_merge(config, overlay)
 
     # Interpolate ${VAR} / ${VAR:-default} from the environment (e.g. the
     # Ollama-only agents.yaml sets host: "${OLLAMA_HOST}"). Fail loudly if a

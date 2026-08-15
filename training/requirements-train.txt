@@ -1,0 +1,10 @@
+# QLoRA training deps (separate from the harness's requirements.txt — install into the
+# training env only). Pin as needed for your CUDA. Training needs an Ampere+ GPU for bf16.
+torch>=2.3
+transformers>=4.44        # needs apply_chat_template(return_assistant_tokens_mask=True) + tools=
+peft>=0.11
+bitsandbytes>=0.43        # 4-bit NF4 + paged_adamw_8bit
+datasets>=2.19
+accelerate>=0.30
+pyyaml>=6.0
+# GGUF export uses llama.cpp (external clone) — not a pip dep.

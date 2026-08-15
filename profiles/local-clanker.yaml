@@ -1,0 +1,47 @@
+# Local eval profile: point every worker agent at a local llama-server (OpenAI-compatible
+# endpoint) serving Qwen3.5-35B-A3B on the RTX 5070 Ti. Used to eval the base model vs our
+# fine-tuned LoRA on the held-out set — the SAME profile serves both; the only difference is
+# whether llama-server was launched with `--lora` (see docs/LOCAL_EVAL.md).
+#
+#   python evals/nyu_bench/run_eval.py --profile nyu-ctf,local-clanker,cloud-haiku-summ \
+#       --challenge-list evals/nyu_bench/eval_holdout.txt --provider openai
+#
+# api_key_env points at LLAMA_LOCAL_KEY (llama-server ignores the value, but the OpenAI client
+# requires SOME key present). Export a dummy before running:  export LLAMA_LOCAL_KEY=sk-local
+# Set OLLAMA_HOST to a dead port so the rare Ollama-only refusal path fails fast.
+agents:
+  supervisor:
+    provider: openai
+    base_url: "http://host.docker.internal:8080/v1"
+    api_key_env: LLAMA_LOCAL_KEY
+    model: "clanker"
+  recon:
+    provider: openai
+    base_url: "http://host.docker.internal:8080/v1"
+    api_key_env: LLAMA_LOCAL_KEY
+    model: "clanker"
+  exploit:
+    provider: openai
+    base_url: "http://host.docker.internal:8080/v1"
+    api_key_env: LLAMA_LOCAL_KEY
+    model: "clanker"
+  privesc:
+    provider: openai
+    base_url: "http://host.docker.internal:8080/v1"
+    api_key_env: LLAMA_LOCAL_KEY
+    model: "clanker"
+  webexplorer:
+    provider: openai
+    base_url: "http://host.docker.internal:8080/v1"
+    api_key_env: LLAMA_LOCAL_KEY
+    model: "clanker"
+  vulnsearch:
+    provider: openai
+    base_url: "http://host.docker.internal:8080/v1"
+    api_key_env: LLAMA_LOCAL_KEY
+    model: "clanker"
+  reversing:
+    provider: openai
+    base_url: "http://host.docker.internal:8080/v1"
+    api_key_env: LLAMA_LOCAL_KEY
+    model: "clanker"

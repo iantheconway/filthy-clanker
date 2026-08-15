@@ -20,11 +20,21 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from .state import TeamState, KnowledgeBase
-from .summarizer import maybe_summarize, _FLAG_RE, _HEX_FLAG_RE, _is_placeholder_flag
+from .summarizer import (
+    maybe_summarize, _FLAG_RE, _HEX_FLAG_RE, _is_placeholder_flag, _is_printable_flag,
+)
 
 # Import existing LLM clients
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from llms import AnthropicClient, GeminiClient, OllamaClient
+from llms import AnthropicClient, GeminiClient, OllamaClient, OpenAIClient
+
+# Opt-in SFT trajectory capture (no-op unless CLANKER_CAPTURE_SFT is set). Captures
+# the exact (system, messages, tools) → assistant turns for fine-tuning — the data
+# the legacy analytics logger throws away. See src/sft_capture.py.
+from sft_capture import (
+    capture_enabled as _sft_enabled, record_turn as _sft_record_turn,
+    stash_invocation as _sft_stash, clear_stash as _sft_clear_stash,
+)
 
 logger = logging.getLogger("filthy_clanker")
 
@@ -33,23 +43,35 @@ logger = logging.getLogger("filthy_clanker")
 # Raw-output flag extraction (runs BEFORE summarisation)
 # ---------------------------------------------------------------------------
 
-def _extract_flags_from_raw(raw: str, tool_args: dict | None = None) -> list[str]:
+def _extract_flags_from_raw(raw: str, tool_args: dict | None = None,
+                            flag_format: str = "") -> list[str]:
     """
     Scan the RAW (un-summarised) tool output for flag strings and return them.
     Called before maybe_summarize() so a lossy summary can never hide a flag.
+
+    Extraction is anchored to what a flag actually looks like: the known CTF
+    prefixes (``_FLAG_RE`` — flag{}, key{}, HTB{}, …) plus, when the challenge
+    states one, its own wrapper prefix. It deliberately does NOT use an unbounded
+    ``\\w{2,20}\\{…\\}`` pass — that firehose scooped ``word{…}`` fragments out of
+    crypto / xor output (``Bx{A]\\n+L*^lSKH\\n…}``) by the dozen, polluting
+    submitted_flags and risking a wrong end on a braceless-format challenge.
     """
     flags: list[str] = []
-    # Bracket-format flags: flag{...}, key{...}, HTB{...}, etc.
+    # Known CTF-prefix flags: flag{...}, key{...}, HTB{...}, etc.
     flags += _FLAG_RE.findall(raw)
-    # Broader single-word bracket flags that _FLAG_RE might miss
-    _broad = re.findall(r'\b\w{2,20}\{[^}]{1,200}\}', raw)
-    flags += [f for f in _broad if f not in flags]
+    # The challenge's own stated wrapper, if it names a prefix _FLAG_RE lacks.
+    fmt = (flag_format or "").strip().lower()
+    if "{" in fmt and "not provided" not in fmt:
+        prefix = fmt.split("{", 1)[0].strip()
+        if re.fullmatch(r'[\w.-]{1,20}', prefix):
+            flags += re.findall(re.escape(prefix) + r'\{[^}]{1,200}\}', raw, re.IGNORECASE)
     # 32-char hex strings when a flag-file context is present
     _args_str = json.dumps(tool_args) if tool_args else ""
     if re.search(r'(?:user|root|flag)\.txt', raw + _args_str, re.IGNORECASE):
         flags += _HEX_FLAG_RE.findall(raw)
-    # Drop placeholder/template flags (e.g. "flag{...}") so a hedge never counts.
-    flags = [f for f in flags if not _is_placeholder_flag(f)]
+    # Drop placeholder/template flags and any non-printable garbage that slipped
+    # through (real flags are printable ASCII with no control bytes).
+    flags = [f for f in flags if not _is_placeholder_flag(f) and _is_printable_flag(f)]
     return list(dict.fromkeys(flags))  # deduplicate preserving order
 
 
@@ -92,6 +114,14 @@ def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
             agent_model = agent_cfg.get("model", "")
             model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["gemini"]
             llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        elif provider == "openai":
+            # Any OpenAI-compatible endpoint (Together/DeepInfra/OpenRouter/vLLM). base_url +
+            # key from the agent config or env (OPENAI_BASE_URL / OPENAI_API_KEY, or an
+            # api_key_env pointer like TOGETHER_API_KEY). Model id has no ":" (e.g. Qwen/...).
+            _base = agent_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
+            _key = os.getenv(agent_cfg.get("api_key_env", "OPENAI_API_KEY"), "") or os.getenv("OPENAI_API_KEY", "")
+            model = agent_cfg.get("model", "") or os.getenv("OPENAI_MODEL", "")
+            llm = OpenAIClient(model=model, base_url=_base, api_key=_key)
         else:
             raise ValueError(f"Unknown provider override: {provider}")
     else:
@@ -105,6 +135,10 @@ def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
         elif provider == "ollama":
             host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
             llm = OllamaClient(host=host, model=model)
+        elif provider == "openai":
+            _base = agent_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
+            _key = os.getenv(agent_cfg.get("api_key_env", "OPENAI_API_KEY"), "") or os.getenv("OPENAI_API_KEY", "")
+            llm = OpenAIClient(model=model, base_url=_base, api_key=_key)
         else:
             raise ValueError(f"Unknown provider in agents.yaml for this agent: {provider}")
 
@@ -114,6 +148,79 @@ def _resolve_llm(state: TeamState, agent_cfg: dict) -> tuple[str, str, Any]:
 def _estimate_tokens(messages: list) -> int:
     """Rough token estimate: total chars / 4."""
     return sum(len(str(m)) for m in messages) // 4
+
+
+# Commands/tools that count as genuine disassembly / dynamic / symbolic analysis.
+# The reversing agent's completion-gate requires at least one of these to have run
+# before it may report — matched against the tool name AND the command arguments
+# (execute_command carries the real work in its `command`).
+_DEEP_RE_RE = re.compile(
+    r'\b(objdump|radare2|rizin|r2\b|gdb|ltrace|strace|angr|ROPgadget|ropper'
+    r'|one_gadget|checksec|readelf|\bnm\b|ghidra|decompil)', re.IGNORECASE,
+)
+
+
+def _is_deep_re_call(tool_name: str, raw_args: dict) -> bool:
+    """True if a tool call is real binary analysis (disassembly/debug/symbolic)."""
+    if _DEEP_RE_RE.search(tool_name or ""):
+        return True
+    try:
+        blob = json.dumps(raw_args)
+    except (TypeError, ValueError):
+        blob = str(raw_args)
+    return bool(_DEEP_RE_RE.search(blob))
+
+
+# A genuine SOLVE attempt (compute/decrypt/exploit), as opposed to mere inspection
+# (file/strings/cat). Used by the exploit agent's follow-through gate on file-based
+# crypto/rev/pwn: it may not conclude until it has actually RUN a solve script or
+# executed the target — forcing "attempt" over "guess".
+_SOLVE_ATTEMPT_RE = re.compile(
+    r'python3?\s+(?:-c|-m\s|\S*\.py)'   # run a python script/one-liner
+    r'|openssl\s+[a-z]'                  # openssl crypto operation
+    r'|RsaCtfTool|\bsage\b|factordb'     # crypto solvers
+    r'|from\s+pwn|import\s+pwn'          # pwntools exploitation
+    r'|import\s+angr|import\s+z3|claripy',  # symbolic execution
+    re.IGNORECASE,
+)
+# Executing a local binary/exploit: `./x` at the START of the command (or after a
+# shell separator) — NOT `./x` as an argument to an inspection tool (objdump -d ./x).
+_EXEC_LOCAL_RE = re.compile(r'(?:^|;|&&|\|\|?|\n)\s*\./\S+')
+
+
+def _is_solve_attempt(tool_name: str, raw_args: dict) -> bool:
+    """True if a tool call is a real solve attempt (script/crypto/exploit/run)."""
+    cmd = ""
+    if isinstance(raw_args, dict):
+        cmd = str(raw_args.get("command") or raw_args.get("cmd") or "")
+    blob = cmd or (json.dumps(raw_args) if raw_args else "")
+    return bool(_SOLVE_ATTEMPT_RE.search(blob)) or bool(_EXEC_LOCAL_RE.search(cmd))
+
+
+# A genuine SERVICE interaction (hit the running HTTP endpoint or raw port), as
+# opposed to only reading local source. Used by the web/service exploitation gate:
+# on a web challenge the exploit/webexplorer agent may not conclude until it has
+# actually sent a request to the service — the flag is served there, not on disk.
+# The observed failure: recon reads the source fine, then the exploit-phase agents
+# emit an analysis paragraph with NO tool call and the unproductive breaker ends
+# the challenge in 4 bounced turns (all 10 web challenges died this way).
+_SERVICE_ATTEMPT_RE = re.compile(
+    r'\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bncat\b|\bhttpie?\b|\bwhatweb\b'
+    r'|\bnikto\b|\bgobuster\b|\bffuf\b|\bsqlmap\b|\bwfuzz\b|\bdirb\b'
+    r'|requests\.(?:get|post|put|Session)|urllib|http\.client|socket\.',
+    re.IGNORECASE,
+)
+
+
+def _is_service_attempt(tool_name: str, raw_args: dict) -> bool:
+    """True if a tool call actually interacts with the running service."""
+    if _SERVICE_ATTEMPT_RE.search(tool_name or ""):
+        return True
+    cmd = ""
+    if isinstance(raw_args, dict):
+        cmd = str(raw_args.get("command") or raw_args.get("cmd") or "")
+    blob = cmd or (json.dumps(raw_args) if raw_args else "")
+    return bool(_SERVICE_ATTEMPT_RE.search(blob))
 
 
 def _trim_tool_descriptions(tools: list, max_chars: int) -> list:
@@ -235,6 +342,8 @@ def _extract_kb_updates(tool_name: str, tool_result: str, kb: KnowledgeBase,
     if flags_found:
         existing_flags = set(kb.get("flags", []))
         kb["flags"] = list(existing_flags | set(flags_found))
+        # Parsed from a tool RESULT → grounded (a real find, may end the challenge).
+        kb["grounded_flags"] = list(set(kb.get("grounded_flags", [])) | set(flags_found))
 
     # Interesting attack surface (directories, files from gobuster/ferox)
     dir_pattern = re.compile(r'(?:Status: 200|Found:)\s*(\/\S+)', re.IGNORECASE)
@@ -478,12 +587,25 @@ async def _run_agent_loop(
         if _has_submit_flag else ""
     )
 
+    # Force VISIBLE reasoning: models (esp. Anthropic) keep their reasoning in redacted
+    # "thinking" blocks we can't capture, and otherwise emit bare tool calls — so ~77% of
+    # captured tool-turns had no text. Requiring one plain-text sentence before each call
+    # puts the reasoning into the trajectory (trainable) and keeps train/inference consistent
+    # (the local model learns to reason-then-act, and is prompted to do so at inference too).
+    _reason_note = (
+        "\n\n=== EXPLAIN BEFORE ACTING ===\n"
+        "Before EVERY tool call, write ONE short sentence of plain-text reasoning: what you are "
+        "about to do and why (what you expect it to reveal). Then make the tool call. Never emit "
+        "a tool call with no preceding reasoning."
+    )
+
     full_system = (
         f"{system_prompt}\n\n"
         f"=== AVAILABLE TOOLS (exact names — use only these) ===\n{tool_names_list}\n\n"
         f"=== KNOWLEDGE BASE (shared with team) ===\n{kb_text}\n"
         f"=== CURRENT TASK ===\n{state.get('task', 'Hack the target machine.')}"
         f"{_submit_flag_note}"
+        f"{_reason_note}"
     )
 
     # Trim verbose tool descriptions to keep the per-turn prompt small on local
@@ -507,9 +629,47 @@ async def _run_agent_loop(
     _exploit_found_at: Optional[int] = None
     # Counts consecutive iterations where every tool call was an unknown-tool error.
     _consecutive_unknown_iters: int = 0
+    # Whether this turn executed at least one REAL (non-unknown) tool call. A turn
+    # with none is "idle" — it feeds the unproductive-streak circuit breaker and
+    # marks the agent complete so the supervisor stops re-routing to it (kills the
+    # observed exploit spin: 44 routes, 0 tool calls, never completing).
+    _made_tool_call: bool = False
+    # Reversing completion-gate: the reversing agent may not finish until it has
+    # actually disassembled/traced the binary. _did_deep_re flips on the first real
+    # RE tool run; _re_gate_used caps the forcing so a stubborn model can't loop.
+    _did_deep_re: bool = False
+    _re_gate_used: int = 0
+    _RE_GATE_MAX: int = 2
+    # Exploit follow-through gate: on a file-based crypto/rev/pwn challenge the
+    # exploit agent may not conclude until it has actually RUN a solve script /
+    # executed the target (forces "attempt" over "guess").
+    _did_solve_attempt: bool = False
+    _solve_gate_used: int = 0
+    # Web/service exploitation gate: on a web challenge the exploit/webexplorer
+    # agent may not conclude until it has actually hit the running service (the
+    # flag is served there, not on disk). Forces "act" over "analyse-and-idle".
+    _did_service_attempt: bool = False
+    _web_gate_used: int = 0
+    # General "act, don't just analyse" nudge — the category-agnostic fallback that
+    # replaces the old 4-turn unproductive breaker (a HITL-era rule that terminated
+    # ~33% of challenges, solvable ones included). If an agent makes ZERO tool calls
+    # in an invocation it analysed without acting; nudge it to run a tool instead of
+    # ending the turn idle, bounded so a stubborn model can't loop forever.
+    _general_gate_used: int = 0
     # Duplicate-output detection: tool_name → set of MD5 hashes of raw results.
     # If a tool returns the exact same bytes twice, we inject a strategy-change hint.
     _seen_output_hashes: dict[str, set] = {}
+
+    # Register this invocation so a run cancelled mid-loop by the challenge timeout still
+    # captures its partial trajectory. References the live message lists (no per-iteration
+    # copy); flush_stash() reads them on cancellation. Cleared after the normal capture below.
+    if _sft_enabled():
+        _sft_stash(
+            session_id=state.get("session_id", ""), agent=agent_name, provider=provider,
+            model=model, system_prompt=full_system, tools=raw_tools,
+            messages=messages, new_messages=new_messages, task=state.get("task", ""),
+            knowledge_base=updated_kb,
+        )
 
     for iteration in range(max_iterations):
         try:
@@ -533,6 +693,117 @@ async def _run_agent_loop(
         new_messages.append(assistant_msg)
 
         if not tool_calls:
+            # Reversing completion-gate: refuse to finish until the binary has
+            # actually been disassembled/traced. Inject a hard corrective and loop
+            # again, up to _RE_GATE_MAX times (then let it out to avoid an infinite
+            # loop if the model simply won't comply).
+            if (agent_name == "reversing" and not _did_deep_re
+                    and _re_gate_used < _RE_GATE_MAX):
+                _re_gate_used += 1
+                logger.info("[reversing] Completion blocked — no disassembly yet "
+                            "(gate %d/%d), forcing RE step", _re_gate_used, _RE_GATE_MAX)
+                new_messages.append({
+                    "role": "user",
+                    "content": (
+                        "STOP — you have not disassembled the binary yet, so you "
+                        "cannot possibly know the answer. Before reporting anything, "
+                        "call execute_command to run REAL analysis on the provided "
+                        "file now, e.g.:\n"
+                        "  objdump -d <path>            (disassembly)\n"
+                        "  radare2 -A -q -c 'pdf @ main' <path>\n"
+                        "  gdb -batch -ex 'disas main' <path>   or ltrace/strace <path>\n"
+                        "For an input-derived flag, write a python3 script using angr "
+                        "(symbolic execution) or z3. Read the output and reason about "
+                        "the logic. Do NOT report until you have done this."
+                    ),
+                })
+                continue
+            # Exploit follow-through gate on file-based crypto/rev/pwn: force at least
+            # one real solve attempt (script/crypto/exploit run) before concluding.
+            _fb_cat = (state.get("challenge_category") or "").lower()
+            if (agent_name == "exploit" and state.get("has_files")
+                    and _fb_cat in ("crypto", "rev", "pwn")
+                    and not _did_solve_attempt and _solve_gate_used < _RE_GATE_MAX):
+                _solve_gate_used += 1
+                logger.info("[exploit] Completion blocked — no solve attempt yet "
+                            "(gate %d/%d), forcing a solve script", _solve_gate_used, _RE_GATE_MAX)
+                new_messages.append({
+                    "role": "user",
+                    "content": (
+                        "STOP — you have only inspected the file, not attempted a "
+                        "solution.\n"
+                        "FIRST: if the output ALREADY revealed the flag/secret — a "
+                        "plaintext string, a decoded message, a recovered password, or "
+                        "the success message a service prints on a correct solve (the "
+                        "flag may be plaintext with NO braces) — call submit_flag with "
+                        "that exact string NOW instead of computing further.\n"
+                        "OTHERWISE, write and RUN a real solve via execute_command and "
+                        "read its output before concluding:\n"
+                        "  crypto: python3 -c \"from Crypto... ; ...\"  (or sympy/gmpy2/"
+                        "z3, openssl, RsaCtfTool) — actually compute/decrypt.\n"
+                        "  rev/pwn: run the binary with crafted input, or a pwntools/"
+                        "angr/z3 python3 script. Do NOT guess or hand-derive the flag."
+                    ),
+                })
+                continue
+            # Web/service exploitation gate: on a web challenge the flag is served
+            # by the LIVE service, never on disk. The exploit/webexplorer agent may
+            # not conclude until it has actually sent a request to the service.
+            # Without this, the agent reads the source then emits an analysis
+            # paragraph with no tool call — every web challenge died on the
+            # unproductive breaker after 4 bounced idle turns.
+            if (agent_name in ("exploit", "webexplorer") and _fb_cat == "web"
+                    and not _did_service_attempt and _web_gate_used < _RE_GATE_MAX):
+                _web_gate_used += 1
+                logger.info("[%s] Completion blocked — web challenge, no service "
+                            "interaction yet (gate %d/%d), forcing a request",
+                            agent_name, _web_gate_used, _RE_GATE_MAX)
+                new_messages.append({
+                    "role": "user",
+                    "content": (
+                        "STOP — you analysed the app but have NOT interacted with the "
+                        "running service, so you cannot have the flag. The flag is "
+                        "served by the live service, not on disk. Act now via "
+                        "execute_command against the target:\n"
+                        "  • curl the endpoints you found (-i for headers, -L to follow "
+                        "redirects, -s to quiet the progress meter).\n"
+                        "  • Send the exploit for the vulnerability you identified in "
+                        "the source — the injection / LFI / SSTI / auth-bypass / "
+                        "deserialization payload — as a real curl request with the "
+                        "crafted parameter or body, and read the RESPONSE for the flag.\n"
+                        "  • If you have not found the vuln yet, curl the index page and "
+                        "probe likely paths (/admin, /flag, /source, /.git, robots.txt) "
+                        "to map the app first.\n"
+                        "Do NOT summarise or conclude until a response actually contains "
+                        "the flag."
+                    ),
+                })
+                continue
+            # General "act, don't just analyse" nudge (fallback for any category the
+            # specific gates above don't cover — forensics, misc, etc.). If the agent
+            # made ZERO tool calls this invocation it produced analysis without action;
+            # nudge it to run a tool rather than ending idle. This replaces the old
+            # unproductive breaker's blunt termination with the gate pattern.
+            if not _made_tool_call and _general_gate_used < _RE_GATE_MAX:
+                _general_gate_used += 1
+                if state.get("has_files"):
+                    _how = ("analyse the provided files with a real tool NOW — "
+                            "file / strings / xxd / binwalk, or write and RUN a python3 "
+                            "script to decode / carve / compute.")
+                else:
+                    _how = ("interact with the target service NOW — curl / nc it and "
+                            "read the response.")
+                logger.info("[%s] Idle (no tool call this turn) — nudging to act "
+                            "(gate %d/%d)", agent_name, _general_gate_used, _RE_GATE_MAX)
+                new_messages.append({
+                    "role": "user",
+                    "content": (
+                        "You produced analysis but called NO tool, so you made no "
+                        "progress. Do not stop or summarise — " + _how + " Report only "
+                        "after a tool has actually run and you have read its output."
+                    ),
+                })
+                continue
             # No more tool calls — agent is done with its sub-task
             break
 
@@ -566,17 +837,30 @@ async def _run_agent_loop(
                                agent_name, tool_name)
             else:
                 _all_unknown_this_iter = False
+                _made_tool_call = True  # a real tool ran → this turn is productive
+                if not _did_deep_re and _is_deep_re_call(tool_name, raw_args):
+                    _did_deep_re = True
+                if not _did_solve_attempt and _is_solve_attempt(tool_name, raw_args):
+                    _did_solve_attempt = True
+                if not _did_service_attempt and _is_service_attempt(tool_name, raw_args):
+                    _did_service_attempt = True
 
                 # ---- Raw flag extraction (BEFORE summarization) ----
                 # Run on the un-summarised output so a lossy summary can never
                 # hide a flag.  Captured flags go directly into the KB.
-                _raw_flags = _extract_flags_from_raw(raw_result, raw_args)
+                _raw_flags = _extract_flags_from_raw(
+                    raw_result, raw_args, flag_format=state.get("flag_format", ""))
                 if _raw_flags:
                     _existing_flags = set(updated_kb.get("flags", []))
                     _new_flags = [f for f in _raw_flags if f not in _existing_flags]
                     if _new_flags:
                         updated_kb = dict(updated_kb)
                         updated_kb["flags"] = list(_existing_flags | set(_raw_flags))
+                        # These came from RAW TOOL OUTPUT → GROUNDED. Only grounded flags may
+                        # end a challenge (see supervisor §1); a flag the model merely types is
+                        # a guess and must not.
+                        updated_kb["grounded_flags"] = list(
+                            set(updated_kb.get("grounded_flags", [])) | set(_raw_flags))
                         logger.info(
                             "[%s] Flags extracted from RAW output (pre-summarisation): %s",
                             agent_name, _new_flags,
@@ -607,8 +891,25 @@ async def _run_agent_loop(
                 else:
                     _tool_hashes.add(_out_hash)
 
-            # Auto-summarize large outputs
-            result = maybe_summarize(raw_result, config)
+            # Tool-output handling. The reversing agent must see RAW disassembly
+            # (paraphrasing assembly is useless), so instead of summarising we pass
+            # it verbatim up to a cap, then hard-TRUNCATE with a note steering it to
+            # targeted disassembly — never hand a full 150k objdump to the model.
+            # All other agents summarise as before.
+            if agent_name == "reversing":
+                _rev_thr = config.get("settings", {}).get("reversing_output_threshold", 16000)
+                if len(raw_result) > _rev_thr:
+                    result = (
+                        raw_result[:_rev_thr]
+                        + f"\n\n[... disassembly truncated at {_rev_thr:,} of "
+                        f"{len(raw_result):,} chars. Do NOT dump the whole binary — run "
+                        f"TARGETED disassembly of the function you care about, e.g. "
+                        f"radare2 -q -c 'pdf @ main' <bin>  or  objdump -d --disassemble=<func> <bin>. ...]"
+                    )
+                else:
+                    result = raw_result
+            else:
+                result = maybe_summarize(raw_result, config)
 
             if result != raw_result:
                 logger.info("[Summarizer] Condensed %s → %s chars", f"{len(raw_result):,}", f"{len(result):,}")
@@ -700,8 +1001,12 @@ async def _run_agent_loop(
                 block = llm.make_tool_result_message(tc.get("id", ""), result)
                 combined["content"].append(block)
             new_messages.append(combined)
+        elif provider == "openai":
+            # OpenAI-compatible: one tool-role message per result, keyed by tool_call_id.
+            for tc, result in tool_results:
+                new_messages.append(llm.make_tool_result_message(tc.get("id", ""), result))
         else:
-            # Gemini and Ollama: one message per result
+            # Gemini and Ollama: one message per result (by tool name)
             for tc, result in tool_results:
                 new_messages.append(llm.make_tool_result_message(tc.get("name", ""), result))
 
@@ -797,21 +1102,23 @@ async def _run_agent_loop(
         if re.search(r'(?:user|root|flag)\.txt', _final_text, re.IGNORECASE):
             _text_flags += re.findall(r'\b([0-9a-f]{32})\b', _final_text, re.IGNORECASE)
         # A flag mentioned in the agent's own prose is the least trustworthy source
-        # (often a hedge/example like "flag{STFUj...}"); drop placeholders.
-        _text_flags = [f for f in _text_flags if not _is_placeholder_flag(f)]
+        # (often a hedge/example like "flag{STFUj...}"); drop placeholders and
+        # non-printable garbage.
+        _text_flags = [f for f in _text_flags
+                       if not _is_placeholder_flag(f) and _is_printable_flag(f)]
         if _text_flags:
             _existing = set(updated_kb.get("flags", []))
             updated_kb = dict(updated_kb)
             updated_kb["flags"] = list(_existing | set(_text_flags))
             logger.info("[%s] Flags extracted from agent text: %s", agent_name, _text_flags)
 
-    # For the exploit agent: only mark complete if a flag was actually captured.
-    # If exploit ran and failed (no flag in KB), do NOT add it to completed_agents —
-    # the exploit_attempts counter + HITL handles the exhaustion case, and we want
-    # the supervisor to be able to re-route to exploit after human guidance or after
-    # other agents surface new information.
+    # For the exploit agent: only mark complete if a GROUNDED flag was captured (extracted
+    # from tool output). A flag the model merely TYPED is a guess — it must NOT mark exploit
+    # complete, or the guess ends the exploit lane and the team stops trying (the residual half
+    # of the guess-termination bug). If exploit ran without grounding a flag, do NOT add it to
+    # completed_agents so the supervisor can re-route to it.
     # For all other agents: the substantive-completion check is sufficient.
-    _flag_captured = bool(updated_kb.get("flags"))
+    _flag_captured = bool(updated_kb.get("grounded_flags"))
     if agent_name == "exploit" and _is_substantive_completion and not _flag_captured:
         _is_substantive_completion = False
         logger.info(
@@ -820,9 +1127,48 @@ async def _run_agent_loop(
             agent_name,
         )
 
+    # An idle turn (no real tool call) means the agent has nothing to act on right
+    # now — mark it complete so the supervisor stops re-routing to it. This also
+    # overrides the exploit special-case above: exploit is kept uncompleted only
+    # when it actually TRIED (made tool calls) but found no flag; an idle exploit
+    # turn is marked complete like any other, breaking the spin. New leads from
+    # other agents still clear completed_agents elsewhere, allowing a real retry.
+    _mark_complete = _is_substantive_completion or not _made_tool_call
+    # The reversing agent is a ONE-SHOT deep pass: after it runs (its internal loop
+    # + disassembly gate already gave it up to 20 iterations), mark it complete so
+    # the supervisor hands off instead of re-invoking it (which caused a ping-pong
+    # with idle network agents). New leads still clear completed_agents elsewhere.
+    if agent_name == "reversing":
+        _mark_complete = True
     existing_completed = list(state.get("completed_agents") or [])
-    if _is_substantive_completion and agent_name not in existing_completed:
+    if _mark_complete and agent_name not in existing_completed:
         existing_completed = existing_completed + [agent_name]
+
+    # Unproductive-streak circuit breaker: reset on any real tool call, else grow.
+    _prev_streak = state.get("unproductive_streak", 0)
+    _new_streak = 0 if _made_tool_call else _prev_streak + 1
+    if not _made_tool_call:
+        logger.info("[%s] Idle turn (no tool calls) — unproductive_streak=%d", agent_name, _new_streak)
+
+    # ---- SFT capture (opt-in) ----
+    # Record the full trajectory of THIS agent invocation for fine-tuning: the exact
+    # system prompt + tool schema shown to the model, and the complete message list
+    # (every assistant turn with tool_calls + the tool results it saw). One record per
+    # invocation avoids the O(n^2) blow-up of dumping the growing history each iteration.
+    # No-op unless CLANKER_CAPTURE_SFT is set; never raises into the loop.
+    if _sft_enabled():
+        _sft_record_turn(
+            session_id=state.get("session_id", ""),
+            agent=agent_name,
+            provider=provider,
+            model=model,
+            system_prompt=full_system,
+            tools=raw_tools,
+            messages=list(messages) + new_messages,
+            task=state.get("task", ""),
+            knowledge_base=updated_kb,
+        )
+        _sft_clear_stash()
 
     return {
         "messages": new_messages,
@@ -830,6 +1176,7 @@ async def _run_agent_loop(
         "current_agent": agent_name,
         "context_token_estimate": new_estimate,
         "exploit_attempts": state.get("exploit_attempts", 0) + exploit_delta,
+        "unproductive_streak": _new_streak,
         "completed_agents": existing_completed,
     }
 
@@ -1174,3 +1521,17 @@ def make_vulnsearch_node(mcp_client: Any, tools: list):
         logger.info("[VulnSearch Agent] Researching vulnerabilities in tech stack...")
         return await _run_agent_loop("vulnsearch", state, tools, mcp_client)
     return vulnsearch_node
+
+
+def make_reversing_node(mcp_client: Any, tools: list):
+    """Return an async node function for the Reversing / binary-analysis agent.
+
+    Specialised for file-based rev/pwn challenges. Its power comes from the
+    disassembly completion-gate in _run_agent_loop (agent_name == "reversing"):
+    it may not finish until it has actually run a disassembler/debugger, which
+    breaks the observed "file/strings then quit" pattern.
+    """
+    async def reversing_node(state: TeamState) -> dict:
+        logger.info("[Reversing Agent] Disassembling and analysing the binary...")
+        return await _run_agent_loop("reversing", state, tools, mcp_client)
+    return reversing_node

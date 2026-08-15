@@ -1,0 +1,16 @@
+# base-vs-LoRA eval set: held-out SOLVED (excluded from training) + never-solved
+2013f-web-historypeats
+2013q-web-guess_harder
+2016q-web-mfw
+2013q-cry-slurp
+2013q-msc-networking_2
+2014f-rev-odd
+2015q-web-throwback
+2016q-web-i_got_id
+2014f-web-webroot
+2016f-web-seizure_cipher
+2016f-web-cloudb
+2015q-web-k_stairs
+2014q-web-silkgoat
+2015q-rev-wyvern
+2016q-msc-coinslot

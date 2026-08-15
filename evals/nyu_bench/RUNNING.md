@@ -178,6 +178,62 @@ when A/B-testing the same challenges with new code/flags.
 ... run_eval.py --max-chals 5 --rerun --profile nyu-ctf   # CTF prompts + recon gets execute_command
 ```
 
+## Model-comparison runs (A/B)
+
+Swap the whole worker team to another local model with one flag — for comparing the
+abliterated Qwen3 30B-A3B baseline against Gemma 4, or stock vs abliterated:
+
+```bash
+# baseline (agents.yaml default: qwen3-abliterated 30b-a3b)
+... run_eval.py --subset ctftiny --timeout 1200 --profile nyu-ctf
+# gemma 4 26b, abliterated
+... run_eval.py --subset ctftiny --timeout 1200 --profile nyu-ctf --worker-model huihui_ai/gemma-4-abliterated:26b
+# gemma 4 26b, STOCK — measures the abliteration delta; watch refusal_rate in the report
+... run_eval.py --subset ctftiny --timeout 1200 --profile nyu-ctf --worker-model gemma4:26b
+# dense qwen3-32b abliterated — MoE-vs-dense at ~same size
+... run_eval.py --subset ctftiny --timeout 1200 --profile nyu-ctf --worker-model huihui_ai/qwen3-abliterated:32b
+```
+
+`--worker-model` overrides every agent except `summarizer`. `--model-override AGENT=TAG`
+(repeatable) overrides one agent, e.g. `--model-override reversing=huihui_ai/qwen3-abliterated:32b`.
+The effective per-agent models are recorded in the run's JSON report (`config.models`), so A/B
+runs self-document. Stock-vs-abliterated refusal rate is in the report summary (`refusal_rate`).
+
+Models available locally (verify with `ollama list`):
+- `huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M` — default worker (MoE, ~3B active)
+- `huihui_ai/qwen3-abliterated:32b` — dense, abliterated
+- `gemma4:26b` — Gemma 4 26B, STOCK
+- `huihui_ai/gemma-4-abliterated:26b` — Gemma 4 26B, abliterated
+- `huihui_ai/qwen3.5-abliterated:9b` — summariser / refusal specialist
+
+> ⚠ Tool-calling under the full ~150-tool Hexstrike schema is the compatibility risk for any
+> new model. Before a full run, smoke-test 3 challenges and grep the logs for
+> `[<agent>] → <tool>(…)` to confirm the model emits well-formed tool calls.
+
+## CTFTiny subset (50-challenge NYU-CTF subset — fast iteration)
+
+```bash
+... run_eval.py --subset ctftiny --timeout 1200 --profile nyu-ctf
+```
+
+The 50 CTFTiny challenges (`evals/nyu_bench/ctftiny.json`) span CSAW 2017–2023 across BOTH the
+development and test splits, so `--subset ctftiny` loads both and filters by canonical name.
+Any it can't find in a locally-available split is logged (`Subset: N/50 target(s) NOT found …`)
+— that usually means the `test` split isn't downloaded. Category mix is rev-heavy (16 rev, 11
+pwn, 12 cry, 6 msc, 3 web, 2 for), so it stresses the a3b's weak categories harder than the dev
+split. `--challenge-list <file>` runs an arbitrary set of canonical names (one per line).
+
+## Capturing fine-tuning data
+
+Add `--capture-sft` to any run to write full (system, messages, tool-schema) → assistant
+trajectories to `data/sft/<session>.jsonl` — the correct SFT format (the legacy `data/training/`
+logger is analytics-only; see `docs/SFT_PLAN.md`). No-op unless the flag is set.
+`CLANKER_SFT_TOOLS=names` shrinks files when the tool schema is constant.
+
+```bash
+... run_eval.py --subset ctftiny --timeout 1200 --profile nyu-ctf --capture-sft
+```
+
 ## Full development split (long)
 
 57 challenges; at 20 min/challenge worst case this is many hours. Run detached

@@ -1,0 +1,8 @@
+# Overlay for CLOUD/API worker runs: route the summarizer to a cheap Anthropic model
+# (Haiku) instead of the local 9B Ollama summarizer, so the run needs NO local GPU and
+# stays cheap. Chain it after nyu-ctf, e.g. --profile nyu-ctf,cloud-haiku-summ.
+# Needs ANTHROPIC_API_KEY in the environment.
+agents:
+  summarizer:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001

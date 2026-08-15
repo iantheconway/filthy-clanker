@@ -22,16 +22,16 @@ from typing import Any, Literal
 from langgraph.types import interrupt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from llms import AnthropicClient, GeminiClient, OllamaClient
+from llms import AnthropicClient, GeminiClient, OllamaClient, OpenAIClient
 
 from .state import TeamState
-from .summarizer import _is_placeholder_flag
+from .summarizer import _is_placeholder_flag, _flag_matches_format
 
 logger = logging.getLogger("filthy_clanker")
 
 
 # Possible routing destinations
-NEXT_OPTIONS = Literal["recon", "exploit", "privesc", "vulnsearch", "compaction", "__end__"]
+NEXT_OPTIONS = Literal["recon", "exploit", "privesc", "vulnsearch", "reversing", "compaction", "__end__"]
 
 
 _PROVIDER_DEFAULT_MODELS = {
@@ -62,6 +62,11 @@ def _resolve_llm(state: TeamState, agent_cfg: dict):
             agent_model = agent_cfg.get("model", "")
             model = agent_model if ":" not in agent_model else _PROVIDER_DEFAULT_MODELS["gemini"]
             llm = GeminiClient(api_key=os.getenv("GEMINI_API_KEY", ""), model=model)
+        elif provider == "openai":
+            _base = agent_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
+            _key = os.getenv(agent_cfg.get("api_key_env", "OPENAI_API_KEY"), "") or os.getenv("OPENAI_API_KEY", "")
+            model = agent_cfg.get("model", "") or os.getenv("OPENAI_MODEL", "")
+            llm = OpenAIClient(model=model, base_url=_base, api_key=_key)
         else:
             raise ValueError(f"Unknown provider override: {provider}")
     else:
@@ -74,6 +79,10 @@ def _resolve_llm(state: TeamState, agent_cfg: dict):
         elif provider == "ollama":
             host = agent_cfg.get("host", os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
             llm = OllamaClient(host=host, model=model)
+        elif provider == "openai":
+            _base = agent_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
+            _key = os.getenv(agent_cfg.get("api_key_env", "OPENAI_API_KEY"), "") or os.getenv("OPENAI_API_KEY", "")
+            llm = OpenAIClient(model=model, base_url=_base, api_key=_key)
         else:
             raise ValueError(f"Unknown provider in agents.yaml for supervisor: {provider}")
 
@@ -114,6 +123,7 @@ async def supervisor_node(state: TeamState) -> dict:
     settings = config.get("settings", {})
     max_attempts: int = settings.get("max_exploit_attempts", 5)
     context_limit: int = settings.get("context_limit_threshold", 80000)
+    max_unproductive: int = settings.get("max_unproductive_turns", 4)
     autonomous: bool = bool(settings.get("autonomous", False))
 
     kb = state.get("knowledge_base", {})
@@ -124,59 +134,70 @@ async def supervisor_node(state: TeamState) -> dict:
 
     # -----------------------------------------------------------------------
     # 1. Check if flag was already captured
-    #    Ignore placeholder/template strings (e.g. "flag{STFUj...}") that a greedy
-    #    extractor may have picked up from an agent's reasoning — ending the run on
-    #    one of those hands back a wrong flag and cuts investigation short.
+    #    Ignore placeholder/template strings (e.g. "flag{STFUj...}") AND strings
+    #    of the wrong shape for this challenge's flag_format (e.g. a `key{...}`
+    #    decoy or a bare hex blob when the flag is `flag{...}`). Ending on either
+    #    hands back a wrong flag and cuts investigation short.
     # -----------------------------------------------------------------------
-    flags = [f for f in kb.get("flags", []) if not _is_placeholder_flag(f)]
-    if flags:
-        logger.info("[Supervisor] Flag captured: %s. Mission complete!", flags)
+    _trust_kb_flags = settings.get("trust_kb_flags_to_end", True)
+    _flag_format = state.get("flag_format", "")
+    # Only flags extracted from TOOL OUTPUT (grounded) may end a challenge. A flag the model
+    # merely TYPED in its reasoning (e.g. a name-derived flag{maze_runner}) is a GUESS — it is
+    # still recorded in kb["flags"] for final scoring, but must NOT end the run, or the challenge
+    # dies the instant the model guesses instead of continuing to solve. (This supersedes the old
+    # trust_kb_flags True/False binary, which ended on any format-matching string incl. guesses.)
+    _grounded_flags = [f for f in kb.get("grounded_flags", [])
+                       if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]
+    if _grounded_flags and _trust_kb_flags:
+        logger.info("[Supervisor] Grounded flag captured from tool output: %s. Mission complete!",
+                    _grounded_flags)
         return {"next": "__end__"}
+    # `flags` drives the "do we actually have a flag?" guards below. A guessed (non-grounded) flag
+    # must NOT count as having a flag, or the guards would stop the team working. When trust is off
+    # (base profile) treat the run as flagless; when on, only grounded tool-output flags count. A
+    # verified submit_flag (solved_event) is handled separately by the eval harness.
+    flags = _grounded_flags if _trust_kb_flags else []
 
     # -----------------------------------------------------------------------
-    # 1e. Autonomous win scan — scan recent message text for flag patterns that
-    #     the KB extractor may have missed (e.g. inside a summarized block).
-    #     Only in autonomous mode to avoid unnecessary parsing overhead in HITL.
+    # 1a. Unproductive streak — INTERACTIVE (HITL) mode only. A long idle streak
+    #     (agents emitting text but never running a tool) is worth pausing for a
+    #     human hint when a human is in the loop.
+    #
+    #     In AUTONOMOUS mode we do NOT terminate here. The old "team is stuck →
+    #     end challenge" breaker was a HITL-era heuristic that cut ~33% of eval
+    #     challenges — solvable ones included — after just a few idle turns. It is
+    #     now redundant: the completion gates (agents.py) nudge idling agents to
+    #     ACT rather than idle, and the wall-clock timeout bounds runtime. Let the
+    #     team keep trying until it solves or the timeout ends it.
     # -----------------------------------------------------------------------
-    if autonomous:
-        import re as _re
-        _FLAG_SCAN = _re.compile(
-            r'(?:flag|key|ctf|htb|thm|picoctf|csaw|crypto|web|pwn|misc|rev|forensics'
-            r'|rtcp|ductf|darkctf|bucket|nite|jctf|cyber)\{[^}]{1,200}\}',
-            _re.IGNORECASE,
-        )
-        _HEX_SCAN = _re.compile(r'\b([0-9a-f]{32})\b', _re.IGNORECASE)
-        messages = state.get("messages", [])
-        # Only scan the last few messages — earlier ones are already processed.
-        _scan_msgs = messages[-6:] if len(messages) > 6 else messages
-        _found_flags: list[str] = []
-        for _msg in _scan_msgs:
-            _content = _msg.get("content", "")
-            if isinstance(_content, list):
-                _content = " ".join(
-                    b.get("text", "") or b.get("content", "")
-                    for b in _content if isinstance(b, dict)
-                )
-            _content = str(_content)
-            _found_flags += _FLAG_SCAN.findall(_content)
-            # Hex flags only when a flag-file reference is nearby
-            if _re.search(r'(?:user|root|flag)\.txt', _content, _re.IGNORECASE):
-                _found_flags += _HEX_SCAN.findall(_content)
+    unproductive = state.get("unproductive_streak", 0)
+    if unproductive >= max_unproductive and not flags and not autonomous:
+        human_response = interrupt({
+            "reason": "stuck_no_tool_calls",
+            "message": (
+                f"The team has taken {unproductive} turns without running any tool.\n"
+                f"Knowledge Base:\n{json.dumps(kb, indent=2)}\n\n"
+                "Provide a concrete next command, tool, or hint to act on."
+            ),
+        })
+        return {
+            "messages": [{"role": "user", "content": f"[Human Operator]: {human_response}"}],
+            "unproductive_streak": 0,
+            "completed_agents": [],
+            "hitl_reason": None,
+            "next": "recon",
+        }
 
-        _found_flags = [f for f in _found_flags if not _is_placeholder_flag(f)]
-        if _found_flags:
-            _existing = set(kb.get("flags", []))
-            _new = [f for f in _found_flags if f not in _existing]
-            if _new:
-                logger.info(
-                    "[Supervisor] Autonomous win scan found flags in message text: %s", _new
-                )
-                updated_kb = dict(kb)
-                updated_kb["flags"] = list(_existing | set(_new))
-                return {
-                    "knowledge_base": updated_kb,
-                    "next": "__end__",
-                }
+    # -----------------------------------------------------------------------
+    # 1e. (REMOVED 2026-08-12) The old "autonomous win scan" ended the challenge on any
+    #     format-matching flag found in recent MESSAGE TEXT. That text includes the model's
+    #     own reasoning, so it ended runs on GUESSES (e.g. flag{maze_runner}) — the bug that
+    #     terminated challenges the instant the model typed a plausible flag. Grounding now
+    #     happens at the source: agents._extract_flags_from_raw marks tool-output flags as
+    #     grounded (§1 ends only on those), while agents' prose-flag extraction still records
+    #     typed flags into kb["flags"] for final scoring. Net: a typed flag is scored but never
+    #     ends the run early; only a tool-grounded flag (or a verified submit_flag) ends it.
+    # -----------------------------------------------------------------------
 
     # -----------------------------------------------------------------------
     # 1b. Shell / foothold already obtained → skip straight to privesc
@@ -185,6 +206,34 @@ async def supervisor_node(state: TeamState) -> dict:
     if shells and current_agent not in ("privesc", "refusal_specialist"):
         logger.info("[Supervisor] Foothold detected (%s) → privesc", shells)
         return {"next": "privesc"}
+
+    # -----------------------------------------------------------------------
+    # 1b'. Binary challenges (file-based rev/pwn) get a fixed two-stage lane that
+    #      skips the network agents (recon/webexplorer/vulnsearch/privesc are
+    #      useless on a local binary and just burn idle turns):
+    #        (1) reversing  — one deep disassembly pass (under its completion-gate)
+    #        (2) exploit    — script/exploit the finding (crypto solve, pwn payload)
+    #      Reversing is marked complete after its pass, so this doesn't loop.
+    # -----------------------------------------------------------------------
+    _cat = (state.get("challenge_category") or "").lower()
+    if state.get("has_files") and _cat in ("rev", "pwn") and not shells and not flags:
+        if ("reversing" not in completed_agents_now
+                and current_agent not in ("reversing", "refusal_specialist")):
+            logger.info("[Supervisor] File-based %s challenge → reversing specialist", _cat)
+            return {"next": "reversing"}
+        if ("reversing" in completed_agents_now
+                and "exploit" not in completed_agents_now
+                and current_agent not in ("exploit", "refusal_specialist")):
+            logger.info("[Supervisor] Binary challenge: reversing done → exploit (script/exploit the finding)")
+            return {"next": "exploit"}
+    # File-based crypto goes straight to exploit (no disassembly stage) — the
+    # exploit agent's solve-script gate then forces a real decrypt/compute attempt.
+    if (state.get("has_files") and _cat == "crypto"
+            and "exploit" not in completed_agents_now
+            and current_agent not in ("exploit", "refusal_specialist")
+            and not shells and not flags):
+        logger.info("[Supervisor] File-based crypto challenge → exploit (crypto scripting)")
+        return {"next": "exploit"}
 
     # -----------------------------------------------------------------------
     # 1c. Confirmed exploit path in attack_surface → route to exploit immediately.
@@ -569,7 +618,8 @@ async def supervisor_node(state: TeamState) -> dict:
     # most appropriate work agent from the knowledge base instead.
     if next_agent == "refusal_specialist" and state.get("current_agent") == "refusal_specialist":
         kb_now = state.get("knowledge_base", {})
-        if [f for f in kb_now.get("flags", []) if not _is_placeholder_flag(f)]:
+        if [f for f in kb_now.get("flags", [])
+                if not _is_placeholder_flag(f) and _flag_matches_format(f, _flag_format)]:
             next_agent = "__end__"
         elif kb_now.get("open_ports") or kb_now.get("attack_surface"):
             next_agent = "exploit"

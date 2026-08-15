@@ -28,7 +28,11 @@ class KnowledgeBase(TypedDict, total=False):
     tech_stack: Dict[str, List[str]]       # "ip:port" -> ["Software/version", ...]
     response_headers: Dict[str, Dict[str, str]]  # "ip:port" -> {header: value}
     credentials: List[Dict[str, str]]      # [{"user": ..., "pass": ..., "service": ...}]
-    flags: List[str]
+    flags: List[str]                       # All flag candidates (tool-grounded AND model-typed)
+    grounded_flags: List[str]              # Flags extracted from TOOL OUTPUT only (never model
+                                           # prose). Only these may END a challenge — a typed
+                                           # guess must not, or the run dies the moment the model
+                                           # guesses instead of continuing to solve.
     attack_surface: List[str]              # Discovered paths, endpoints, CVEs, vulns
     notes: List[str]                       # Freeform analyst notes
     # Work-history fields — survive compaction, prevent agents re-doing completed work
@@ -48,6 +52,11 @@ class TeamState(TypedDict):
     task                  — Current high-level objective.
     next                  — Routing decision set by the supervisor.
     exploit_attempts      — Counter for consecutive failed exploit attempts.
+    unproductive_streak   — Consecutive agent turns that executed ZERO real tool
+                            calls. Reset to 0 the moment any agent runs a tool.
+                            The supervisor ends a challenge once it exceeds
+                            settings.max_unproductive_turns (the team is stuck —
+                            emitting text without acting — so more time won't help).
     completed_agents      — Set of agent names that have signalled TASK COMPLETE
                             with substantive findings. Reset when KB changes significantly.
     provider              — Global provider override ("anthropic", "gemini", "ollama"),
@@ -63,6 +72,11 @@ class TeamState(TypedDict):
     task: str
     next: str
     exploit_attempts: int
+    unproductive_streak: int
+    flag_format: str
+    challenge_category: str   # CTF category (rev, pwn, crypto, …) — drives RE routing
+    has_files: bool           # challenge ships local files (vs. only a live service)
+    provided_files: List[str] # absolute paths of the challenge's handout files, if any
     completed_agents: List[str]
     provider: Optional[str]
     context_token_estimate: int

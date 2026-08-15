@@ -137,6 +137,44 @@ def _is_placeholder_flag(flag: str) -> bool:
     return bool(_PLACEHOLDER_FLAG_RE.search(flag))
 
 
+def _is_printable_flag(flag: str) -> bool:
+    """True if ``flag`` is printable ASCII (no control characters or high bytes).
+
+    This is what separates a genuine ``flag{...}`` from the ``word{...}`` noise the
+    broad bracket regex scoops out of binary / crypto output — that garbage is
+    riddled with newlines, tabs, and 0x00–0x1f / non-ASCII bytes (e.g.
+    ``Si{\\nB+=i…}`` out of an xor blob). Internal spaces are allowed (a few CTF
+    flags contain them); only control and non-ASCII bytes are rejected. Apply
+    alongside ``_is_placeholder_flag`` so this junk never enters the KB and so a
+    braceless / "not provided" format challenge cannot end on it.
+    """
+    f = flag.strip()
+    return bool(f) and all(0x20 <= ord(c) <= 0x7e for c in f)
+
+
+def _flag_matches_format(flag: str, flag_format: str) -> bool:
+    """True if ``flag`` plausibly matches the challenge's stated ``flag_format``.
+
+    Guards premature session-end on a wrong-but-plausible flag of the WRONG shape
+    — e.g. the agent extracts ``key{decoy}`` or a bare hex string from a binary
+    when the challenge wants ``flag{...}``. We only check the wrapper prefix
+    (``flag{`` vs ``key{``), which is all a format string reliably tells us; the
+    value is verified elsewhere (submit_flag / final scoring).
+
+    Conservative: when the format is unknown, "not provided", or has no ``{``
+    wrapper (so nothing to validate), returns True — never over-rejects.
+    """
+    if not flag_format:
+        return True
+    fmt = flag_format.strip().lower()
+    if "not provided" in fmt or "{" not in fmt:
+        return True
+    prefix = fmt.split("{", 1)[0].strip()
+    if not re.fullmatch(r'[\w.-]{1,20}', prefix):
+        return True  # unparseable prefix — don't risk a false rejection
+    return flag.strip().lower().startswith(prefix + "{")
+
+
 def _detect_flag_content(text: str) -> bool:
     """
     Return True if the text contains a flag-like pattern or dense ASCII art.
@@ -265,10 +303,16 @@ def _build_generate_fn(agent_cfg: dict) -> Callable[[str, str], str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def maybe_summarize(text: str, config: Dict[str, Any]) -> str:
+def maybe_summarize(text: str, config: Dict[str, Any],
+                    threshold_override: Optional[int] = None) -> str:
     """
     If `text` exceeds the configured character threshold, pass it through the
     summarizer and return a condensed version.  Otherwise return as-is.
+
+    ``threshold_override`` raises the char threshold for a specific caller — the
+    reversing agent uses a high value so raw disassembly/hex reaches the model
+    instead of being paraphrased into uselessness by the small summariser (RE
+    needs the actual instructions, not a "findings" summary).
 
     Flag protection:
       If the raw text contains a recognisable flag pattern or dense ASCII art,
@@ -285,7 +329,8 @@ def maybe_summarize(text: str, config: Dict[str, Any]) -> str:
         config: Full agents.yaml config dict (settings + agents sections).
     """
     settings = config.get("settings", {})
-    threshold: int = settings.get("tool_output_threshold", 4000)
+    threshold: int = threshold_override if threshold_override is not None \
+        else settings.get("tool_output_threshold", 4000)
     fallback_chars: int = settings.get("summarizer_fallback_chars", 6000)
 
     if len(text) <= threshold:
@@ -316,10 +361,23 @@ def maybe_summarize(text: str, config: Dict[str, Any]) -> str:
         logger.error("[Summarizer] Configuration error — returning truncated raw text: %s", exc)
         return _raw_fallback(text, fallback_chars)
 
+    # Cap the text fed to the (small) summariser LLM so it can't stall/time out on
+    # a huge dump — a full `objdump -d` can be 150k+ chars, on which the 9B model
+    # hangs for 90s+ then read-times-out. It only needs a representative slice;
+    # sample head+tail. (This is the LLM-input cap, distinct from the char
+    # threshold that decides WHETHER to summarise.)
+    _llm_cap = 40000
+    llm_text = text
+    if len(text) > _llm_cap:
+        _head = int(_llm_cap * 0.75)
+        _tail = _llm_cap - _head
+        llm_text = (text[:_head]
+                    + f"\n\n[... {len(text) - _llm_cap:,} chars omitted from the middle ...]\n\n"
+                    + text[-_tail:])
     prompt = (
         "The following is raw output from a security tool. "
         "Produce a concise Condensed Report highlighting only security-relevant findings.\n\n"
-        f"--- RAW OUTPUT ---\n{text}\n--- END ---"
+        f"--- RAW OUTPUT ---\n{llm_text}\n--- END ---"
     )
 
     try:

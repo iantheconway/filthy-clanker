@@ -67,12 +67,31 @@ class AnthropicClient(BaseLLMClient):
         if messages and messages[-1].get("role") == "assistant":
             messages = list(messages) + [{"role": "user", "content": "Continue."}]
 
+        # ── Prompt caching ────────────────────────────────────────────────
+        # The tools + system prefix (~5k tokens) is otherwise re-billed on every
+        # call in an agent's ReAct loop. Two breakpoints (render order is
+        # tools → system → messages):
+        #   • last tool  — caches the tool schemas, which are stable for the whole
+        #     challenge (an agent reuses its tool set across every turn).
+        #   • system     — caches tools+system together; stable within a single
+        #     agent invocation (the KB/task in the system prompt is fixed for the
+        #     loop, only `messages` grows).
+        # Static content is byte-identical across calls, so subsequent calls read
+        # the prefix at ~0.1x instead of full price. Cuts input cost ~30-40% on
+        # frontier (Anthropic) runs; a no-op for the local Ollama path.
+        if formatted_tools:
+            formatted_tools = list(formatted_tools)
+            formatted_tools[-1] = {**formatted_tools[-1],
+                                   "cache_control": {"type": "ephemeral"}}
+        cached_system = [{"type": "text", "text": system_prompt,
+                          "cache_control": {"type": "ephemeral"}}]
+
         # Adaptive thinking is only supported on Opus and Sonnet — not Haiku.
         _supports_thinking = "haiku" not in self.model.lower()
         create_kwargs: dict = dict(
             model=self.model,
             max_tokens=16000,
-            system=system_prompt,
+            system=cached_system,
             messages=messages,
             tools=formatted_tools,
         )
@@ -102,20 +121,34 @@ class AnthropicClient(BaseLLMClient):
 
         text = "\n".join(text_parts) if text_parts else None
         tc_names = [tc["name"] for tc in tool_calls]
-        logger.info("[Anthropic] RESPONSE  stop=%s  tool_calls=%s  text=%.200s",
-                    response.stop_reason, tc_names,
-                    (text or "").replace("\n", " "))
 
         usage = getattr(response, "usage", None)
+        _cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        _cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        logger.info(
+            "[Anthropic] RESPONSE  stop=%s  tool_calls=%s  in=%s out=%s "
+            "cache_read=%s cache_write=%s  text=%.200s",
+            response.stop_reason, tc_names,
+            getattr(usage, "input_tokens", 0), getattr(usage, "output_tokens", 0),
+            _cache_read, _cache_write, (text or "").replace("\n", " "),
+        )
+
+        _usage_dict = {
+            "input_tokens": getattr(usage, "input_tokens", 0),
+            "output_tokens": getattr(usage, "output_tokens", 0),
+            "cache_read_input_tokens": _cache_read,
+            "cache_creation_input_tokens": _cache_write,
+        } if usage else {}
+        # Feed the budget guard (no-op for free/local models; here it's a paid Anthropic call).
+        from .cost import add_usage as _add_cost
+        _add_cost(self.model, _usage_dict)
+
         return {
             "text": text,
             "tool_calls": tool_calls,
             "raw": response,
             "stop_reason": response.stop_reason,
-            "usage": {
-                "input_tokens": getattr(usage, "input_tokens", 0),
-                "output_tokens": getattr(usage, "output_tokens", 0),
-            } if usage else {},
+            "usage": _usage_dict,
         }
 
     def parse_tool_calls(self, response: dict[str, Any]) -> list[dict[str, Any]]:

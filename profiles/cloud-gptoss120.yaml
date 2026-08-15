@@ -1,0 +1,47 @@
+# Cloud-open worker run via Together (OpenAI-compatible endpoint): all worker agents ->
+# OpenAI gpt-oss-120b (open-weight, Apache-2.0 — the license, not OpenAI's API ToS, governs
+# the weights/outputs, so training on captured trajectories is permitted; ToS-clean).
+# Chosen because Qwen3-235B-A22B-2507 is dedicated-endpoint-only on Together, whereas
+# gpt-oss-120b is serverless (and cheaper: $0.15/$0.60 per 1M). Pair with the Haiku
+# summarizer + nyu-ctf prompts:
+#     --profile nyu-ctf,cloud-gptoss120,cloud-haiku-summ
+# Needs TOGETHER_API_KEY in .env. GPU-free (set OLLAMA_HOST to a dead port so the rare
+# refusal path — hardcoded to Ollama — fails fast instead of loading a model).
+# The deep-merge keeps each agent's tools + system_prompt from agents.yaml; it only swaps
+# provider/model/endpoint.
+agents:
+  supervisor:
+    provider: openai
+    base_url: "https://api.together.xyz/v1"
+    api_key_env: TOGETHER_API_KEY
+    model: "openai/gpt-oss-120b"
+  recon:
+    provider: openai
+    base_url: "https://api.together.xyz/v1"
+    api_key_env: TOGETHER_API_KEY
+    model: "openai/gpt-oss-120b"
+  exploit:
+    provider: openai
+    base_url: "https://api.together.xyz/v1"
+    api_key_env: TOGETHER_API_KEY
+    model: "openai/gpt-oss-120b"
+  privesc:
+    provider: openai
+    base_url: "https://api.together.xyz/v1"
+    api_key_env: TOGETHER_API_KEY
+    model: "openai/gpt-oss-120b"
+  webexplorer:
+    provider: openai
+    base_url: "https://api.together.xyz/v1"
+    api_key_env: TOGETHER_API_KEY
+    model: "openai/gpt-oss-120b"
+  vulnsearch:
+    provider: openai
+    base_url: "https://api.together.xyz/v1"
+    api_key_env: TOGETHER_API_KEY
+    model: "openai/gpt-oss-120b"
+  reversing:
+    provider: openai
+    base_url: "https://api.together.xyz/v1"
+    api_key_env: TOGETHER_API_KEY
+    model: "openai/gpt-oss-120b"

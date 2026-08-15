@@ -5,6 +5,13 @@
 # LangSmith tracing API (add eu./ other regions if you use them)
 ^api\.smith\.langchain\.com$
 ^.*\.smith\.langchain\.com$
+# Anthropic API — frontier ceiling runs (--provider anthropic). The harness's OWN API
+# calls route out via this proxy (HTTPS_PROXY is exported); the agent still cannot reach
+# writeup/search sites, so it can't look up challenge solutions.
+^api\.anthropic\.com$
+# Together AI API — cloud-open model runs (OpenAI-compatible endpoint).
+^api\.together\.xyz$
+^.*\.together\.xyz$
 # Brave Search API (used by the Brave MCP server when BRAVE_API_KEY is set)
 ^api\.search\.brave\.com$
 # npm registry — the Brave MCP server is launched via `npx -y …`, which fetches

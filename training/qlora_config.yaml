@@ -1,0 +1,40 @@
+# QLoRA config for train_qlora.py. CLI flags override these.
+#
+# base_model MUST be HF weights (fp16/bf16) — NOT an Ollama GGUF. For the abliterated worker,
+# use the huihui-ai HF repo (e.g. an abliterated Qwen3-32B) or the vanilla Qwen/Qwen3-32B and
+# abliterate/keep as you prefer. The MoE 30B-A3B can be trained too but LoRA on a dense base is
+# simpler for a first run.
+base_model: Qwen/Qwen3-32B
+output_dir: training/out/clanker-qlora
+
+# Sequence length. Captured trajectories are large (median ~12k tok, max ~22k). 16384 keeps most
+# whole; examples longer than this are SKIPPED (not truncated mid-trajectory). Drop to 8192 if
+# VRAM-bound (skips more long trajectories).
+max_seq_len: 16384
+
+# ── VRAM reality ──────────────────────────────────────────────────────────────────────────
+# 32B QLoRA @ 16k ctx needs ~24GB+ and will NOT fit a single 16GB card (the RTX 5070 Ti). Options:
+#   • 14B base (fits 16GB, best first target on this box)   • shorter max_seq_len
+#   • device_map="auto" CPU/disk offload (slow)             • a bigger / rented GPU
+# The mismatched second card (GTX 1080 Ti, Pascal) can't do bf16/modern bitsandbytes, so treat
+# training as effectively single-GPU on the 5070 Ti.
+# ────────────────────────────────────────────────────────────────────────────────────────────
+
+# LoRA
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# Optim / schedule
+learning_rate: 2.0e-4
+num_train_epochs: 2
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4   # small dataset (~80 ex): lower accum -> more optimizer steps
+warmup_ratio: 0.03
+weight_decay: 0.0
+lr_scheduler_type: cosine
+logging_steps: 5
+save_steps: 100
+seed: 3407
+bf16: true
