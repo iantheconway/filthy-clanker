@@ -50,28 +50,43 @@ from htb_client import HTB  # type: ignore
 from build_sft_dataset import HINT_START, HINT_END  # type: ignore
 
 
-def _build_task(machine: str, ip: str, walkthrough: str) -> str:
-    return "\n".join([
+def _build_task(machine: str, ip: str, walkthrough: str | None = None,
+                vhost: str | None = None) -> str:
+    lines = [
         f"You are solving the HackTheBox machine '{machine}' at {ip}. Capture user.txt and root.txt.",
         "Work autonomously: scan, enumerate, exploit for a foothold, then escalate to root. Read",
         "both flag files and record their contents.",
-        "",
-        HINT_START,
-        "A walkthrough for THIS machine is provided ONLY to help you reach the flag quickly during",
-        "data capture. Follow its technical steps using the real tools:",
-        "",
-        walkthrough.strip(),
-        HINT_END,
-        "",
-        f"Target IP: {ip}. Begin.",
-    ])
+    ]
+    if vhost:
+        lines += [
+            "",
+            f"HTB WEB ROUTING: this box uses virtual-host routing and '{vhost}' -> {ip} is already in "
+            f"/etc/hosts. Target the app by HOSTNAME (http://{vhost}/ and https://{vhost}/), NOT the raw "
+            f"IP — the IP usually serves an empty/default vhost, so IP-based dir fuzzing finds nothing. "
+            f"Also fuzz for additional vhosts (e.g. ffuf -H 'Host: FUZZ.{vhost}' -u http://{ip}/ and "
+            f"filter by response size) and add any you find to /etc/hosts.",
+        ]
+    if walkthrough and walkthrough.strip():
+        lines += [
+            "",
+            HINT_START,
+            "A walkthrough for THIS machine is provided ONLY to help you reach the flag quickly during",
+            "data capture. Follow its technical steps using the real tools:",
+            "",
+            walkthrough.strip(),
+            HINT_END,
+        ]
+    lines += ["", f"Target IP: {ip}. Begin."]
+    return "\n".join(lines)
 
 
 async def main() -> None:
     load_dotenv(str(PROJECT_ROOT / ".env"), override=False)
     ap = argparse.ArgumentParser(description="HTB walkthrough-guided trajectory capture (UNTESTED).")
     ap.add_argument("--machine", required=True, help="HTB machine name or id.")
-    ap.add_argument("--walkthrough", required=True, help="Path to the walkthrough text/markdown.")
+    ap.add_argument("--walkthrough", default=None,
+                    help="Path to a walkthrough (OPTIONAL). Omit for an UNHINTED genuine "
+                         "solve/eval; provide it for hinted data capture (STaR).")
     ap.add_argument("--htb-token", default=os.getenv("HTB_TOKEN") or os.getenv("HTB_APP_TOKEN", ""))
     ap.add_argument("--timeout", type=int, default=2400)
     ap.add_argument("--provider", default=None, choices=["anthropic", "gemini", "ollama"])
@@ -82,11 +97,15 @@ async def main() -> None:
     ap.add_argument("--db", default=str(PROJECT_ROOT / "evals" / "nyu_bench" / "htb_checkpoints.db"))
     ap.add_argument("--no-stop", action="store_true", help="Leave the machine running afterward.")
     ap.add_argument("--verify-flags", action="store_true", help="Submit captured flags to HTB to label success.")
+    ap.add_argument("--max-cost", type=float, default=0.0,
+                    help="Hard USD cap for PAID (API) runs — ends the run mid-flight when the "
+                         "cumulative API cost crosses this. 0 = no cap.")
     args = ap.parse_args()
 
     if not args.htb_token:
         sys.exit("No HTB token — set HTB_TOKEN (or pass --htb-token).")
-    walkthrough = Path(args.walkthrough).read_text(encoding="utf-8")
+    walkthrough = Path(args.walkthrough).read_text(encoding="utf-8") if args.walkthrough else None
+    print(f"[htb] mode: {'HINTED capture' if walkthrough else 'UNHINTED genuine attempt'}")
 
     os.environ["CLANKER_CAPTURE_SFT"] = "1"  # this whole script exists to capture
     print("[htb] SFT capture ENABLED → data/sft/")
@@ -98,11 +117,26 @@ async def main() -> None:
         sys.exit(f"[htb] {ip}")
     print(f"[htb] {args.machine} at {ip}")
 
+    # HTB web apps route by virtual host (<name>.htb). Resolve the machine name and add the
+    # conventional vhost to /etc/hosts so the agent's tools reach the real app by hostname —
+    # scanning the raw IP usually hits an empty default vhost (this is why the first Cohort
+    # attempt fuzzed IP paths and found nothing).
+    vhost = None
+    _info = htb.get_machine_info(args.machine)
+    if isinstance(_info, dict) and _info.get("name"):
+        vhost = f"{_info['name'].lower()}.htb"
+        try:
+            with open("/etc/hosts", "a", encoding="utf-8") as _hf:
+                _hf.write(f"\n{ip} {vhost}\n")
+            print(f"[htb] added vhost to /etc/hosts: {ip} {vhost}")
+        except Exception as _e:
+            print(f"[htb] WARN: could not write /etc/hosts ({_e}); the agent must add {vhost} itself")
+
     config = load_config(PROJECT_ROOT / "agents.yaml", profile=args.profile)
     _apply_model_overrides(config, args)
     tlogger = TrajectoryLogger(str(PROJECT_ROOT / "data" / "training"))
     session_id = f"htb-{args.machine.lower()}-{str(uuid.uuid4())[:8]}"
-    task = _build_task(args.machine, ip, walkthrough)
+    task = _build_task(args.machine, ip, walkthrough, vhost)
 
     ensure_hexstrike_running()
     mcp_pool = await build_mcp_pool()
@@ -114,7 +148,7 @@ async def main() -> None:
                 graph=graph, session_id=session_id, task=task, provider=args.provider,
                 config=config, trajectory_logger=tlogger, target_ip=ip,
                 timeout_sec=args.timeout, flag_pool=flag_pool, challenge_category="pwn",
-                has_files=False,
+                has_files=False, max_cost=args.max_cost,
             )
         flags = result.get("flags", [])
         print(f"[htb] captured flags: {flags or 'none'}  (trajectory → data/sft/{session_id}.jsonl)")

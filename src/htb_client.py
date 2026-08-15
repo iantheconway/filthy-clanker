@@ -1,121 +1,152 @@
-"""Thin wrapper around pyhackthebox for filthy-clanker integration."""
+"""HTB integration via the HackTheBox API v4 (direct requests).
 
-from hackthebox import HTBClient
+The `pyhackthebox` lib went stale against HTB's current API (its `machine/list` /
+name-based `machine/profile/{name}` endpoints 404), so this talks to the API directly with
+the app token (a JWT). The *action* endpoints are still current: `vm/spawn`, `vm/terminate`,
+`vm/reset`, `machine/own`, `machine/active`, and `machine/paginated` for listing. Machine
+lookups use a numeric **id** (names only resolve for machines on the paginated page — pass the
+id for anything older). Interface preserved for generate_htb_trajectories.py.
+"""
+from __future__ import annotations
+
+import time
+
+import requests
+
+_BASE = "https://labs.hackthebox.com/api/v4"
+_UA = "Mozilla/5.0 (filthy-clanker HTB client)"
 
 
 class HTB:
     def __init__(self, app_token: str):
-        self._client = HTBClient(app_token=app_token)
+        self._token = (app_token or "").strip()
+        self._s = requests.Session()
+        self._s.headers.update({
+            "Authorization": f"Bearer {self._token}",
+            "Accept": "application/json",
+            "User-Agent": _UA,
+        })
 
-    def get_active_machine(self) -> dict | None:
-        """Return dict with active machine info, or None."""
+    # ── low-level ────────────────────────────────────────────────────────────────
+    def _get(self, path: str, **kw):
+        r = self._s.get(f"{_BASE}/{path}", timeout=20, **kw)
+        r.raise_for_status()
+        return r.json()
+
+    def _post(self, path: str, json_data: dict | None = None):
+        r = self._s.post(f"{_BASE}/{path}", json=json_data or {}, timeout=30)
+        # HTB returns 400/200 with a JSON {message}; surface the body either way
         try:
-            instance = self._client.get_active_machine(release_arena=False)
+            body = r.json()
+        except Exception:
+            body = {"message": r.text[:200]}
+        return r.status_code, body
+
+    def _resolve_id(self, name_or_id) -> int | None:
+        """Numeric id passes through; a name is matched against the paginated list
+        (recent machines only — pass the numeric id for older/retired boxes)."""
+        s = str(name_or_id).strip()
+        if s.isdigit():
+            return int(s)
+        try:
+            data = self._get("machine/paginated?per_page=100").get("data", [])
         except Exception:
             return None
-        if instance is None:
+        for m in data:
+            if str(m.get("name", "")).lower() == s.lower():
+                return int(m["id"])
+        for m in data:  # substring fallback
+            if s.lower() in str(m.get("name", "")).lower():
+                return int(m["id"])
+        return None
+
+    # ── machine info / state ─────────────────────────────────────────────────────
+    def get_active_machine(self) -> dict | None:
+        try:
+            info = (self._get("machine/active") or {}).get("info")
+        except Exception:
             return None
-        m = instance.machine
-        return {
-            "name": m.name,
-            "os": m.os,
-            "difficulty": m.difficulty,
-            "ip": instance.ip,
-            "id": m.id,
-        }
+        if not info:
+            return None
+        return {"name": info.get("name"), "ip": info.get("ip"),
+                "id": info.get("id"), "type": info.get("type")}
 
     def get_machine_info(self, name_or_id) -> dict | str:
-        """Return dict with machine details, or error string."""
+        mid = self._resolve_id(name_or_id)
+        if mid is None:
+            return f"Error looking up machine: '{name_or_id}' not found (pass a numeric id)."
         try:
-            m = self._client.get_machine(name_or_id)
-            return {
-                "name": m.name,
-                "os": m.os,
-                "difficulty": m.difficulty,
-                "points": m.points,
-                "id": m.id,
-                "active": m.active,
-                "retired": m.retired,
-                "user_owned": m.user_owned,
-                "root_owned": m.root_owned,
-                "stars": m.stars,
-            }
+            info = self._get(f"machine/profile/{mid}").get("info", {})
+            return {"name": info.get("name"), "os": info.get("os"),
+                    "difficulty": info.get("difficultyText"), "points": info.get("points"),
+                    "id": info.get("id"), "active": info.get("active"),
+                    "retired": info.get("retired"), "ip": info.get("ip"),
+                    "user_owned": info.get("authUserInUserOwns"),
+                    "root_owned": info.get("authUserInRootOwns")}
         except Exception as e:
             return f"Error looking up machine: {e}"
 
-    def spawn_machine(self, name_or_id) -> str:
-        """Spawn a machine and return its IP, or an error string."""
-        try:
-            m = self._client.get_machine(name_or_id)
-            instance = m.spawn(release_arena=False)
-            return instance.ip
-        except Exception as e:
-            return f"Error spawning machine: {e}"
+    # ── lifecycle ────────────────────────────────────────────────────────────────
+    def spawn_machine(self, name_or_id, wait_sec: int = 240) -> str:
+        """Spawn (VIP on-demand) and poll until an IP is assigned; return the IP or an error."""
+        mid = self._resolve_id(name_or_id)
+        if mid is None:
+            return f"Error spawning machine: '{name_or_id}' not found (pass a numeric id)."
+        active = self.get_active_machine()
+        if active and active.get("id") == mid and active.get("ip"):
+            return active["ip"]
+        if active and active.get("id") != mid:
+            return (f"Error spawning machine: another machine is active "
+                    f"('{active.get('name')}' id={active.get('id')}). Stop it first.")
+        code, body = self._post("vm/spawn", {"machine_id": mid})
+        msg = body.get("message", "")
+        if code >= 400 and "deploy" not in msg.lower() and "spawn" not in msg.lower():
+            return f"Error spawning machine: HTTP {code}: {msg}"
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            a = self.get_active_machine()
+            if a and a.get("id") == mid and a.get("ip"):
+                return a["ip"]
+            time.sleep(8)
+        return f"Error spawning machine: spawned but no IP after {wait_sec}s (msg: {msg})"
 
     def stop_machine(self) -> str:
-        """Stop the active machine."""
-        try:
-            instance = self._client.get_active_machine(release_arena=False)
-            if instance is None:
-                return "No active machine to stop."
-            name = instance.machine.name
-            instance.stop()
-            return f"Stopped machine '{name}'."
-        except Exception as e:
-            return f"Error stopping machine: {e}"
+        a = self.get_active_machine()
+        if not a:
+            return "No active machine to stop."
+        code, body = self._post("vm/terminate", {"machine_id": a["id"]})
+        return f"Stopped '{a.get('name')}': {body.get('message', code)}"
 
     def reset_machine(self) -> str:
-        """Reset the active machine."""
-        try:
-            instance = self._client.get_active_machine(release_arena=False)
-            if instance is None:
-                return "No active machine to reset."
-            name = instance.machine.name
-            instance.reset()
-            return f"Reset requested for '{name}' (takes ~1 minute)."
-        except Exception as e:
-            return f"Error resetting machine: {e}"
+        a = self.get_active_machine()
+        if not a:
+            return "No active machine to reset."
+        code, body = self._post("vm/reset", {"machine_id": a["id"]})
+        return f"Reset '{a.get('name')}': {body.get('message', code)}"
 
     def submit_flag(self, flag: str, difficulty: int = 50) -> str:
-        """Submit a flag for the active machine."""
-        try:
-            instance = self._client.get_active_machine(release_arena=False)
-            if instance is None:
-                return "No active machine to submit a flag for."
-            result = instance.machine.submit(flag=flag, difficulty=difficulty)
-            return str(result)
-        except Exception as e:
-            return f"Error submitting flag: {e}"
+        a = self.get_active_machine()
+        if not a:
+            return "No active machine to submit a flag for."
+        code, body = self._post("machine/own",
+                                {"flag": flag, "id": a["id"], "difficulty": difficulty})
+        return f"HTTP {code}: {body.get('message', body)}"
 
+    # ── misc ─────────────────────────────────────────────────────────────────────
     def search(self, term: str) -> str:
-        """Search HTB and return formatted results."""
         try:
-            results = self._client.search(term)
-            lines = []
-            if results.machines:
-                lines.append("Machines:")
-                for m in results.machines:
-                    lines.append(f"  - {m.name} ({m.os}, {m.difficulty})")
-            if results.challenges:
-                lines.append("Challenges:")
-                for c in results.challenges:
-                    lines.append(f"  - {c.name}")
-            if not lines:
-                return "No results found."
-            return "\n".join(lines)
+            data = self._get("machine/paginated?per_page=100").get("data", [])
         except Exception as e:
             return f"Error searching: {e}"
+        hits = [m for m in data if term.lower() in str(m.get("name", "")).lower()]
+        if not hits:
+            return "No results found (paginated list only covers recent machines)."
+        return "\n".join(f"  - {m['name']} (id={m['id']}, {m.get('os')}, "
+                         f"{m.get('difficultyText')})" for m in hits)
 
     def get_vpn_status(self) -> str:
-        """Return current VPN server info."""
         try:
-            vpn = self._client.get_current_vpn_server(release_arena=False)
-            if vpn is None:
-                return "No VPN server assigned."
-            return (
-                f"VPN Server: {vpn.friendly_name}\n"
-                f"Location: {vpn.location}\n"
-                f"Active clients: {vpn.current_clients}"
-            )
+            info = self._get("connection/status")
+            return str(info)
         except Exception as e:
             return f"Error getting VPN status: {e}"

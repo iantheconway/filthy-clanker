@@ -23,3 +23,13 @@ data/training/*.jsonl
 evals/nyu_bench/*.db
 evals/nyu_bench/*.db-*
 evals/nyu_bench/results/
+*.ovpn
+machines_*.ovpn
+*.htb_token
+vpn/
+# Captured trajectories + built SFT datasets + intercode artifacts (bulky, generated — not source)
+data/sft/
+training/data/
+evals/intercode/results/
+evals/intercode/*.db
+evals/intercode/*.db-*
