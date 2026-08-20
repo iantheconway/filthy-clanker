@@ -1,0 +1,41 @@
+# Stuck-detector configuration. Tune weights/thresholds here without touching code.
+# stuckness = sum(weight_i * signal_i), clamped to [0,1]. Fires when >= fire_threshold,
+# subject to warmup (min_steps) and cooldown.
+
+window: 6              # sliding window (steps) for repeat / error_rate
+min_steps: 5           # warmup: never fire before this many steps (skip opening enumeration)
+cooldown: 5            # steps to wait after a fire before it can fire again
+fire_threshold: 0.40   # stuckness at/above this fires a hint request
+                       # chosen from sweep.py: 'grind' weights @ 0.40 => recall 9/14,
+                       # false-alarm 1/11 (Youden J +0.55, the Pareto knee on this corpus)
+
+# per-step signal weights (need not sum to 1; stuckness is clamped).
+# 'grind' profile: leans on the signals actually alive in the file-challenge corpus
+# (repeat / step_budget / kb_stall); error_rate + oscillation stay weighted for the
+# multi-agent NETWORK runs where they light up, but aren't relied on here.
+weights:
+  kb_stall: 0.18       # per consecutive no-finding step, capped by kb_stall_cap
+  repeat: 0.35         # a near-duplicate command in-window (strongest live signal here)
+  error_rate: 0.20     # scaled by fraction of in-window steps that errored
+  stale_progress: 0.15 # per step since last real finding (score>=0.55), capped
+  oscillation: 0.15    # agent bounced without score gain in-window (network runs)
+  step_budget: 0.30    # over the soft per-category step budget
+
+# caps so a single signal can't dominate unboundedly
+kb_stall_cap: 4        # count at most this many stall steps
+stale_progress_cap: 8  # count at most this many stale steps
+
+# soft step budgets by challenge category prefix (from session_id, e.g. eval-2013q-cry-...)
+# over-budget contributes the step_budget weight. Missing category -> default.
+step_budgets:
+  default: 12
+  cry: 14        # crypto: scripting-heavy, allow more
+  rev: 16        # reverse engineering: slow
+  pwn: 16
+  web: 14
+  for: 12        # forensics
+  msc: 12        # misc
+
+# near-duplicate command detection: normalize by lowercasing, collapsing whitespace,
+# stripping digits and the challenge path prefix, then compare. >= similarity -> repeat.
+repeat_similarity: 0.90
