@@ -35,7 +35,11 @@ _PRICES: dict[str, tuple[float, float, float]] = {
 }
 
 _lock = threading.Lock()
-_state = {"cost": 0.0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0}
+# Paid (cloud) usage in input/output/…; FREE/local-model usage (e.g. the served "clanker"
+# worker, which has no price) is tracked separately in local_* so efficiency metrics can see
+# the worker's real token volume even though it costs $0.
+_state = {"cost": 0.0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0,
+          "local_input": 0, "local_output": 0, "local_calls": 0}
 _warned_unknown: set = set()
 
 
@@ -57,8 +61,14 @@ def add_usage(model: str, usage: dict) -> None:
     cr = int(usage.get("cache_read_input_tokens", 0) or 0)
     cw = int(usage.get("cache_creation_input_tokens", 0) or 0)
     if price is None:
-        # Local/unknown model (e.g. an Ollama tag) → free. Warn once for anything that
-        # looks like it *should* cost (has a vendor prefix) so a mispriced paid model shows up.
+        # Local/unknown model (e.g. the served "clanker" worker, or an Ollama tag) → $0, but
+        # still record its token volume in local_* for efficiency metrics.
+        with _lock:
+            _state["local_input"] += it
+            _state["local_output"] += ot
+            _state["local_calls"] += 1
+        # Warn once for anything that *looks* like it should cost (vendor prefix) so a mispriced
+        # paid model shows up.
         if model and ("/" in model or model.lower().startswith("claude")) and model not in _warned_unknown:
             _warned_unknown.add(model)
             logger.warning("[cost] no price for %r — counting as $0 (add it to cost._PRICES if paid)", model)
@@ -72,6 +82,21 @@ def add_usage(model: str, usage: dict) -> None:
         _state["cache_read"] += cr
         _state["cache_write"] += cw
         _state["calls"] += 1
+
+
+# LLM-call FAILURES by kind (e.g. BUG-B 400s, context overflow, connection). A run can exit 0
+# with results while most calls silently failed — this lets the runner self-report that.
+_errors: dict = {}
+
+
+def add_error(kind: str) -> None:
+    with _lock:
+        _errors[kind] = _errors.get(kind, 0) + 1
+
+
+def errors_summary() -> dict:
+    with _lock:
+        return dict(_errors)
 
 
 def total_cost() -> float:
@@ -88,3 +113,4 @@ def reset() -> None:
     with _lock:
         for k in _state:
             _state[k] = 0.0 if k == "cost" else 0
+        _errors.clear()

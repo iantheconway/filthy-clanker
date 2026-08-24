@@ -54,6 +54,30 @@ _STREAM = os.getenv("OPENAI_STREAM", "1") != "0"
 _MSG_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name")
 
 
+def _count_llm_error(status: int, body: str) -> None:
+    """Record a FINAL (post-retry) LLM-call failure by kind, so a run self-reports silent
+    failure storms (BUG-B 400s, context overflow, connection drops) instead of needing a grep."""
+    try:
+        from .cost import add_error
+    except ImportError:  # standalone/smoke context
+        from cost import add_error  # type: ignore
+    b = (body or "").lower()
+    if status == 0:
+        kind = "connection/timeout"
+    elif status == 400 and "2 or more assistant" in b:
+        kind = "http400_msg_shape(BUG_B)"
+    elif status == 400 and "context size" in b:
+        kind = "http400_context_overflow"
+    elif status == 400:
+        kind = "http400_other"
+    else:
+        kind = f"http{status}"
+    try:
+        add_error(kind)
+    except Exception:
+        pass
+
+
 def _backoff(attempt: int) -> float:
     """Patient jittered backoff — rides out transient 429/503 capacity spikes on serverless
     endpoints (gpt-oss on Together can 503 for a minute+ under load) rather than failing the turn."""
@@ -79,14 +103,27 @@ class OpenAIClient(BaseLLMClient):
 
     @staticmethod
     def _sanitize_messages(messages: list[dict]) -> list[dict]:
-        """Keep only OpenAI-accepted keys — drops our captured ``reasoning`` (and any other
-        bookkeeping) so it never gets echoed back upstream."""
+        """Keep only OpenAI-accepted keys (drops our captured ``reasoning``/bookkeeping), AND
+        collapse consecutive same-role ASSISTANT messages into one. The multi-agent graph shares one
+        message list; an agent's idle-turn assistant reply followed by the supervisor's routing
+        assistant reply (no tool/user message between) leaves 2+ consecutive assistant messages,
+        which strict llama-server rejects with HTTP 400 "Cannot have 2 or more assistant messages at
+        the end of the list", cascading into a dead run. Merge ONLY when NEITHER assistant carries
+        tool_calls, so a tool_call / tool_response pairing is never broken. (Q1 BUG B fix; unit-tested.)"""
         out: list[dict] = []
         for m in messages:
-            if isinstance(m, dict):
-                out.append({k: v for k, v in m.items() if k in _MSG_KEYS})
-            else:
+            if not isinstance(m, dict):
                 out.append(m)
+                continue
+            m2 = {k: v for k, v in m.items() if k in _MSG_KEYS}
+            if (out and isinstance(out[-1], dict)
+                    and m2.get("role") == "assistant" and out[-1].get("role") == "assistant"
+                    and not m2.get("tool_calls") and not out[-1].get("tool_calls")):
+                prev = out[-1]
+                a, b = (prev.get("content") or ""), (m2.get("content") or "")
+                prev["content"] = (a + "\n" + b).strip() if (a or b) else a
+                continue
+            out.append(m2)
         return out
 
     async def generate_response(self, messages: list[dict], tools: list[dict],
@@ -143,6 +180,7 @@ class OpenAIClient(BaseLLMClient):
                         continue
                     logger.error("[OpenAI] HTTP %d (final, attempt %d/%d) model=%s body=%.400s",
                                  r.status_code, attempt, _MAX_RETRIES, self.model, body)
+                    _count_llm_error(r.status_code, body)
                     r.raise_for_status()
                 return self._parse_stream(r) if streaming else self._parse_json(r.json())
             except (requests.Timeout, requests.ConnectionError) as exc:
@@ -151,6 +189,7 @@ class OpenAIClient(BaseLLMClient):
                 if attempt < _MAX_RETRIES:
                     time.sleep(_backoff(attempt))
                     continue
+                _count_llm_error(0, type(exc).__name__)
                 raise
         if last:
             raise last
