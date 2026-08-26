@@ -37,6 +37,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,10 +57,11 @@ from dotenv import load_dotenv
 from run_eval import (  # type: ignore
     FlagCheckingMCPPool, run_challenge_headless, build_mcp_pool,
     ensure_hexstrike_running, _detect_compose_cmd, flags_match,
-    load_config, _apply_model_overrides,
+    load_config, _apply_model_overrides, _scored_canonical_names,
 )
-from graph import build_graph, create_checkpointer  # type: ignore
+from graph import build_graph, build_single_agent_graph, create_checkpointer  # type: ignore
 from data_capture import TrajectoryLogger  # type: ignore
+from llms import cost as _cost  # type: ignore  # per-task token/$ capture (Q1 efficiency metric)
 
 from cybench_dataset import CybenchTask, find_tasks, build_cybench_task_prompt
 
@@ -119,7 +121,8 @@ async def evaluate_task(task: CybenchTask, graph, config, tlogger, *,
         submitted = run_result["flags"]
         solved = run_result.get("solved_via_tool") or any(flags_match(f, flag) for f in submitted)
         result = {
-            "task": task.canonical_name, "category": task.category, "difficulty": task.difficulty,
+            "task": task.canonical_name, "canonical_name": task.canonical_name,
+            "category": task.category, "difficulty": task.difficulty,
             "correct_flag": flag, "submitted_flags": submitted, "solved": solved,
             "solved_via_tool": run_result.get("solved_via_tool", False),
             "timed_out": run_result["timed_out"], "error": run_result["error"],
@@ -146,8 +149,12 @@ async def main() -> None:
                     help="Path to a clone of andyzorigin/cybench (or set $CYBENCH_DIR).")
     ap.add_argument("--max-tasks", type=int, default=None)
     ap.add_argument("--only", default=None, help="Substring filter on canonical task name.")
+    ap.add_argument("--no-docker-only", action="store_true",
+                    help="Keep only file-based tasks (no docker service) — sidesteps the "
+                         "target-host networking seam; ideal for the first smoke.")
     ap.add_argument("--timeout", type=int, default=1200)
-    ap.add_argument("--provider", default=None, choices=["anthropic", "gemini", "ollama"])
+    ap.add_argument("--provider", default=None,
+                    choices=["anthropic", "gemini", "ollama", "openai"])
     ap.add_argument("--no-docker", action="store_true")
     ap.add_argument("--profile", default=None)
     ap.add_argument("--worker-model", default=None)
@@ -156,6 +163,16 @@ async def main() -> None:
     ap.add_argument("--submit-flag-mode", default="gated", choices=["always", "gated", "off"])
     ap.add_argument("--gate-after", type=int, default=3)
     ap.add_argument("--capture-sft", action="store_true")
+    ap.add_argument("--rerun", action="store_true",
+                    help="Re-run tasks already scored in --output-dir (default: skip them, so a "
+                         "segmented run resumes where it left off).")
+    ap.add_argument("--no-guidance", action="store_true",
+                    help="Disable the frontier-hint guidance node — a clean multi-vs-single "
+                         "architecture ablation with no cloud $ (build_graph includes guidance, "
+                         "build_single_agent_graph does not, so both must have it off to be fair).")
+    ap.add_argument("--single-agent", action="store_true",
+                    help="Q1 ablation: run the single generalist 'solver' agent (no supervisor / "
+                         "no specialists) instead of the multi-agent graph. Same model + tools.")
     ap.add_argument("--output-dir", default=str(EVAL_DIR / "results"))
     ap.add_argument("--db", default=str(EVAL_DIR / "cybench_checkpoints.db"))
     args = ap.parse_args()
@@ -169,18 +186,34 @@ async def main() -> None:
         sys.exit(f"Cybench benchmark dir not found: {bench_root} — clone andyzorigin/cybench "
                  "and pass --cybench-dir or set $CYBENCH_DIR.")
 
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     tasks = find_tasks(bench_root)
     if args.only:
         tasks = [t for t in tasks if args.only.lower() in t.canonical_name.lower()]
+    if args.no_docker_only:
+        tasks = [t for t in tasks if not t.has_docker]
+        log.info("Filtered to %d file-based (no-docker) task(s).", len(tasks))
+    # Resume: skip tasks already scored in --output-dir so a segmented run continues where it
+    # left off — only a challenge interrupted MID-run (no result line yet) is ever re-done.
+    # Crashes are recorded without a canonical_name, so they retry. --rerun redoes everything.
+    if not args.rerun:
+        done = _scored_canonical_names(out_dir)
+        if done:
+            _before = len(tasks)
+            tasks = [t for t in tasks if t.canonical_name not in done]
+            log.info("Resume: %d already-scored task(s) in %s skipped (%d remaining; --rerun to redo).",
+                     _before - len(tasks), out_dir, len(tasks))
     if args.max_tasks:
         tasks = tasks[: args.max_tasks]
     log.info("Discovered %d Cybench task(s) to run.", len(tasks))
 
     config = load_config(PROJECT_ROOT / "agents.yaml", profile=args.profile)
     _apply_model_overrides(config, args)
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.no_guidance:
+        config.setdefault("settings", {}).setdefault("guidance", {})["enabled"] = False
+        log.info("Guidance (frontier hints) DISABLED — clean architecture ablation, no cloud spend.")
     run_id = f"cyb-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{str(uuid.uuid4())[:6]}"
     tlogger = TrajectoryLogger(str(PROJECT_ROOT / "data" / "training"))
 
@@ -193,16 +226,57 @@ async def main() -> None:
     results: list[dict] = []
     try:
         async with create_checkpointer(args.db) as checkpointer:
-            graph = build_graph(flag_pool, config, checkpointer)
+            _builder = build_single_agent_graph if args.single_agent else build_graph
+            graph = _builder(flag_pool, config, checkpointer)
+            log.info("Harness config: %s", "SINGLE-AGENT (solver)" if args.single_agent
+                     else "MULTI-AGENT (supervisor + specialists)")
             for i, task in enumerate(tasks, 1):
                 log.info("Task %d/%d", i, len(tasks))
+                # Per-task efficiency capture (Q1): diff the global cost/token + tool-call counters
+                # around the task so we get cost, in/out/cache tokens, LLM calls, tool calls, wall time.
+                _c0 = _cost.summary()
+                _e0 = _cost.errors_summary()
+                _tc0 = getattr(flag_pool, "tool_call_count", 0)
+                _t0 = time.time()
                 try:
-                    results.append(await evaluate_task(
+                    res = await evaluate_task(
                         task, graph, config, tlogger, timeout_sec=args.timeout,
-                        provider=args.provider, flag_pool=flag_pool, no_docker=args.no_docker))
+                        provider=args.provider, flag_pool=flag_pool, no_docker=args.no_docker)
                 except Exception as exc:
                     log.error("Task %s crashed: %s", task.canonical_name, exc, exc_info=True)
-                    results.append({"task": task.canonical_name, "solved": False, "error": str(exc)})
+                    res = {"task": task.canonical_name, "solved": False, "error": str(exc)}
+                _c1 = _cost.summary()
+                _e1 = _cost.errors_summary()
+                _err_delta = {k: _e1.get(k, 0) - _e0.get(k, 0) for k in set(_e1) | set(_e0)}
+                _err_delta = {k: v for k, v in _err_delta.items() if v > 0}
+                res["metrics"] = {
+                    "harness": "single_agent" if args.single_agent else "multi_agent",
+                    "llm_errors": _err_delta,
+                    "llm_error_count": sum(_err_delta.values()),
+                    "cost_usd": round(_c1["cost"] - _c0["cost"], 6),
+                    "input_tokens": _c1["input"] - _c0["input"],
+                    "output_tokens": _c1["output"] - _c0["output"],
+                    "cache_read_tokens": _c1["cache_read"] - _c0["cache_read"],
+                    "cache_write_tokens": _c1["cache_write"] - _c0["cache_write"],
+                    "llm_calls": _c1["calls"] - _c0["calls"],
+                    "worker_input_tokens": _c1["local_input"] - _c0["local_input"],
+                    "worker_output_tokens": _c1["local_output"] - _c0["local_output"],
+                    "worker_calls": _c1["local_calls"] - _c0["local_calls"],
+                    "tool_calls": getattr(flag_pool, "tool_call_count", 0) - _tc0,
+                    "wall_seconds": round(time.time() - _t0, 1),
+                }
+                _m = res["metrics"]
+                log.info("[metrics] %s: $%.4f cloud(in=%d out=%d) | worker(in=%d out=%d calls=%d) | tools=%d | %.0fs",
+                         task.canonical_name, _m["cost_usd"], _m["input_tokens"], _m["output_tokens"],
+                         _m["worker_input_tokens"], _m["worker_output_tokens"], _m["worker_calls"],
+                         _m["tool_calls"], _m["wall_seconds"])
+                _tot = _m["worker_calls"] + _m["llm_calls"] + _m["llm_error_count"]
+                if _m["llm_error_count"] and _tot:
+                    _fr = 100 * _m["llm_error_count"] / _tot
+                    (log.warning if _fr >= 30 else log.info)(
+                        "[errors] %s: %d/%d LLM calls FAILED (%.0f%%) — %s",
+                        task.canonical_name, _m["llm_error_count"], _tot, _fr, _err_delta)
+                results.append(res)
                 (out_dir / f"{run_id}.jsonl").open("a", encoding="utf-8").write(
                     json.dumps(results[-1], ensure_ascii=False) + "\n")
     finally:
@@ -211,14 +285,56 @@ async def main() -> None:
             hexproc.terminate()
 
     solved = sum(1 for r in results if r.get("solved"))
+    # Aggregate the per-task efficiency metrics → the Q1 headline (cost-per-solve, tokens/task).
+    _ms = [r["metrics"] for r in results if r.get("metrics")]
+    _sum = lambda k: sum(m.get(k, 0) for m in _ms)
+    _tot_cost = round(_sum("cost_usd"), 4)
+    _err_total: dict = {}
+    for _m in _ms:
+        for _k, _v in (_m.get("llm_errors") or {}).items():
+            _err_total[_k] = _err_total.get(_k, 0) + _v
+    _failed = sum(_err_total.values())
+    _all_calls = _sum("worker_calls") + _sum("llm_calls") + _failed
+    _fail_rate = round(100 * _failed / _all_calls, 1) if _all_calls else 0.0
+    agg = {
+        "harness": "single_agent" if args.single_agent else "multi_agent",
+        "failed_llm_calls": _failed,
+        "llm_failure_rate_pct": _fail_rate,
+        "llm_errors_by_kind": _err_total,
+        "total_cost_usd": _tot_cost,
+        "cost_per_solve_usd": round(_tot_cost / solved, 4) if solved else None,
+        "avg_cloud_input_tokens": round(_sum("input_tokens") / len(_ms)) if _ms else 0,
+        "avg_cloud_output_tokens": round(_sum("output_tokens") / len(_ms)) if _ms else 0,
+        "total_cache_read_tokens": _sum("cache_read_tokens"),
+        "avg_cloud_calls": round(_sum("llm_calls") / len(_ms), 1) if _ms else 0,
+        "avg_worker_input_tokens": round(_sum("worker_input_tokens") / len(_ms)) if _ms else 0,
+        "avg_worker_output_tokens": round(_sum("worker_output_tokens") / len(_ms)) if _ms else 0,
+        "avg_worker_calls": round(_sum("worker_calls") / len(_ms), 1) if _ms else 0,
+        "avg_tool_calls": round(_sum("tool_calls") / len(_ms), 1) if _ms else 0,
+        "avg_wall_seconds": round(_sum("wall_seconds") / len(_ms), 1) if _ms else 0,
+    }
     summary = {"run_id": run_id, "total": len(results), "solved": solved,
                "solve_rate": round(solved / len(results), 4) if results else 0.0,
+               "aggregate_metrics": agg,
                "models": getattr(args, "_effective_models", None), "results": results}
     (out_dir / f"{run_id}.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False),
                                             encoding="utf-8")
     log.info("=" * 70)
     log.info("CYBENCH COMPLETE: %d / %d solved. Report: %s", solved, len(results),
              out_dir / f"{run_id}.json")
+    log.info("Aggregate [%s]: $%.4f total | cost/solve=%s | WORKER avg in=%d out=%d calls=%.1f "
+             "| cloud avg in=%d out=%d | avg tools=%.1f | avg %.0fs/task",
+             agg["harness"], agg["total_cost_usd"], agg["cost_per_solve_usd"],
+             agg["avg_worker_input_tokens"], agg["avg_worker_output_tokens"], agg["avg_worker_calls"],
+             agg["avg_cloud_input_tokens"], agg["avg_cloud_output_tokens"],
+             agg["avg_tool_calls"], agg["avg_wall_seconds"])
+    if _failed:
+        (log.warning if _fail_rate >= 20 else log.info)(
+            "[errors] RUN LLM failures: %d / %d calls (%.1f%%) — by kind: %s",
+            _failed, _all_calls, _fail_rate, _err_total)
+        if _fail_rate >= 20:
+            log.warning("[errors] ⚠ HIGH failure rate — results are likely DEGRADED by a harness "
+                        "bug (not model capability). Investigate before trusting these numbers.")
 
 
 if __name__ == "__main__":

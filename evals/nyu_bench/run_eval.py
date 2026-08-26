@@ -68,9 +68,9 @@ from dotenv import load_dotenv
 from langgraph.types import Command
 
 # Filthy-Clanker internals
-from graph import build_graph, create_checkpointer, TeamState
+from graph import build_graph, build_single_agent_graph, create_checkpointer, TeamState
 from graph.graph import initial_state
-from mcp_client import HexstrikeMCPClient, MCPClientPool
+from mcp_client import HexstrikeMCPClient, MCPClientPool, WebSearchClient
 from data_capture import TrajectoryLogger
 
 # NYU CTF library
@@ -243,7 +243,7 @@ def ensure_hexstrike_running() -> subprocess.Popen | None:
     sys.exit("Hexstrike server failed to start within 30 seconds.")
 
 
-async def build_mcp_pool() -> MCPClientPool:
+async def build_mcp_pool(web_search_enabled: bool = True) -> MCPClientPool:
     """Connect all MCP servers and return a ready pool."""
     pool = MCPClientPool()
     mcp_command = os.getenv("MCP_COMMAND", HEXSTRIKE_VENV_PYTHON)
@@ -254,14 +254,18 @@ async def build_mcp_pool() -> MCPClientPool:
     hexstrike = HexstrikeMCPClient(command=mcp_command, args=mcp_args_str.split())
     pool.add_server("hexstrike", hexstrike)
 
+    # Web search: local Brave-REST client (node-free — replaces the npx
+    # @modelcontextprotocol/server-brave-search server, which needed Node and so
+    # never actually ran). Default ON when BRAVE_API_KEY is set; --no-web-search
+    # forces it off (the gate — default on, per the cheat-audit decision).
     brave_key = os.getenv("BRAVE_API_KEY", "")
-    if brave_key:
-        brave = HexstrikeMCPClient(
-            command="npx",
-            args=["-y", "@modelcontextprotocol/server-brave-search"],
-            env={"BRAVE_API_KEY": brave_key},
-        )
-        pool.add_server("brave-search", brave)
+    if web_search_enabled and brave_key:
+        pool.add_server("web-search", WebSearchClient(api_key=brave_key))
+        log.info("web_search ENABLED (Brave REST, node-free)")
+    elif brave_key:
+        log.info("web_search disabled via --no-web-search")
+    else:
+        log.info("web_search disabled (BRAVE_API_KEY unset)")
 
     await pool.connect()
     tools = await pool.list_tools()
@@ -759,11 +763,32 @@ def _normalize_flag(flag: str) -> str:
     return flag.strip().lower()
 
 
+def _flag_core_variants(flag: str) -> set:
+    """Reasonable equivalence variants for lenient matching: the whole string, the
+    content INSIDE the outermost braces (so a different wrapper/prefix is ignored —
+    key{X} ~ flag{X} ~ X), and an alphanumeric-only fold of each (so punctuation /
+    underscores / case can't block a content-correct flag). All lower-cased."""
+    f = (flag or "").strip()
+    low = f.lower()
+    m = re.search(r'\{(.*)\}', f, re.S)      # content inside the outermost braces
+    inner = m.group(1).strip().lower() if m else low
+    variants = {low, inner,
+                re.sub(r'[^a-z0-9]', '', inner),
+                re.sub(r'[^a-z0-9]', '', low)}
+    return {v for v in variants if v}
+
+
 def flags_match(submitted: str, correct: str) -> bool:
-    """Exact match, then case-insensitive."""
+    """Exact, then case-insensitive, then a few reasonable FORMAT variants: a
+    content-correct flag with a different wrapper/prefix or punctuation still counts
+    (key{stfu_x} == STFU_X, flag{ab} == CSAW{ab}). The variant match is guarded by a
+    min core length (>=6) so short/empty inner content can't collide across challenges."""
     if submitted == correct:
         return True
-    return _normalize_flag(submitted) == _normalize_flag(correct)
+    if _normalize_flag(submitted) == _normalize_flag(correct):
+        return True
+    common = _flag_core_variants(submitted) & _flag_core_variants(correct)
+    return any(len(c) >= 6 for c in common)
 
 
 # ---------------------------------------------------------------------------
@@ -1246,6 +1271,37 @@ def _restore_dataset_answer_keys(version: str) -> None:
         log.warning("Answer-key guard: could not restore dataset: %s", exc)
 
 
+def _pristine_flag_from_git(challenge_dir) -> Optional[str]:
+    """Return the committed (pristine) flag for a challenge, read straight from git.
+
+    :func:`_redact_answer_key` only ever rewrites the WORKING TREE (``path.write_bytes``);
+    it never commits. So ``git show HEAD:<rel>/challenge.json`` is always the true flag,
+    immune to any redaction currently sitting on disk. Used to heal a ``chal.flag`` that
+    cached as ``[REDACTED]`` because a prior interrupted / concurrent run left this
+    challenge's on-disk metadata scrubbed at the moment it loaded — otherwise both the
+    live submit-match and the fallback score silently false-negative. Returns None if the
+    flag cannot be recovered (caller keeps the original value).
+    """
+    try:
+        cdir = Path(challenge_dir).resolve()
+        root = cdir
+        while root != root.parent and not (root / ".git").exists():
+            root = root.parent
+        if not (root / ".git").exists():
+            return None
+        rel = cdir.relative_to(root).as_posix()
+        r = subprocess.run(
+            ["git", "-C", str(root), "show", f"HEAD:{rel}/challenge.json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+        fl = json.loads(r.stdout).get("flag")
+        return fl.strip() if isinstance(fl, str) and fl.strip() else None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Per-challenge orchestrator
 # ---------------------------------------------------------------------------
@@ -1278,8 +1334,19 @@ async def evaluate_challenge(
     # -- Per-challenge logging --
     log_fh = _setup_challenge_log(session_id, log_dir)
 
-    # Arm the flag checker for this challenge.
-    flag_pool.set_challenge(chal.flag)
+    # Arm the flag checker for this challenge. Snapshot the ground-truth flag NOW,
+    # before any redaction — and if a prior interrupted run left this challenge's
+    # metadata scrubbed so chal.flag cached as "[REDACTED]", heal it from git. This
+    # single pristine value drives the live match AND the fallback score AND the saved
+    # correct_flag, so scoring can never false-negative on a redacted on-disk flag.
+    pristine_flag = (chal.flag or "").strip()
+    if (not pristine_flag) or "[REDACTED]" in pristine_flag:
+        recovered = _pristine_flag_from_git(chal.challenge_dir)
+        if recovered:
+            log.warning("Answer-key guard: chal.flag was %r at load — recovered pristine "
+                        "flag from git HEAD for scoring.", pristine_flag or "(empty)")
+            pristine_flag = recovered
+    flag_pool.set_challenge(pristine_flag)
 
     target: Optional[str] = None
     result: dict = {}
@@ -1389,7 +1456,7 @@ async def evaluate_challenge(
         submitted_flags = run_result["flags"]
         # solved_via_tool is authoritative — the tool already verified the flag.
         solved = run_result.get("solved_via_tool") or any(
-            flags_match(f, chal.flag) for f in submitted_flags
+            flags_match(f, pristine_flag) for f in submitted_flags
         )
 
         result = _make_result(
@@ -1397,6 +1464,7 @@ async def evaluate_challenge(
             session_id=session_id,
             submitted_flags=submitted_flags,
             solved=solved,
+            correct_flag=pristine_flag,
             target=target,
             timed_out=run_result["timed_out"],
             error=run_result["error"],
@@ -1432,7 +1500,7 @@ async def evaluate_challenge(
     status = "SOLVED" if result.get("solved") else ("TIMEOUT" if result.get("timed_out") else "FAILED")
     log.info(
         "Result: %s | submitted=%s | correct=%s",
-        status, result.get("submitted_flags"), chal.flag,
+        status, result.get("submitted_flags"), pristine_flag,
     )
     return result
 
@@ -1449,6 +1517,7 @@ def _make_result(
     refusal_fired: bool = False,
     tool_calls: int = 0,
     duration_sec: float = 0.0,
+    correct_flag: Optional[str] = None,
 ) -> dict:
     # A single, distinct failure reason so refusal frequency is directly reportable.
     if solved:
@@ -1468,7 +1537,7 @@ def _make_result(
         "year": chal.year,
         "event": chal.event,
         "flag_format": chal.flag_format,
-        "correct_flag": chal.flag,
+        "correct_flag": correct_flag if correct_flag is not None else chal.flag,
         "submitted_flags": submitted_flags,
         "solved": solved,
         "solved_via_tool": solved_via_tool,
@@ -1541,6 +1610,7 @@ def generate_report(results: list[dict], run_id: str, args: argparse.Namespace) 
             "dataset_version": args.version,
             "worker_model": getattr(args, "worker_model", None),
             "models": getattr(args, "_effective_models", None),
+            "harness": "single_agent" if getattr(args, "single_agent", False) else "multi_agent",
         },
         "summary": {
             "total": total,
@@ -1824,6 +1894,17 @@ async def main() -> None:
     parser.add_argument("--capture-sft", action="store_true",
                         help="Capture full (system,messages,tools)->assistant trajectories to "
                              "data/sft/ for fine-tuning (sets CLANKER_CAPTURE_SFT=1).")
+    parser.add_argument("--no-guidance", action="store_true",
+                        help="Disable the frontier-hint guidance node (settings.guidance.enabled=false) "
+                             "— for clean local-only baselines with no cloud spend / no hint confound.")
+    parser.add_argument("--single-agent", action="store_true",
+                        help="Use the single-agent solver graph (build_single_agent_graph) instead of "
+                             "the multi-agent supervisor+specialists — the Q1 harness ablation. Pair "
+                             "with --no-guidance for a clean apples-to-apples baseline.")
+    parser.add_argument("--no-web-search", action="store_true",
+                        help="Disable the web_search (Brave) tool even when BRAVE_API_KEY is set. "
+                             "Web search is ON by default (paired with the frontier-LLM cheat-audit); "
+                             "use this only for a deliberately research-free control arm.")
     parser.add_argument("--max-cost", type=float, default=0.0,
                         help="Hard USD budget cap for PAID (API) runs. Cumulative API cost is "
                              "checked BETWEEN challenges; the run stops once it exceeds this "
@@ -1899,6 +1980,9 @@ async def main() -> None:
     if args.profile:
         log.info("Config profile overlay applied: %s", args.profile)
     _apply_model_overrides(config, args)  # --worker-model / --model-override for A/B runs
+    if args.no_guidance:
+        config.setdefault("settings", {}).setdefault("guidance", {})["enabled"] = False
+        log.info("Guidance (frontier hints) DISABLED — clean local baseline, no cloud spend.")
     validate_api_keys(config)  # exits with clear message if any key is missing
 
     training_dir = PROJECT_ROOT / config.get("settings", {}).get(
@@ -1924,7 +2008,7 @@ async def main() -> None:
     _hexstrike_proc = ensure_hexstrike_running()
 
     # ── Connect MCP pool and wrap with flag checker ──────────────────────────
-    mcp_pool = await build_mcp_pool()
+    mcp_pool = await build_mcp_pool(web_search_enabled=not args.no_web_search)
     flag_pool = FlagCheckingMCPPool(
         mcp_pool, mode=args.submit_flag_mode, gate_after=args.gate_after
     )
@@ -1943,7 +2027,15 @@ async def main() -> None:
         # ── Build graph with checkpointer ────────────────────────────────────
         # Pass flag_pool (not mcp_pool) so agents see the submit_flag tool.
         async with create_checkpointer(args.db) as checkpointer:
-            graph = build_graph(flag_pool, config, checkpointer)
+            # Harness ablation (Q1): single-agent solver vs the multi-agent
+            # supervisor+specialists. Same TeamState/runner/scoring, so the numbers
+            # are directly comparable. build_single_agent_graph has the SAME
+            # positional signature (mcp_client, config, checkpointer) as build_graph.
+            _single = getattr(args, "single_agent", False)
+            _builder = build_single_agent_graph if _single else build_graph
+            log.info("Harness: %s", "SINGLE-AGENT (solver)" if _single
+                     else "multi-agent (supervisor + specialists)")
+            graph = _builder(flag_pool, config, checkpointer)
 
             for i, (chal_info, chal_ds) in enumerate(challenge_pairs, 1):
                 cname = CTFChallenge(chal_info, chal_ds.basedir).canonical_name
@@ -1999,11 +2091,38 @@ async def main() -> None:
     log.info("=" * 70)
     log.info("EVAL COMPLETE: %d / %d solved (%.1f%%)", solved, total,
              100 * solved / total if total else 0)
-    from llms.cost import summary as _cost_summary
+    from llms.cost import summary as _cost_summary, errors_summary as _cost_errors
     _cs = _cost_summary()
     if _cs["calls"]:
         log.info("[budget] FINAL API cost: $%.4f  (input=%d output=%d cache_read=%d calls=%d)",
                  _cs["cost"], _cs["input"], _cs["output"], _cs["cache_read"], _cs["calls"])
+    # Self-report LLM-call FAILURES so a run degraded by a harness bug (e.g. BUG-B 400 storms)
+    # announces itself instead of exiting 0 and looking "capability-bound".
+    _errs = _cost_errors()
+    _failed = sum(_errs.values())
+    _ok = _cs.get("calls", 0) + _cs.get("local_calls", 0)
+    _rate = round(100 * _failed / (_ok + _failed), 1) if (_ok + _failed) else 0.0
+    if _failed:
+        (log.warning if _rate >= 20 else log.info)(
+            "[errors] LLM failures: %d / %d calls (%.1f%%) — by kind: %s", _failed, _ok + _failed, _rate, _errs)
+        if _rate >= 20:
+            log.warning("[errors] ⚠ HIGH failure rate — results likely DEGRADED by a harness bug, "
+                        "not model capability. Do not read these as a capability ceiling.")
+    # Self-report the HINTER (frontier-hint guidance): its [Supervisor]/[guidance] logs don't
+    # reach captured stdout, so without this a silently no-op'd hinter looks identical to a
+    # working one. considered=trigger evaluated; reached=node ran; fired=frontier called.
+    try:
+        from graph.guidance import hint_summary as _hint_summary
+        _hs = _hint_summary()
+        if _hs["considered"] or _hs["fired"]:
+            log.info("[hinter] considered=%d reached=%d fired=%d skipped_cost=%d spend=$%.2f "
+                     "reject=%s error=%s", _hs["considered"], _hs["reached"], _hs["fired"],
+                     _hs["skipped_cost"], _hs["spend_usd"], _hs["reject"], _hs["error"])
+            if _hs["considered"] and not _hs["fired"]:
+                log.warning("[hinter] ⚠ hinter NEVER fired despite %d trigger evaluation(s) — hints "
+                            "are a silent no-op; see reject/error above.", _hs["considered"])
+    except Exception as _he:
+        log.info("[hinter] summary unavailable: %s", _he)
     log.info("Results written to %s", output_dir)
 
 

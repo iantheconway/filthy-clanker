@@ -1,1 +1,1 @@
-from .client import HexstrikeMCPClient, MCPClientPool
+from .client import HexstrikeMCPClient, MCPClientPool, WebSearchClient
