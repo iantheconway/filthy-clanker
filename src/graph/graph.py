@@ -32,6 +32,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from .state import TeamState
 from .supervisor import supervisor_node, route_from_supervisor
 from .summarizer import compaction_node
+from .guidance import make_guidance_node
 from .file_sweep import sweep_files
 from .agents import (
     make_recon_node, make_exploit_node, make_privesc_node, make_webexplorer_node,
@@ -92,6 +93,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     graph.add_node("reversing", reversing_node)
     graph.add_node("refusal_specialist", refusal_specialist_node)
     graph.add_node("compaction", compaction_node)
+    graph.add_node("guidance", make_guidance_node(mcp_client))
 
     # Entry: always start at supervisor
     graph.add_edge(START, "supervisor")
@@ -109,6 +111,7 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
             "reversing": "reversing",
             "refusal_specialist": "refusal_specialist",
             "compaction": "compaction",
+            "guidance": "guidance",
             "__end__": END,
         },
     )
@@ -122,10 +125,40 @@ def build_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
     # refusal_specialist always hands back to supervisor after fixing a response
     graph.add_edge("refusal_specialist", "supervisor")
     graph.add_edge("compaction", "supervisor")
+    graph.add_edge("guidance", "supervisor")
 
     # Compile with checkpointer for persistence
     compiled = graph.compile(checkpointer=checkpointer)
     return compiled
+
+
+def build_single_agent_graph(mcp_client: Any, config: Dict[str, Any], checkpointer):
+    """Single-agent ablation graph (Q1: filthy-clanker-q1-harness-ablation).
+
+    START → solver → (loop until a grounded flag / message budget) → END. ONE generalist agent
+    with the full toolset, NO supervisor and NO specialists — the orchestration-only ablation of
+    build_graph. Uses the same TeamState and the same headless runner, so solve rate and the
+    per-task cost/token capture are directly comparable to the multi-agent graph.
+    """
+    from .agents import make_solver_node, route_from_solver
+
+    tools: list = []  # agents use mcp_client directly (see build_graph)
+    solver_node = make_solver_node(mcp_client, tools)
+
+    graph = StateGraph(TeamState)
+    graph.add_node("solver", solver_node)
+    # Same compaction node the multi-agent graph uses — the solver routes to it when its
+    # context estimate crosses context_limit_threshold, then loops back. Without this the
+    # single-agent history grows unbounded and overflows the 16k window (the 80%-overflow bug).
+    graph.add_node("compaction", compaction_node)
+    graph.add_edge(START, "solver")
+    graph.add_conditional_edges(
+        "solver",
+        route_from_solver,
+        {"solver": "solver", "compaction": "compaction", "__end__": END},
+    )
+    graph.add_edge("compaction", "solver")
+    return graph.compile(checkpointer=checkpointer)
 
 
 def initial_state(
@@ -214,4 +247,9 @@ def initial_state(
         hitl_reason=None,
         session_id=session_id,
         config=config,
+        hints_used=0,
+        last_hint_step=-10 ** 9,
+        hint_reason=None,
+        hint_log=[],
+        raw_tool_log=[],
     )

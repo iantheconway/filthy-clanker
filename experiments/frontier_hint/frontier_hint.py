@@ -27,7 +27,9 @@ _PRICES = {
     "claude-sonnet": (3.0, 15.0),
     "claude-haiku": (1.0, 5.0),
 }
-_DEFAULT_MAX_OUTPUT = 700  # hints are short structured JSON
+_DEFAULT_MAX_OUTPUT = 3000  # the hint JSON is short (~1k tok), but Claude 5 reasoning models
+# spend output budget on a thinking block FIRST — at 700 the thinking consumed it all and the
+# text hint came back empty. 3000 leaves room for thinking + the structured answer.
 
 
 def price(model: str):
@@ -50,21 +52,38 @@ def project_cost(payload, model: str, max_output=_DEFAULT_MAX_OUTPUT) -> float:
 def call_frontier(payload, model="claude-sonnet-5", max_output=_DEFAULT_MAX_OUTPUT):
     """Real API call. Requires the `anthropic` SDK + ANTHROPIC_API_KEY."""
     import anthropic  # imported lazily so dry-run needs no dependency
-    client = anthropic.Anthropic()
-    resp = client.messages.create(
+    client = anthropic.Anthropic(timeout=600.0)  # generous ceiling; streaming keeps the socket alive
+    # STREAM the response: a full-solver hint is long (thinking + a complete script), and a
+    # non-streamed messages.create drops the connection after a few minutes ("Connection error").
+    with client.messages.stream(
         model=model,
         max_tokens=max_output,
         system=compactor.SYSTEM_PROMPT,
         messages=[{"role": "user", "content": compactor.render_prompt(payload)}],
-    )
+    ) as stream:
+        resp = stream.get_final_message()
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
     usage = getattr(resp, "usage", None)
-    try:
-        hint = json.loads(text)
-    except json.JSONDecodeError:
-        # models sometimes wrap JSON in prose/fences — salvage the object
+    def _try(t):
+        try:
+            return json.loads(t)
+        except json.JSONDecodeError:
+            return None
+    # models sometimes wrap JSON in ```fences``` or emit a not-quite-strict object;
+    # degrade gracefully to {"_raw": text} rather than crash (Phase 3 depends on this).
+    hint = _try(text)
+    if hint is None:
+        t = text.strip()
+        if t.startswith("```"):
+            t = t.split("\n", 1)[-1]
+            if t.rstrip().endswith("```"):
+                t = t.rstrip()[:-3]
+        hint = _try(t.strip())
+    if hint is None:
         s, e = text.find("{"), text.rfind("}")
-        hint = json.loads(text[s:e + 1]) if s >= 0 and e > s else {"_raw": text}
+        hint = _try(text[s:e + 1]) if s >= 0 and e > s else None
+    if hint is None:
+        hint = {"_raw": text}
     return {
         "hint": hint,
         "usage": {"input": getattr(usage, "input_tokens", None),

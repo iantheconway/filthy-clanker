@@ -45,3 +45,9 @@ agents:
     base_url: "http://host.docker.internal:8080/v1"
     api_key_env: LLAMA_LOCAL_KEY
     model: "clanker"
+  # Single-agent ablation node (Q1) — same clanker endpoint as the specialists.
+  solver:
+    provider: openai
+    base_url: "http://host.docker.internal:8080/v1"
+    api_key_env: LLAMA_LOCAL_KEY
+    model: "clanker"

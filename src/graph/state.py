@@ -20,6 +20,14 @@ def _append_messages(left: list, right) -> list:
     return left + list(right)
 
 
+def _append_tool_log(left: list, right) -> list:
+    """Append reducer for raw_tool_log, capped so it can't bloat the checkpoint.
+    Holds the RAW (pre-summarisation) tool output the frontier-hint payload needs."""
+    if not right:
+        return left or []
+    return (list(left or []) + list(right))[-60:]
+
+
 class KnowledgeBase(TypedDict, total=False):
     """Structured environmental facts shared across all agents."""
     ips: List[str]
@@ -83,3 +91,10 @@ class TeamState(TypedDict):
     hitl_reason: Optional[str]
     session_id: str
     config: Dict[str, Any]
+    # Frontier-hint / Phase 3 guidance (see src/graph/guidance.py). Cooldown clock is
+    # the message count, so no per-return counter is needed.
+    hints_used: int            # frontier hints requested this session (capped)
+    last_hint_step: int        # message count at the last hint (cooldown)
+    hint_reason: Optional[str] # why the supervisor routed to guidance (stall symptom)
+    hint_log: List[dict]       # captured (stall → payload → hint) triples for the flywheel
+    raw_tool_log: Annotated[list, _append_tool_log]  # RAW tool cmd+output per call (guidance payload)

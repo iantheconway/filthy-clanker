@@ -26,6 +26,7 @@ from llms import AnthropicClient, GeminiClient, OllamaClient, OpenAIClient
 
 from .state import TeamState
 from .summarizer import _is_placeholder_flag, _flag_matches_format
+from .guidance import should_hint
 
 logger = logging.getLogger("filthy_clanker")
 
@@ -159,6 +160,22 @@ async def supervisor_node(state: TeamState) -> dict:
     flags = _grounded_flags if _trust_kb_flags else []
 
     # -----------------------------------------------------------------------
+    # 1'. Frontier-hint (Phase 3) EARLY trigger — a step-budget stall. The late
+    #     all-agents-complete / exploit-loop points fire ~turn 50+ (little recovery
+    #     headroom before timeout), and file-based crypto/rev lanes may never hit
+    #     them at all. So once the team has ground past a message budget with NO
+    #     grounded flag, spend a gated hint while there's still time to act on it.
+    #     should_hint() enforces cooldown + per-session cap + spend cap.
+    # -----------------------------------------------------------------------
+    if autonomous and not flags:
+        _gset = settings.get("guidance", {}) or {}
+        _budget = int(_gset.get("step_budget_msgs", 28))
+        if len(state.get("messages", [])) >= _budget and should_hint(state):
+            logger.info("[Supervisor] Step-budget stall (%d msgs, no flag) → guidance (frontier hint).",
+                        len(state.get("messages", [])))
+            return {"hint_reason": "step_budget", "next": "guidance"}
+
+    # -----------------------------------------------------------------------
     # 1a. Unproductive streak — INTERACTIVE (HITL) mode only. A long idle streak
     #     (agents emitting text but never running a tool) is worth pausing for a
     #     human hint when a human is in the loop.
@@ -283,6 +300,11 @@ async def supervisor_node(state: TeamState) -> dict:
     # -----------------------------------------------------------------------
     if exploit_attempts >= max_attempts:
         if autonomous:
+            # Frontier-hint (Phase 3): before resetting, spend one gated hint on the stall.
+            if should_hint(state):
+                logger.info("[Supervisor] Exploit loop (%d failures) → guidance (frontier hint).",
+                            exploit_attempts)
+                return {"hint_reason": "exploit_loop", "next": "guidance"}
             # In autonomous mode: reset the counter and route to recon for a
             # fresh angle rather than looping the exploit agent forever.
             logger.info(
@@ -364,6 +386,10 @@ async def supervisor_node(state: TeamState) -> dict:
     all_work_agents = {"recon", "webexplorer", "vulnsearch", "exploit", "privesc"}
     if all_work_agents.issubset(set(completed_agents_now)) and not flags:
         if autonomous:
+            # Frontier-hint (Phase 3): a fully-stalled team is the prime hint moment.
+            if should_hint(state):
+                logger.info("[Supervisor] All agents complete, no flag → guidance (frontier hint).")
+                return {"hint_reason": "all_agents_complete", "next": "guidance"}
             logger.warning(
                 "[Supervisor] Autonomous mode — all agents completed but no flag. "
                 "Resetting completed_agents and retrying from recon."
@@ -567,6 +593,10 @@ async def supervisor_node(state: TeamState) -> dict:
             "continuing autonomously" if autonomous else "triggering HITL",
         )
         if autonomous:
+            # Frontier-hint (Phase 3): the model is giving up flagless — hint before retrying.
+            if should_hint(state):
+                logger.info("[Supervisor] FINISH w/o flag → guidance (frontier hint).")
+                return {"hint_reason": "finish_without_flag", "next": "guidance"}
             refreshed_completed = [a for a in completed_agents_now if a != "exploit"]
             return {
                 "completed_agents": refreshed_completed,

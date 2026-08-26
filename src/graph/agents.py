@@ -624,6 +624,7 @@ async def _run_agent_loop(
 
     # ReAct loop: call LLM → execute tools → repeat
     max_iterations = 20
+    _raw_tool_records: list = []  # RAW (pre-summarisation) tool cmd+output for the guidance payload
     # Tracks the iteration at which a high-value exploit path was first confirmed.
     # Recon/webexplorer are given one more iteration to write up then forced to stop.
     _exploit_found_at: Optional[int] = None
@@ -822,6 +823,14 @@ async def _run_agent_loop(
 
             logger.info("[%s] → %s(%s)", agent_name, tool_name, json.dumps(raw_args)[:200])
             raw_result = await mcp_client.call_tool(tool_name, raw_args)
+            # Capture the RAW (pre-summarisation) output for the frontier-hint payload — the
+            # message stream is summarised, laundering the ground truth the frontier needs.
+            _cmd_str = raw_args.get("command") if isinstance(raw_args, dict) else None
+            _raw_tool_records.append({
+                "agent": agent_name, "tool": tool_name,
+                "cmd": (_cmd_str or json.dumps(raw_args))[:300],
+                "raw": (raw_result or "")[:3000],
+            })
 
             # Detect unknown-tool errors and replace with a corrective message that
             # lists the actual available tools so the model stops guessing.
@@ -1178,6 +1187,7 @@ async def _run_agent_loop(
         "exploit_attempts": state.get("exploit_attempts", 0) + exploit_delta,
         "unproductive_streak": _new_streak,
         "completed_agents": existing_completed,
+        "raw_tool_log": _raw_tool_records,
     }
 
 
@@ -1535,3 +1545,53 @@ def make_reversing_node(mcp_client: Any, tools: list):
         logger.info("[Reversing Agent] Disassembling and analysing the binary...")
         return await _run_agent_loop("reversing", state, tools, mcp_client)
     return reversing_node
+
+
+# ---------------------------------------------------------------------------
+# Single-agent ablation (Q1: filthy-clanker-q1-harness-ablation)
+# ---------------------------------------------------------------------------
+
+def make_solver_node(mcp_client: Any, tools: list):
+    """Return the async node for the single-agent ablation: ONE generalist ReAct agent with the
+    full toolset and no supervisor/specialisation. Reuses the shared agent loop under the 'solver'
+    config (agents.yaml), so the only difference vs the multi-agent graph is orchestration."""
+    async def solver_node(state: TeamState) -> dict:
+        logger.info("[Solver Agent] Single-agent step — full toolset, no routing.")
+        return await _run_agent_loop("solver", state, tools, mcp_client)
+    return solver_node
+
+
+def route_from_solver(state: TeamState) -> str:
+    """Conditional edge for build_single_agent_graph: END on a grounded flag (mirrors the
+    supervisor's flag-end gate exactly) or once a message budget is exhausted; otherwise loop
+    back to the solver. A correct submit_flag is caught externally by the eval runner
+    (flag_pool.solved_event), and the per-task timeout is the ultimate backstop — identical to
+    the multi-agent graph, so solve outcomes are comparable."""
+    # Same flag-end gate the supervisor uses; both helpers live in summarizer.py (agents.py
+    # already imports _is_placeholder_flag from there at module top).
+    try:
+        from .summarizer import _is_placeholder_flag, _flag_matches_format
+    except ImportError:  # standalone/smoke context
+        from summarizer import _is_placeholder_flag, _flag_matches_format  # type: ignore
+    settings = (state.get("config", {}) or {}).get("settings", {})
+    kb = state.get("knowledge_base", {}) or {}
+    fmt = state.get("flag_format", "")
+    grounded = [f for f in kb.get("grounded_flags", [])
+                if not _is_placeholder_flag(f) and _flag_matches_format(f, fmt)]
+    if grounded and settings.get("trust_kb_flags_to_end", True):
+        logger.info("[Solver] Grounded flag captured: %s — ending single-agent run.", grounded)
+        return "__end__"
+    cap = int(settings.get("single_agent_max_msgs", 160))
+    if len(state.get("messages", []) or []) >= cap:
+        logger.info("[Solver] Message budget %d reached with no grounded flag — ending run.", cap)
+        return "__end__"
+    # Context-limit guard (mirrors route_from_supervisor's compaction branch). The
+    # single-agent graph has no supervisor, so the solver's own edge must compact the
+    # history BEFORE the prompt (system + tools + history + the response budget) overflows
+    # the served window — otherwise every subsequent call 400s (the 80%-overflow bug).
+    context_limit = int(settings.get("context_limit_threshold", 80000))
+    if int(state.get("context_token_estimate", 0) or 0) > context_limit:
+        logger.info("[Solver] Context ~%s tok > %s — compacting before overflow.",
+                    f"{state.get('context_token_estimate', 0):,}", f"{context_limit:,}")
+        return "compaction"
+    return "solver"
