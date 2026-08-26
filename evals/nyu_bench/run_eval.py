@@ -68,9 +68,9 @@ from dotenv import load_dotenv
 from langgraph.types import Command
 
 # Filthy-Clanker internals
-from graph import build_graph, create_checkpointer, TeamState
+from graph import build_graph, build_single_agent_graph, create_checkpointer, TeamState
 from graph.graph import initial_state
-from mcp_client import HexstrikeMCPClient, MCPClientPool
+from mcp_client import HexstrikeMCPClient, MCPClientPool, WebSearchClient
 from data_capture import TrajectoryLogger
 
 # NYU CTF library
@@ -243,7 +243,7 @@ def ensure_hexstrike_running() -> subprocess.Popen | None:
     sys.exit("Hexstrike server failed to start within 30 seconds.")
 
 
-async def build_mcp_pool() -> MCPClientPool:
+async def build_mcp_pool(web_search_enabled: bool = True) -> MCPClientPool:
     """Connect all MCP servers and return a ready pool."""
     pool = MCPClientPool()
     mcp_command = os.getenv("MCP_COMMAND", HEXSTRIKE_VENV_PYTHON)
@@ -254,14 +254,18 @@ async def build_mcp_pool() -> MCPClientPool:
     hexstrike = HexstrikeMCPClient(command=mcp_command, args=mcp_args_str.split())
     pool.add_server("hexstrike", hexstrike)
 
+    # Web search: local Brave-REST client (node-free — replaces the npx
+    # @modelcontextprotocol/server-brave-search server, which needed Node and so
+    # never actually ran). Default ON when BRAVE_API_KEY is set; --no-web-search
+    # forces it off (the gate — default on, per the cheat-audit decision).
     brave_key = os.getenv("BRAVE_API_KEY", "")
-    if brave_key:
-        brave = HexstrikeMCPClient(
-            command="npx",
-            args=["-y", "@modelcontextprotocol/server-brave-search"],
-            env={"BRAVE_API_KEY": brave_key},
-        )
-        pool.add_server("brave-search", brave)
+    if web_search_enabled and brave_key:
+        pool.add_server("web-search", WebSearchClient(api_key=brave_key))
+        log.info("web_search ENABLED (Brave REST, node-free)")
+    elif brave_key:
+        log.info("web_search disabled via --no-web-search")
+    else:
+        log.info("web_search disabled (BRAVE_API_KEY unset)")
 
     await pool.connect()
     tools = await pool.list_tools()
@@ -1606,6 +1610,7 @@ def generate_report(results: list[dict], run_id: str, args: argparse.Namespace) 
             "dataset_version": args.version,
             "worker_model": getattr(args, "worker_model", None),
             "models": getattr(args, "_effective_models", None),
+            "harness": "single_agent" if getattr(args, "single_agent", False) else "multi_agent",
         },
         "summary": {
             "total": total,
@@ -1889,6 +1894,17 @@ async def main() -> None:
     parser.add_argument("--capture-sft", action="store_true",
                         help="Capture full (system,messages,tools)->assistant trajectories to "
                              "data/sft/ for fine-tuning (sets CLANKER_CAPTURE_SFT=1).")
+    parser.add_argument("--no-guidance", action="store_true",
+                        help="Disable the frontier-hint guidance node (settings.guidance.enabled=false) "
+                             "— for clean local-only baselines with no cloud spend / no hint confound.")
+    parser.add_argument("--single-agent", action="store_true",
+                        help="Use the single-agent solver graph (build_single_agent_graph) instead of "
+                             "the multi-agent supervisor+specialists — the Q1 harness ablation. Pair "
+                             "with --no-guidance for a clean apples-to-apples baseline.")
+    parser.add_argument("--no-web-search", action="store_true",
+                        help="Disable the web_search (Brave) tool even when BRAVE_API_KEY is set. "
+                             "Web search is ON by default (paired with the frontier-LLM cheat-audit); "
+                             "use this only for a deliberately research-free control arm.")
     parser.add_argument("--max-cost", type=float, default=0.0,
                         help="Hard USD budget cap for PAID (API) runs. Cumulative API cost is "
                              "checked BETWEEN challenges; the run stops once it exceeds this "
@@ -1964,6 +1980,9 @@ async def main() -> None:
     if args.profile:
         log.info("Config profile overlay applied: %s", args.profile)
     _apply_model_overrides(config, args)  # --worker-model / --model-override for A/B runs
+    if args.no_guidance:
+        config.setdefault("settings", {}).setdefault("guidance", {})["enabled"] = False
+        log.info("Guidance (frontier hints) DISABLED — clean local baseline, no cloud spend.")
     validate_api_keys(config)  # exits with clear message if any key is missing
 
     training_dir = PROJECT_ROOT / config.get("settings", {}).get(
@@ -1989,7 +2008,7 @@ async def main() -> None:
     _hexstrike_proc = ensure_hexstrike_running()
 
     # ── Connect MCP pool and wrap with flag checker ──────────────────────────
-    mcp_pool = await build_mcp_pool()
+    mcp_pool = await build_mcp_pool(web_search_enabled=not args.no_web_search)
     flag_pool = FlagCheckingMCPPool(
         mcp_pool, mode=args.submit_flag_mode, gate_after=args.gate_after
     )
@@ -2008,7 +2027,15 @@ async def main() -> None:
         # ── Build graph with checkpointer ────────────────────────────────────
         # Pass flag_pool (not mcp_pool) so agents see the submit_flag tool.
         async with create_checkpointer(args.db) as checkpointer:
-            graph = build_graph(flag_pool, config, checkpointer)
+            # Harness ablation (Q1): single-agent solver vs the multi-agent
+            # supervisor+specialists. Same TeamState/runner/scoring, so the numbers
+            # are directly comparable. build_single_agent_graph has the SAME
+            # positional signature (mcp_client, config, checkpointer) as build_graph.
+            _single = getattr(args, "single_agent", False)
+            _builder = build_single_agent_graph if _single else build_graph
+            log.info("Harness: %s", "SINGLE-AGENT (solver)" if _single
+                     else "multi-agent (supervisor + specialists)")
+            graph = _builder(flag_pool, config, checkpointer)
 
             for i, (chal_info, chal_ds) in enumerate(challenge_pairs, 1):
                 cname = CTFChallenge(chal_info, chal_ds.basedir).canonical_name
@@ -2081,6 +2108,21 @@ async def main() -> None:
         if _rate >= 20:
             log.warning("[errors] ⚠ HIGH failure rate — results likely DEGRADED by a harness bug, "
                         "not model capability. Do not read these as a capability ceiling.")
+    # Self-report the HINTER (frontier-hint guidance): its [Supervisor]/[guidance] logs don't
+    # reach captured stdout, so without this a silently no-op'd hinter looks identical to a
+    # working one. considered=trigger evaluated; reached=node ran; fired=frontier called.
+    try:
+        from graph.guidance import hint_summary as _hint_summary
+        _hs = _hint_summary()
+        if _hs["considered"] or _hs["fired"]:
+            log.info("[hinter] considered=%d reached=%d fired=%d skipped_cost=%d spend=$%.2f "
+                     "reject=%s error=%s", _hs["considered"], _hs["reached"], _hs["fired"],
+                     _hs["skipped_cost"], _hs["spend_usd"], _hs["reject"], _hs["error"])
+            if _hs["considered"] and not _hs["fired"]:
+                log.warning("[hinter] ⚠ hinter NEVER fired despite %d trigger evaluation(s) — hints "
+                            "are a silent no-op; see reject/error above.", _hs["considered"])
+    except Exception as _he:
+        log.info("[hinter] summary unavailable: %s", _he)
     log.info("Results written to %s", output_dir)
 
 

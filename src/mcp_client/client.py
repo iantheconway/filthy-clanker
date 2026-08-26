@@ -1,5 +1,9 @@
+import asyncio
 import json
 import logging
+import re
+import urllib.parse
+import urllib.request
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -204,3 +208,102 @@ class MCPClientPool:
                 logger.debug("[MCPPool] Ignored error disconnecting from %s: %s", name, exc)
         self._tool_router = {}
         self._tools_cache = None
+
+
+class WebSearchClient:
+    """A local, node-free 'MCP server' exposing a single ``web_search`` tool
+    backed by the Brave Search REST API.
+
+    Replaces the ``npx @modelcontextprotocol/server-brave-search`` server (which
+    needs Node — absent from the eval image, so web search never actually ran).
+    Speaks the same ``connect / list_tools / call_tool / disconnect`` interface
+    as :class:`HexstrikeMCPClient`, so it drops straight into an
+    :class:`MCPClientPool` via ``pool.add_server("web-search", WebSearchClient(key))``
+    and routes through the existing tool filter / schema / capture / dispatch.
+
+    Uses stdlib ``urllib`` (honours the sandbox's HTTP(S)_PROXY env, and
+    ``api.search.brave.com`` is already on the proxy allowlist), so it needs no
+    extra dependency to be present in either the eval image or the app venv.
+    """
+
+    _ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+    def __init__(self, api_key: str, count: int = 5, timeout: float = 15.0):
+        self._api_key = api_key
+        self._count = count
+        self._timeout = timeout
+
+    async def connect(self) -> None:
+        return
+
+    async def disconnect(self) -> None:
+        return
+
+    async def list_tools(self) -> list[dict]:
+        return [{
+            "name": "web_search",
+            "description": (
+                "Search the web (Brave) for technical CTF research: CVEs, "
+                "software-version vulnerabilities, exploit/PoC references, "
+                "protocol/format/library docs, default credentials, error-message "
+                "lookups. Returns the top results as title + url + snippet. "
+                "RESEARCH ONLY — query by software+version, CVE id, technique, or "
+                "error string; NEVER search the challenge name/title and NEVER "
+                "paste the flag into a query. To fetch a page you found, use "
+                "execute_command with curl."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search terms (e.g. 'CVE-2021-41773 apache path traversal', 'vsftpd 2.3.4 backdoor').",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "How many results to return (1-10, default 5).",
+                    },
+                },
+                "required": ["query"],
+            },
+        }]
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        if name != "web_search":
+            return f"Unknown tool: {name}"
+        return await asyncio.to_thread(self._search, arguments or {})
+
+    def _search(self, arguments: dict[str, Any]) -> str:
+        query = str(arguments.get("query", "") or "").strip()
+        if not query:
+            return "web_search error: empty query"
+        try:
+            count = int(arguments.get("count", self._count) or self._count)
+        except (TypeError, ValueError):
+            count = self._count
+        count = max(1, min(count, 10))
+
+        url = self._ENDPOINT + "?" + urllib.parse.urlencode({"q": query, "count": count})
+        req = urllib.request.Request(url, headers={
+            "X-Subscription-Token": self._api_key,
+            "Accept": "application/json",
+        })
+        logger.info("[web_search] q=%r count=%d", query[:120], count)
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001 — surface the failure to the agent, don't crash the loop
+            logger.error("[web_search] ERROR %s: %s", type(exc).__name__, exc)
+            return f"web_search error: {type(exc).__name__}: {exc}"
+
+        results = ((data.get("web") or {}).get("results")) or []
+        if not results:
+            return f"web_search: no results for {query!r}"
+
+        out = [f"Top {min(len(results), count)} web results for {query!r}:"]
+        for i, r in enumerate(results[:count], 1):
+            title = (r.get("title") or "").strip()
+            link = (r.get("url") or "").strip()
+            desc = re.sub(r"<[^>]+>", "", (r.get("description") or "")).strip()
+            out.append(f"{i}. {title}\n   {link}\n   {desc}")
+        return "\n".join(out)
